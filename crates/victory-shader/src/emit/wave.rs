@@ -128,9 +128,13 @@ pub(crate) enum Shape {
 }
 
 /// The section starting at instruction `start` of a block: its restore
-/// index and the shapes of the values it writes.
+/// index and the shapes of the values it writes. The `v_readlane_b32`s of
+/// its values at constant lanes right after the restore (`end + 1` up to
+/// `after`) belong to it: they pick one lane of a partial result (lane 63
+/// of a wave64 reduction whose halves the code joined with lane 31's).
 pub(crate) struct Section {
     pub end: usize,
+    pub after: usize,
     pub shapes: HashMap<Value, Shape>,
 }
 
@@ -169,9 +173,17 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes });
-        i = end + 1;
+        let (vec, mut uni) = simulate(&insts[i + 1..end], wave, saved);
+        let mut after = end + 1;
+        while let Some(inst) = insts.get(after)
+            && let Some((w, lane)) = readlane(inst, &vec, wave)
+        {
+            uni.insert(w, lane);
+            after += 1;
+        }
+        let shapes = shapes(vec, uni, wave);
+        out.insert(i, Section { end, after, shapes });
+        i = after;
     }
     out
 }
@@ -257,7 +269,35 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+/// A `v_readlane_b32` at a constant lane of a value the section wrote:
+/// what it writes and that lane's value.
+fn readlane(inst: &Inst, vec: &HashMap<Value, Vec<Sym>>, wave: u32) -> Option<(Value, Sym)> {
+    let Fields::Valu(v) = &inst.fields else {
+        return None;
+    };
+    if inst.name() != "v_readlane_b32" {
+        return None;
+    }
+    let (Some(Operand::Scalar { code, .. }), Some(&Operand::Vector { reg, .. }), Some(lane)) =
+        (v.dst, v.src.first(), v.src.get(1))
+    else {
+        return None;
+    };
+    let l = match *lane {
+        Operand::Const(c) => crate::resource::inline(c)?,
+        Operand::Literal(x) => x,
+        _ => return None,
+    };
+    let lanes = vec.get(&inst.read(Reg::V(reg))?)?;
+    let s = *lanes.get(l as usize).filter(|_| l < wave)?;
+    Some((inst.write(Reg::S(code))?, s))
+}
+
+/// Each lane's value of the vector values the section writes, and the
+/// uniform values.
+type Simulated = (HashMap<Value, Vec<Sym>>, HashMap<Value, Sym>);
+
+fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -278,7 +318,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 .then(|| constant(inst))
                 .flatten();
             let Some(k) = lo else {
-                return shapes(vec, uni, wave);
+                return (vec, uni);
             };
             exec = (if name == "s_mov_b64" {
                 k
@@ -293,7 +333,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 .then(|| constant(inst))
                 .flatten()
             else {
-                return shapes(vec, uni, wave);
+                return (vec, uni);
             };
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
@@ -514,7 +554,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             .collect();
         vec.insert(dst, merged);
     }
-    shapes(vec, uni, wave)
+    (vec, uni)
 }
 
 fn constant(inst: &Inst) -> Option<u64> {

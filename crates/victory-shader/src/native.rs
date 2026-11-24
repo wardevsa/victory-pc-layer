@@ -69,7 +69,7 @@
 //! Unknown versions are rejected so a format change shows up as an error.
 
 use crate::ShaderError::{self, Malformed};
-use crate::dxbc::{u32_at, u64_at};
+use crate::dxbc::{Container, FourCC, u32_at, u64_at};
 
 const XDAT_OFFSET: usize = 0x18;
 const MAX_XDAT_ENTRIES: usize = 64;
@@ -409,8 +409,20 @@ pub struct UsedResource {
     pub slot: u8,
 }
 
-/// The native programs in a `DXIL` part's data; empty for the PC layout.
+/// The part holding a container's native programs: its `DXIL` part, else
+/// an `ACCC` part ([`crate::fspx`]).
+pub fn program_part<'a>(c: &Container<'a>) -> Option<&'a [u8]> {
+    c.part(FourCC::DXIL)
+        .or_else(|| c.part(FourCC::ACCC))
+        .map(|p| p.data)
+}
+
+/// The native programs in a `DXIL` part's data (empty for the PC layout),
+/// or the one of an `ACCC` part's `FSPX` image.
 pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
+    if part.get(0..4) == Some(crate::fspx::MAGIC) {
+        return Ok(vec![crate::fspx::program(part)?]);
+    }
     if part.get(XDAT_OFFSET..XDAT_OFFSET + 4) != Some(b"XDAT") {
         return Ok(Vec::new());
     }

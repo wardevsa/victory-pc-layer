@@ -1196,6 +1196,9 @@ impl<'a> Tracer<'a> {
                 words: [w2, w3],
             });
         }
+        if let Some(source) = self.raw_view(words) {
+            return Ok(source);
+        }
         let loaded = |w: &Term| {
             matches!(*w, Term::Value(v)
                 if self.def(v).is_some_and(|i| i.name().starts_with("s_load_")))
@@ -2145,6 +2148,48 @@ impl<'a> Tracer<'a> {
         )
     }
 
+    /// A loaded buffer descriptor the code views as a raw buffer, as the
+    /// FidelityFX upscaler's programs do before byte-addressed access: the
+    /// stride cleared (dword 1 bits 16-29), the record count multiplied (by
+    /// the stride, into bytes), the out-of-bounds mode set (dword 3 bits
+    /// 28-29). The base address and everything else stay as loaded, so it
+    /// is the loaded descriptor; the host reads it raw through its view.
+    fn raw_view(&self, words: &[Term]) -> Option<Source> {
+        const STRIDE: u32 = 0x3FFF_0000;
+        const OOB: u32 = 0x3000_0000;
+        let [w0, w1, w2, w3] = *words else {
+            return None;
+        };
+        let value = |t: Term| match t {
+            Term::Value(v) => Some(v),
+            Term::Const(_) => None,
+        };
+        let w1 = match self.sop2(value(w1)?, &["s_and_b32"]) {
+            Some((_, [x, Term::Const(m)] | [Term::Const(m), x])) if m | STRIDE == !0 => x,
+            _ => w1,
+        };
+        let w2 = match self.sop2(value(w2)?, &["s_mul_i32"]) {
+            Some((_, [x, _])) if self.loaded(&[w0, w1, x]).is_some() => x,
+            Some((_, [_, y])) => y,
+            None => w2,
+        };
+        let mut w3 = w3;
+        if let Some((_, [x, Term::Const(o)] | [Term::Const(o), x])) =
+            self.sop2(value(w3)?, &["s_or_b32"])
+            && o & !OOB == 0
+        {
+            w3 = x;
+        }
+        if let Some((_, [x, Term::Const(m)] | [Term::Const(m), x])) =
+            self.sop2(value(w3)?, &["s_and_b32"])
+            && m | OOB == !0
+        {
+            w3 = x;
+        }
+        let source = self.loaded(&[w0, w1, w2, w3])?;
+        (words != [w0, w1, w2, w3]).then_some(source)
+    }
+
     /// Consecutive dwords of one scalar load.
     fn loaded(&self, words: &[Term]) -> Option<Source> {
         let Term::Value(v0) = words[0] else {
@@ -2436,6 +2481,10 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         // high one is zero.
         ("s_mov_b64", Operand::Literal(x)) => Some(Moved::Const(if k == 0 { x } else { 0 })),
         // 64-bit inline integers are sign-extended.
+        // Literals below 2^31: zero and sign extension agree.
+        ("s_mov_b64", Operand::Literal(x)) if (x as i32) >= 0 => {
+            Some(Moved::Const(if k == 0 { x } else { 0 }))
+        }
         ("s_mov_b64", Operand::Const(c @ 128..=208)) => {
             let low = inline(c)?;
             Some(Moved::Const(if k == 0 {
@@ -2543,6 +2592,45 @@ pub(crate) mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn a_loaded_buffer_descriptor_viewed_raw_is_the_loaded_one() {
+        // As the FidelityFX upscaler's programs do (FSPX).
+        let mut words = vec![
+            0xBE8A_0304, // s_mov_b32 s10, s4
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xF408_0305,
+            0xFA00_0160, // s_load_dwordx4 s[12:15], s[10:11], 0x160
+            0x938A_FF0D,
+            0x000E_0010, // s_bfe_u32 s10, s13, 0x000e0010 (the stride)
+            0x848A_810A, // s_max_u32 s10, s10, 1
+            0x870F_FF0F,
+            0xCFFF_FFFF, // s_and_b32 s15, s15, 0xcfffffff
+            0x930E_0A0E, // s_mul_i32 s14, s14, s10
+            0x880F_FF0F,
+            0x3000_0000, // s_or_b32 s15, s15, 0x30000000
+            0x870D_FF0D,
+            0xC000_FFFF, // s_and_b32 s13, s13, 0xc000ffff
+            0xE038_1000,
+            0x8003_0802, // buffer_load_dwordx4 v[8:11], v2, s[12:15], 0 offen
+            S_ENDPGM,
+        ];
+        let layout = [param(Table, 4, 1)];
+        let r = track_words(&words, &layout, HwStage::Cs);
+        assert_eq!(r.scalar, [((0, 2), at(0, 0x160))]);
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Loaded {
+                load: (0, 2),
+                first: 0
+            }
+        );
+        // A moved base address is another buffer.
+        words.insert(14, 0x800C_900C); // s_add_u32 s12, s12, 16
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        assert!(track(&p, &layout, HwStage::Cs, None).is_err());
     }
 
     #[test]
