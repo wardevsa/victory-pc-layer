@@ -9229,6 +9229,11 @@ impl<'a> Lower<'a> {
                 let Operand::Vector { reg, .. } = *data else {
                     return Err("an image result");
                 };
+                // Only the spatial coordinates: an array's layer must be
+                // undef (DXIL validation).
+                for slot in cs.iter_mut().skip(spatial) {
+                    *slot = fu;
+                }
                 let f32t = self.s.t.f32;
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
