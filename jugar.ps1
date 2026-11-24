@@ -12,12 +12,15 @@
 #                                 every run; plain numbers select calls)
 #         .\jugar.ps1 -Precompiled -Skip <hash>,<hash>  (every 0x218 program
 #                                 but these)
+#         .\jugar.ps1 -Fast      (keeps the texture guard: a little faster,
+#                                 but the intro flickers)
 # The title's executable is VICTORY_GAME_DIR if that names an .exe; if it
 # names a folder, the largest .exe in it. Or pass it with -Game.
 param(
     [string]$Resolution = "1920x1080",
     [switch]$Diag,
     [switch]$Precompiled,
+    [switch]$Fast,
     [string]$Calls = "",
     [string]$Skip = "",
     [string]$Game = $(
@@ -45,6 +48,13 @@ $env:VICTORY_WIDE_BACK = "1"
 # instead of being copied every frame.
 $env:VICTORY_CARD_BUFFERS_MIN_MB = "1"
 $env:VICTORY_CARD_BUFFERS_MB = "1024"
+# Textures in view memory are checked at every refresh instead of every 8th
+# frame while their guard sees no write: the startup screens and the opening
+# cutscene otherwise flicker and repeat frames (victory-fork issue #269).
+# Costs some milliseconds a frame; -Fast keeps the guard.
+$env:VICTORY_TEXTURE_GUARD = if ($Fast) { "1" } else { "0" }
+# Large tiled textures detiled on 4 CPU threads (victory-fork PR #271).
+$env:VICTORY_TEXTURE_DETILE_WORKERS = "4"
 
 $env:VICTORY_PRECOMPILED = if (-not $Precompiled) { "0" } elseif ($Calls) { $Calls } else { "1" }
 $env:VICTORY_PRECOMPILED_SKIP = $Skip

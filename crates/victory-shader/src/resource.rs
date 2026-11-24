@@ -2477,9 +2477,6 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         // that has no inline form; fold more if descriptors need it.
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
         ("s_not_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(!x)),
-        // A 32-bit literal in a 64-bit integer move fills the low dword; the
-        // high one is zero.
-        ("s_mov_b64", Operand::Literal(x)) => Some(Moved::Const(if k == 0 { x } else { 0 })),
         // 64-bit inline integers are sign-extended.
         // Literals below 2^31: zero and sign extension agree.
         ("s_mov_b64", Operand::Literal(x)) if (x as i32) >= 0 => {
