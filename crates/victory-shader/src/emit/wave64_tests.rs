@@ -497,3 +497,75 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// An `s_cbranch_execz` guarding a loop whose exit is `v_cmp_eq_u32` + `s_cbranch_vccz`
+/// must not be stripped by `ir::without_skips`: when no lane enters the loop (`EXEC == 0`),
+/// `v_cmp` always writes 0 to `vcc`, so `s_cbranch_vccz` loops until the synthetic loop limit
+/// and aborts the shader before the store after the loop runs.
+#[test]
+fn without_skips_keeps_execz_guard_over_vcc_loop() {
+    // Same CFG as a wave-wide light loop guarded by `s_cbranch_execz`:
+    //   if (tid < s0) {
+    //       loop { v5 += 1; if (v5 == 3) break; }   // v_cmp_eq + s_cbranch_vccz latch
+    //   }
+    //   store(7 + v5)
+    let words = [
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0  (active iff tid < s0)
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0005, // s_cbranch_execz +5 -> after_loop
+        // loop:
+        0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
+        0x7D84_0A83, // v_cmp_eq_u32 vcc, 3, v5
+        0xBF86_0001, // s_cbranch_vccz +1 -> latch
+        0xBF82_0001, // s_branch +1 -> after_loop
+        // latch:
+        0xBF82_FFFB, // s_branch -5 -> loop
+        // after_loop:
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7DA4_0001, // v_cmpx_eq_u32 exec, s1, v0 (only lane s1 stores)
+        0x4A00_0A87, // v_add_nc_u32 v0, 7, v5
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let stripped = ir::without_skips(&p, true);
+    assert!(
+        stripped.is_none(),
+        "without_skips must keep s_cbranch_execz guarding a vcc loop"
+    );
+    let p_run = stripped.as_ref().unwrap_or(&p);
+    let wide_blocks: HashSet<usize> = (0..p_run.blocks.len())
+        .filter(|&b| {
+            p_run.blocks[b]
+                .insts
+                .last()
+                .is_some_and(|i| matches!(i.name(), "s_cbranch_execz" | "s_cbranch_vccz"))
+        })
+        .collect();
+    assert_eq!(wide_blocks.len(), 2, "expected execz skip and vccz loop branch");
+    // Check both per-lane lowering and wave-wide lowering (as in `widen` when the loop body
+    // contains cross-lane work).
+    let cases = [
+        // (s0 = active count, s1 = lane that stores, expected value)
+        (0u32, 0u32, 7u32), // empty wave skips loop -> v5 stays 0 -> stores 7
+        (10, 0, 10),        // active lane runs 3 iterations -> stores 10
+        (10, 35, 7),        // inactive lane in second host wave -> stores 7
+        (64, 63, 10),       // full wave runs 3 iterations -> stores 10
+    ];
+    for (label, wide) in [("per-lane", HashSet::new()), ("wave-wide", wide_blocks)] {
+        let shader = lowered(&native, p_run, &wide).expect("lower");
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for (below, lane, expected) in cases {
+            let Some(got) = on_the_card(&shader, [below, lane]) else { return };
+            assert_eq!(got, expected, "{label}: s0 = {below}, lane {lane}");
+        }
+    }
+}

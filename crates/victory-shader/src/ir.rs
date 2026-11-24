@@ -580,6 +580,103 @@ pub(crate) fn thread_edges(
     Ok(rename(blocks, p.wave64, p.vgprs))
 }
 
+/// Whether `goal` is reachable from `start` while staying inside `region`.
+fn reaches_within(p: &Program, region: &[bool], start: usize, goal: usize) -> bool {
+    if !region[start] {
+        return false;
+    }
+    let mut seen = vec![false; p.blocks.len()];
+    let mut stack = vec![start];
+    seen[start] = true;
+    while let Some(u) = stack.pop() {
+        if u == goal {
+            return true;
+        }
+        for s in p.blocks[u].exit.successors() {
+            if region[s] && !seen[s] {
+                seen[s] = true;
+                stack.push(s);
+            }
+        }
+    }
+    false
+}
+
+/// All blocks reachable from `start`.
+fn reachable_from(p: &Program, start: usize) -> Vec<bool> {
+    let mut seen = vec![false; p.blocks.len()];
+    let mut stack = vec![start];
+    seen[start] = true;
+    while let Some(u) = stack.pop() {
+        for s in p.blocks[u].exit.successors() {
+            if !seen[s] {
+                seen[s] = true;
+                stack.push(s);
+            }
+        }
+    }
+    seen
+}
+
+/// Whether `last` (`s_cbranch_scc0` / `s_cbranch_scc1`) tests an `SCC` value
+/// written in `block` by a mask AND with `EXEC` or `VCC` (so `SCC == 0`
+/// whenever `EXEC == 0`).
+fn scc_zero_under_empty_exec(block: &Block, last: &Inst) -> bool {
+    let Some(scc) = last.read(Reg::Scc) else {
+        return false;
+    };
+    let Some(def) = block.insts.iter().rev().find(|i| i.write(Reg::Scc) == Some(scc)) else {
+        return false;
+    };
+    match def.name() {
+        "s_and_b32" | "s_and_b64" | "s_and_saveexec_b32" | "s_and_saveexec_b64" => {
+            def.read(Reg::S(EXEC)).is_some() || def.read(Reg::S(VCC)).is_some()
+        }
+        "s_andn2_b32" | "s_andn2_b64" => matches!(
+            &def.fields,
+            crate::gfx10::Fields::Sop { src, .. }
+                if matches!(
+                    src.first(),
+                    Some(crate::gfx10::Operand::Scalar { code, .. })
+                        if *code == EXEC || *code == VCC
+                )
+        ),
+        _ => false,
+    }
+}
+
+/// Whether `region` contains a loop that an empty wave (`EXEC == 0`) cannot
+/// leave: a block in `region` ending in a mask branch whose zero-mask edge
+/// stays on a cycle within `region`. Removing a preceding `s_cbranch_execz`
+/// lets `EXEC == 0` enter that loop and spin until the synthetic loop limit
+/// fires (aborting the shader, or hanging the GPU when the loop carries
+/// wave-wide group barriers).
+fn has_empty_exec_loop(p: &Program, region: &[bool]) -> bool {
+    for (x, block) in p.blocks.iter().enumerate() {
+        if !region[x] {
+            continue;
+        }
+        let Exit::Branch { taken, not_taken } = block.exit else {
+            continue;
+        };
+        let Some(last) = block.insts.last() else {
+            continue;
+        };
+        let zero_edge = match last.name() {
+            // Under EXEC == 0, `v_cmp*` writes VCC = 0 and EXEC is 0.
+            "s_cbranch_vccz" | "s_cbranch_execz" => taken,
+            "s_cbranch_vccnz" | "s_cbranch_execnz" => not_taken,
+            "s_cbranch_scc0" if scc_zero_under_empty_exec(block, last) => taken,
+            "s_cbranch_scc1" if scc_zero_under_empty_exec(block, last) => not_taken,
+            _ => continue,
+        };
+        if reaches_within(p, region, zero_edge, x) {
+            return true;
+        }
+    }
+    false
+}
+
 /// The program without its early-outs: an `s_cbranch_execz` to a block that
 /// only ends the program (`if (!inBounds) return;`, the outermost branch of
 /// most compute programs) is left out, so the lanes that would have left
@@ -600,7 +697,10 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
         let Exit::Branch { taken, not_taken } = block.exit else {
             continue;
         };
-        if ends(taken) && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
+        if ends(taken)
+            && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz")
+            && !has_empty_exec_loop(p, &reachable_from(p, not_taken))
+        {
             block.insts.pop();
             block.exit = Exit::Jump(not_taken);
             any = true;
@@ -744,6 +844,11 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         if !deep && join.preds.iter().any(|&q| q != b && !inside[q]) {
             return None;
         }
+        // A loop inside the region whose exit requires a non-zero lane mask
+        // cannot terminate when EXEC == 0 falls through.
+        if has_empty_exec_loop(p, &inside) {
+            return None;
+        }
         Some(inside)
     };
     let mut blocks = p.blocks.clone();
@@ -755,7 +860,8 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         if !p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
             continue;
         }
-        if ends(taken) || skipped(b, taken, not_taken).is_some() {
+        let early_out = ends(taken) && !has_empty_exec_loop(p, &reachable_from(p, not_taken));
+        if early_out || skipped(b, taken, not_taken).is_some() {
             blocks[b].insts.pop();
             blocks[b].exit = Exit::Jump(not_taken);
             any = true;
@@ -1787,5 +1893,79 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    #[test]
+    fn without_skips_keeps_execz_over_vcc_loops_and_strips_scalar_loops() {
+        // 1. `s_cbranch_execz` over a `v_cmp_eq_u32` + `s_cbranch_vccz` loop: must be kept.
+        let vccz_loop = build_words(
+            &[
+                0x7E0A_0280, // v_mov_b32 v5, 0
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0003, // s_cbranch_execz +3 -> after
+                0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
+                0x7D84_0A83, // v_cmp_eq_u32 vcc, 3, v5
+                0xBF86_FFFD, // s_cbranch_vccz -3 -> loop
+                0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert!(without_skips(&vccz_loop, false).is_none());
+        assert!(without_skips(&vccz_loop, true).is_none());
+
+        // 2. `s_cbranch_execz` over a `s_cbranch_vccnz` exit loop (zero edge stays in loop): kept.
+        let vccnz_exit = build_words(
+            &[
+                0x7E0A_0280, // v_mov_b32 v5, 0
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0004, // s_cbranch_execz +4 -> after
+                0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
+                0x7D84_0A83, // v_cmp_eq_u32 vcc, 3, v5
+                0xBF87_0001, // s_cbranch_vccnz +1 -> after
+                0xBF82_FFFC, // s_branch -4 -> loop
+                0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert!(without_skips(&vccnz_exit, false).is_none());
+        assert!(without_skips(&vccnz_exit, true).is_none());
+
+        // 3. `s_cbranch_execz` early-out (`-> s_endpgm`) before a `s_cbranch_vccz` loop: kept.
+        let early_out_vccz = build_words(
+            &[
+                0x7E0A_0280, // v_mov_b32 v5, 0
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0003, // s_cbranch_execz +3 -> endpgm
+                0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
+                0x7D84_0A83, // v_cmp_eq_u32 vcc, 3, v5
+                0xBF86_FFFD, // s_cbranch_vccz -3 -> loop
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert!(without_early_outs(&early_out_vccz).is_none());
+        assert!(without_skips(&early_out_vccz, true).is_none());
+
+        // 4. `s_cbranch_execz` over a fixed scalar loop (SCC from `s_cmp_lg_u32`): still stripped.
+        let scalar_loop = build_words(
+            &[
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0004, // s_cbranch_execz +4 -> after
+                0xBE84_0380, // s_mov_b32 s4, 0
+                0x8004_8104, // s_add_u32 s4, s4, 1
+                0xBF07_8404, // s_cmp_lg_u32 s4, 4
+                0xBF85_FFFD, // s_cbranch_scc1 -3 -> loop
+                0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert!(without_skips(&scalar_loop, true).is_some());
     }
 }
