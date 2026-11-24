@@ -90,6 +90,36 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
+    /// The GFX10 color buffer bypasses blending for typed integer targets.
+    fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut blend = self.blend;
+        let count = self.targets.NumRenderTargets.min(8) as usize;
+        let formats = &self.targets.RTFormats[..count];
+        if !blend.IndependentBlendEnable.as_bool() {
+            let shared = blend.RenderTarget[0];
+            if !shared.BlendEnable.as_bool() || !formats.iter().copied().any(integer_rtv) {
+                return blend;
+            }
+            if formats.iter().all(|&f| f == DXGI_FORMAT_UNKNOWN || integer_rtv(f)) {
+                blend.RenderTarget[0].BlendEnable = false.into();
+                return blend;
+            }
+            // Materialize the shared RT0 state before changing just the integer slots.
+            blend.IndependentBlendEnable = true.into();
+            for (&format, target) in formats.iter().zip(&mut blend.RenderTarget) {
+                if format != DXGI_FORMAT_UNKNOWN {
+                    *target = shared;
+                }
+            }
+        }
+        for (&format, target) in formats.iter().zip(&mut blend.RenderTarget) {
+            if integer_rtv(format) {
+                target.BlendEnable = false.into();
+            }
+        }
+        blend
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -196,7 +226,7 @@ impl GraphicsState {
             .collect();
         format!(
             "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}",
-            self.blend,
+            self.host_blend(),
             self.sample_mask,
             self.rasterizer,
             self.depth,
@@ -239,6 +269,19 @@ impl GraphicsState {
             })
             .collect()
     }
+}
+
+fn integer_rtv(format: DXGI_FORMAT) -> bool {
+    matches!(format,
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32_SINT | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT | DXGI_FORMAT_R16G16_SINT | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT | DXGI_FORMAT_R8G8_SINT | DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT | DXGI_FORMAT_R8_SINT
+    )
 }
 
 /// One input element: vertex buffer slot, byte offset, format.
@@ -594,6 +637,7 @@ impl HostPipeline {
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
             }
         }
+        let blend = g.host_blend();
         let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
@@ -605,7 +649,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -675,7 +719,7 @@ impl HostPipeline {
             depth = ?g.depth,
             dsv = g.depth_format.0,
             targets = ?&g.targets.RTFormats[..g.targets.NumRenderTargets.min(8) as usize],
-            blend = ?g.blend.RenderTarget[0],
+            blend = ?blend.RenderTarget[0],
             cull = g.rasterizer.CullMode.0,
             "host graphics state"
         );
@@ -690,7 +734,7 @@ impl HostPipeline {
             inputs: g.elements(),
             rects: rect_gs.is_some(),
             state: {
-                let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
+                let (d, r, b) = (&g.depth, &g.rasterizer, &blend.RenderTarget[0]);
                 let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
                     format!(
                         "fail {} depth-fail {} pass {} func {}",
@@ -761,7 +805,7 @@ fn mesh_pipeline(
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
@@ -849,6 +893,94 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    #[test]
+    fn integer_rtv_blend_bypasses_only_integer_targets_with_independent_blend() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[..4].copy_from_slice(&[
+            DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R8_UINT,
+            DXGI_FORMAT_R16G16_UINT,
+        ]);
+        g.blend.IndependentBlendEnable = true.into();
+        for target in &mut g.blend.RenderTarget[..4] {
+            target.BlendEnable = true.into();
+            target.DestBlend = D3D12_BLEND_ONE;
+            target.BlendOp = D3D12_BLEND_OP_MAX;
+        }
+        g.blend.RenderTarget[1].DestBlendAlpha = D3D12_BLEND_ONE;
+        g.blend.RenderTarget[1].BlendOpAlpha = D3D12_BLEND_OP_MAX;
+        g.blend.RenderTarget[2].RenderTargetWriteMask = 1;
+
+        let mut expected = g.blend;
+        expected.RenderTarget[2].BlendEnable = false.into();
+        assert_eq!(g.host_blend(), expected);
+
+        let before = g.describe();
+        g.blend = expected;
+        assert_eq!(before, g.describe());
+    }
+
+    #[test]
+    fn integer_rtv_blend_splits_shared_state_only_for_mixed_active_formats() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 4;
+        g.targets.RTFormats[..5].copy_from_slice(&[
+            DXGI_FORMAT_R8_SINT, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_UINT,
+        ]);
+        g.blend.AlphaToCoverageEnable = true.into();
+        let shared = &mut g.blend.RenderTarget[0];
+        shared.BlendEnable = true.into();
+        shared.BlendOp = D3D12_BLEND_OP_MAX;
+        shared.RenderTargetWriteMask = 3;
+        *shared = D3D12_RENDER_TARGET_BLEND_DESC {
+            LogicOp: D3D12_LOGIC_OP_XOR,
+            ..*shared
+        };
+
+        let mut expected = g.blend;
+        expected.IndependentBlendEnable = true.into();
+        expected.RenderTarget[1] = expected.RenderTarget[0];
+        expected.RenderTarget[3] = expected.RenderTarget[0];
+        expected.RenderTarget[0].BlendEnable = false.into();
+        assert_eq!(g.host_blend(), expected);
+    }
+
+    #[test]
+    fn integer_rtv_blend_keeps_shared_mode_for_integer_only_targets() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 2;
+        g.targets.RTFormats[..2].copy_from_slice(&[DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R32G32_SINT]);
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.blend.RenderTarget[0].BlendOp = D3D12_BLEND_OP_MAX;
+
+        let mut expected = g.blend;
+        expected.RenderTarget[0].BlendEnable = false.into();
+        assert_eq!(g.host_blend(), expected);
+
+        g.blend = expected;
+        g.blend.RenderTarget[0].LogicOpEnable = true.into();
+        g.blend.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_XOR;
+        assert_eq!(g.host_blend(), g.blend);
+    }
+
+    #[test]
+    fn integer_rtv_blend_keeps_blend_on_normalized_formats() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[..4].copy_from_slice(&[
+            DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8B8A8_SNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            DXGI_FORMAT_R8_UINT,
+        ]);
+        for target in &mut g.blend.RenderTarget[..4] {
+            target.BlendEnable = true.into();
+        }
+        assert_eq!(g.host_blend(), g.blend);
+
+        g.blend.IndependentBlendEnable = true.into();
+        assert_eq!(g.host_blend(), g.blend);
+    }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };

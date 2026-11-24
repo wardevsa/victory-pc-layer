@@ -1508,6 +1508,10 @@ mod barycentric_tests {
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        pixel_with_input(words, input_addr, false)
+    }
+
+    fn pixel_with_input(words: &[u32], input_addr: u32, fp16: bool) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -1521,7 +1525,7 @@ mod barycentric_tests {
                     mask: 0b1111,
                     attr: 0,
                     flat: false,
-                    fp16: false,
+                    fp16,
                     pack2: false,
                     row2: 0,
                 }],
@@ -1622,6 +1626,32 @@ mod barycentric_tests {
         assert_eq!(features & 0x2_0000, 0);
         assert!(inputs.iter().all(|e| e.kind != 28), "{inputs:?}");
         validate(&shader);
+    }
+
+    #[test]
+    fn mixed_f16_write_preserves_the_first_interpolation_half() {
+        for mix in [0xCC21_0002, 0xCC22_0002] {
+            let words = [
+                0xD742_0002,
+                0x0002_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
+                0xD75A_0003,
+                0x040A_0200, // v_interp_p2_f16 v3, v1, attr0.x, v2
+                mix,
+                0x03C9_E4F2, // v_fma_mixlo/hi_f16 v2, 1.0, 1.0, 1.0
+                0x7E08_1702, // v_cvt_f32_f16 v4, v2
+                0x2C0A_0490, // v_lshrrev_b32 v5, 16, v2
+                0x7E0C_1705, // v_cvt_f32_f16 v6, v5
+                0x7E0E_1703, // v_cvt_f32_f16 v7, v3
+                0xF800_180F,
+                0x0407_0604, // exp mrt0, v4, v6, v7, v4 done vm
+                S_ENDPGM,
+            ];
+            let shader = pixel_with_input(&words, PERSP_CENTER, true).unwrap();
+            let (_, inputs) = parts(&shader);
+            assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
+            assert_eq!(texcoord_mode(&shader), 1);
+            validate(&shader);
+        }
     }
 
     /// Both: the attribute is interpolated and J is used as a value.
