@@ -279,9 +279,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     true
 }
 
-/// Whether a texture refresh that finds the runtime remapping title memory
-/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; off by
-/// default).
+/// Whether a texture refresh can proceed while the runtime remaps title
+/// memory. `VICTORY_TEXTURE_NO_WAIT=0` restores the blocking read for A/B.
 ///
 /// A texture whose memory is all mapped is read in place, under a lock
 /// the runtime takes alone while it changes a mapping
@@ -293,7 +292,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// of it (1,345 of 1,381 ms; 3,630 of 3,708; the write-watch askings 3-12
 /// ms, the texture's own lock 0).
 ///
-/// With the switch the refresh asks for the lock without waiting. If the
+/// By default the refresh asks for the lock without waiting. If the
 /// runtime has it, the texture is read through the kernel instead, which
 /// needs no lock: it fails if a page is not there, and then the texture is
 /// left as it is and read at its next refresh, a frame later. A read
@@ -303,7 +302,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// is remapping may show a frame later. It never shows partly read.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
@@ -592,6 +591,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 }
 
 impl Staging {
+
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
         (self.memory as usize, self.layout.size as usize)
@@ -753,10 +753,14 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let hash = blake3::hash(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
             }
             true
         });
@@ -1091,6 +1095,37 @@ mod title_memory_tests {
                 assert!(bytes[0x5_0000..HEAD].iter().all(|&b| b == 0x5a));
                 assert!(bytes[HEAD..].iter().all(|&b| b == 0));
             });
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn a_kernel_texture_read_requires_every_page_while_remapping() {
+        use windows_sys::Win32::System::Memory::*;
+
+        const PAGE: usize = 4096;
+        // SAFETY: all accesses stay within the reserved range and touch only
+        // committed pages directly. The kernel reads the whole range for us.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE)
+                .cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            base.write_bytes(0x5a, PAGE);
+
+            let mut read = vec![0; 2 * PAGE];
+            {
+                let _remapping = crate::watch::title_memory_remapping();
+                assert!(crate::watch::title_memory_reading_now().is_none());
+                assert!(!crate::host::read_into(base, &mut read));
+
+                let second = base.add(PAGE);
+                assert_eq!(VirtualAlloc(second.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), second.cast());
+                second.write_bytes(0xa5, PAGE);
+                assert!(crate::host::read_into(base, &mut read));
+                assert_eq!(&read[..PAGE], &[0x5a; PAGE]);
+                assert_eq!(&read[PAGE..], &[0xa5; PAGE]);
+            }
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
     }
