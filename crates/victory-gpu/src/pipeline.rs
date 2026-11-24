@@ -622,23 +622,44 @@ pub(crate) extern "system" fn create_precompiled_compute(
     let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     #[cfg(windows)]
     crate::device::dump_unknown_pipeline(0x218, call, desc.cast());
-    if !precompiled_on(call) {
-        return E_NOTIMPL;
+    let selection = precompiled_selection();
+    match selection {
+        Selection::Off => return E_NOTIMPL,
+        Selection::Calls(a, b) if !(a..=b).contains(&call) => return E_NOTIMPL,
+        _ => {}
     }
     // SAFETY: the title passes a description (null is tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
     use std::sync::atomic::{AtomicU64, Ordering};
-    // Made and failed, logged at powers of two with the call number (what
-    // a `VICTORY_PRECOMPILED` range counts).
+    // Made and failed, logged at powers of two with the call number.
     static MADE: AtomicU64 = AtomicU64::new(0);
     static FAILED: AtomicU64 = AtomicU64::new(0);
     match precompiled_container(desc) {
         Ok(container) => {
+            // The program's hash as pipelines log it (`shader`): what a hash
+            // range and the skip list go by, the same in every run.
+            let hash = blake3::hash(&container).to_hex()[..16].to_owned();
+            let prefix = u16::from_str_radix(&hash[..4], 16).unwrap_or(0);
+            if let Selection::Hashes(a, b) = selection
+                && !(a..=b).contains(&prefix)
+            {
+                return E_NOTIMPL;
+            }
+            if precompiled_skipped(&hash) {
+                return E_NOTIMPL;
+            }
             let n = MADE.fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_power_of_two() {
                 tracing::info!(made = n, call, "precompiled compute pipelines (0x218) made");
+            }
+            // In a narrowed hash range, every program made, by hash: the
+            // candidates when the picture changes.
+            if let Selection::Hashes(a, b) = selection
+                && b - a < 0x1000
+            {
+                tracing::info!(%hash, "precompiled compute pipeline (0x218) made in the hash range");
             }
             hand_out(
                 vec![shader("compute", &container)],
@@ -658,33 +679,87 @@ pub(crate) extern "system" fn create_precompiled_compute(
     }
 }
 
-/// Whether 0x218 makes the pipeline of its `call`-th call (from 1):
-/// `VICTORY_PRECOMPILED=1` for every call, `=<first>-<last>` for those
-/// calls only (to find which pipelines change the picture by halving the
-/// range); off by default. On an RTX 2060 SUPER (2026-11-24) the frame rate
-/// rose from about 3 to 4 fps with every call, but the picture went grey or
-/// blank: some of the programs that now run compute wrongly, or read what
-/// others that still fail never write. Off, the calls fail as before and
-/// the title goes without these pipelines.
-fn precompiled_on(call: u32) -> bool {
-    static RANGE: OnceLock<Option<(u32, u32)>> = OnceLock::new();
-    let range = RANGE.get_or_init(|| {
-        let v = std::env::var("VICTORY_PRECOMPILED").ok()?;
-        let v = v.trim();
-        let range = if v == "1" {
-            (1, u32::MAX)
-        } else {
-            let (a, b) = v.split_once('-')?;
-            (a.trim().parse().ok()?, b.trim().parse().ok()?)
+/// Which 0x218 calls make their pipeline (`VICTORY_PRECOMPILED`).
+#[derive(Clone, Copy)]
+enum Selection {
+    Off,
+    All,
+    /// Calls `a` to `b` (from 1). The title makes these pipelines from
+    /// several threads, so the numbering differs between runs.
+    Calls(u32, u32),
+    /// Programs whose hash (as logged) starts with 4 hex digits from `a` to
+    /// `b`: the same programs in every run, to find by halving the range
+    /// which ones change the picture.
+    Hashes(u16, u16),
+}
+
+/// `VICTORY_PRECOMPILED`: `1` every call, `<first>-<last>` those calls,
+/// `h<hex4>-<hex4>` (e.g. `h0000-7fff`) programs whose hash starts in that
+/// range; off by default. On an RTX 2060 SUPER (2026-11-24) the world ran at
+/// about 12 fps instead of 3 with every call, but the picture went grey:
+/// some of the programs that now run compute wrongly, or read what others
+/// that still fail never write. Off, the calls fail as before and the title
+/// goes without these pipelines.
+fn precompiled_selection() -> Selection {
+    static SELECTION: OnceLock<Selection> = OnceLock::new();
+    *SELECTION.get_or_init(|| {
+        let Ok(v) = std::env::var("VICTORY_PRECOMPILED") else {
+            return Selection::Off;
         };
-        tracing::warn!(
-            first = range.0,
-            last = range.1,
-            "VICTORY_PRECOMPILED: device method 0x218 makes compute pipelines for these calls"
-        );
-        Some(range)
-    });
-    range.is_some_and(|(a, b)| (a..=b).contains(&call))
+        let v = v.trim();
+        let parsed = if v == "1" {
+            Some(Selection::All)
+        } else if let Some(hex) = v.strip_prefix(['h', 'H']) {
+            hex.split_once('-').and_then(|(a, b)| {
+                Some(Selection::Hashes(
+                    u16::from_str_radix(a.trim(), 16).ok()?,
+                    u16::from_str_radix(b.trim(), 16).ok()?,
+                ))
+            })
+        } else {
+            v.split_once('-').and_then(|(a, b)| {
+                Some(Selection::Calls(a.trim().parse().ok()?, b.trim().parse().ok()?))
+            })
+        };
+        let selection = parsed.unwrap_or(Selection::Off);
+        match selection {
+            Selection::Off if v != "0" && !v.is_empty() => {
+                tracing::warn!(value = v, "VICTORY_PRECOMPILED not understood: 0x218 stays off");
+            }
+            Selection::Off => {}
+            Selection::All => tracing::warn!("VICTORY_PRECOMPILED=1: 0x218 makes every pipeline"),
+            Selection::Calls(a, b) => {
+                tracing::warn!(first = a, last = b, "VICTORY_PRECOMPILED: 0x218 makes these calls' pipelines");
+            }
+            Selection::Hashes(a, b) => tracing::warn!(
+                from = format_args!("{a:04x}"),
+                to = format_args!("{b:04x}"),
+                "VICTORY_PRECOMPILED: 0x218 makes the pipelines whose hash starts in this range"
+            ),
+        }
+        selection
+    })
+}
+
+/// Whether the program with `hash` (16 hex digits, as logged) is on
+/// `VICTORY_PRECOMPILED_SKIP` (hashes separated by commas): programs found
+/// to spoil the picture stay without their pipeline while the rest run.
+fn precompiled_skipped(hash: &str) -> bool {
+    static SKIP: OnceLock<Vec<String>> = OnceLock::new();
+    SKIP.get_or_init(|| {
+        let list: Vec<String> = std::env::var("VICTORY_PRECOMPILED_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
+        if !list.is_empty() {
+            tracing::warn!(count = list.len(), "VICTORY_PRECOMPILED_SKIP: these 0x218 programs stay without pipelines");
+        }
+        list
+    })
+    .iter()
+    .any(|h| h == hash)
 }
 
 /// The console container for a 0x218 description.

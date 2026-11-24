@@ -7,7 +7,11 @@
 #         .\jugar.ps1 -Precompiled  (makes device method 0x218's compute
 #                                 pipelines, VICTORY_PRECOMPILED=1: faster, but
 #                                 the picture can go grey; work in progress)
-#         .\jugar.ps1 -Precompiled -Calls 1-500  (only those 0x218 calls)
+#         .\jugar.ps1 -Precompiled -Calls h0000-7fff  (only 0x218 programs whose
+#                                 hash starts in that range: the same ones
+#                                 every run; plain numbers select calls)
+#         .\jugar.ps1 -Precompiled -Skip <hash>,<hash>  (every 0x218 program
+#                                 but these)
 # The title's executable is VICTORY_GAME_DIR if that names an .exe; if it
 # names a folder, the largest .exe in it. Or pass it with -Game.
 param(
@@ -15,6 +19,7 @@ param(
     [switch]$Diag,
     [switch]$Precompiled,
     [string]$Calls = "",
+    [string]$Skip = "",
     [string]$Game = $(
         if ($env:VICTORY_GAME_DIR -like "*.exe") { $env:VICTORY_GAME_DIR }
         elseif ($env:VICTORY_GAME_DIR -and (Test-Path $env:VICTORY_GAME_DIR -PathType Container)) {
@@ -42,6 +47,7 @@ $env:VICTORY_CARD_BUFFERS_MIN_MB = "1"
 $env:VICTORY_CARD_BUFFERS_MB = "1024"
 
 $env:VICTORY_PRECOMPILED = if (-not $Precompiled) { "0" } elseif ($Calls) { $Calls } else { "1" }
+$env:VICTORY_PRECOMPILED_SKIP = $Skip
 
 Set-Location $PSScriptRoot
 $exe = ".\target\release\victory.exe"

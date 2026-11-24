@@ -27,6 +27,10 @@ windows = { workspace = true, optional = true, features = [
     "Win32_Graphics_Dxgi_Common",
 ] }
 
+[dev-dependencies]
+# examples/precompiled.rs: a program's hash as victory-gpu logs it.
+blake3.workspace = true
+
 [target.'cfg(windows)'.dev-dependencies]
 windows = { workspace = true, features = [
     "Win32_Foundation",
