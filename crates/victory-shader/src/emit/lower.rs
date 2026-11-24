@@ -6029,18 +6029,23 @@ impl<'a> Lower<'a> {
                     .get(..4)
                     .and_then(|w| w.try_into().ok())
                     .ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
+                let cmp = props.0 & 0x8000 != 0;
+                let n = match self.samplers.iter().enumerate().position(|(i, w)| {
+                    *w == words && (i < 64 && self.s.cmp_samplers >> i & 1 != 0) == cmp
+                }) {
                     Some(n) => n,
                     None => {
+                        let n = self.samplers.len();
+                        if cmp && n >= 64 {
+                            return Err("too many comparison static samplers");
+                        }
                         self.samplers.push(words);
-                        self.samplers.len() - 1
+                        if cmp {
+                            self.s.cmp_samplers |= 1u64 << n;
+                        }
+                        n
                     }
                 };
-                if props.0 & 0x8000 != 0 {
-                    // shortcut: one sampler used with and without comparison
-                    // would need two static samplers; it becomes a comparison one.
-                    self.s.cmp_samplers |= 1 << n;
-                }
                 Ok(self.s.sampler_handle(self.cur, n as u32))
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
@@ -11392,5 +11397,92 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn static_sampler_separates_ordinary_and_comparison_uses() {
+        let sample = [
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf 2D
+        ];
+        let sample_cmp = [
+            0xF0BC_0108,
+            0x0043_1002, // image_sample_c_lz v16, v[2:4], s[12:19], s[8:11] dmask:0x1 2D
+        ];
+        for (cmp_first, first, second) in [
+            (false, sample, sample_cmp),
+            (true, sample_cmp, sample),
+        ] {
+            let mut words = vec![
+                0xBE81_0380, // s_mov_b32 s1, 0 (high table address)
+                0xF40C_0300,
+                0xFA00_0000, // s_load_dwordx8 s[12:19], s[0:1], 0 (2D SRV)
+                0xF408_0500,
+                0xFA00_0040, // s_load_dwordx4 s[20:23], s[0:1], 64 (raw UAV)
+                0xBE88_0380, // s_mov_b32 s8, 0  (constant sampler words)
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xBE8A_0380, // s_mov_b32 s10, 0
+                0xBE8B_0380, // s_mov_b32 s11, 0
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0x7E08_0280, // v_mov_b32 v4, 0
+            ];
+            words.extend_from_slice(&first);
+            words.extend_from_slice(&second);
+            words.extend_from_slice(&[
+                0x0618_210C, // v_add_f32 v12, v12, v16
+                0x38 << 26 | 0x1C << 18,
+                0x80 << 24 | 5 << 16 | 12 << 8, // buffer_store_dword v12, off, s[20:23], 0
+                S_ENDPGM,
+            ]);
+            let (layout, used) = texture_and_uav_tables();
+            let l = lower_wave(&words, layout.clone(), used.clone(), false).expect("lower");
+            assert_eq!(l.samplers.len(), 2, "cmp_first={cmp_first}");
+            assert_eq!(l.samplers[0], l.samplers[1], "cmp_first={cmp_first}");
+            assert_eq!(
+                l.cmp_samplers,
+                if cmp_first { 0b01 } else { 0b10 },
+                "cmp_first={cmp_first}"
+            );
+            #[cfg(windows)]
+            if let Ok(mut v) = crate::emit::validator::Validator::load(
+                crate::emit::validator::Validator::default_path().as_deref(),
+            ) {
+                let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
+                let native = NativeProgram {
+                    stage: HwStage::Cs,
+                    wave64: false,
+                    vgprs: 20,
+                    layout,
+                    used,
+                    io: StageIo::Cs(ComputeIo {
+                        rsrc2: 1 << 15 | sgprs.max(2) << 1,
+                        threads: [64, 1, 1],
+                    }),
+                    code,
+                };
+                let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir");
+                let st = structure::structure(&p).expect("structure");
+                let io = io::raise(&p, &native).expect("io");
+                let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("res");
+                let empty_bytes = crate::dxbc::build(&[]);
+                let empty = crate::dxbc::Container::parse(&empty_bytes).unwrap();
+                let shader = crate::emit::emit(&empty, &native, &p, &st, &io, &res).expect("emit");
+                assert_eq!(shader.static_samplers.len(), 2);
+                assert_eq!(
+                    shader.static_samplers[0].filter & 0x80 != 0,
+                    cmp_first,
+                    "cmp_first={cmp_first}"
+                );
+                assert_eq!(
+                    shader.static_samplers[1].filter & 0x80 != 0,
+                    !cmp_first,
+                    "cmp_first={cmp_first}"
+                );
+                v.validate(&mut shader.dxil.clone())
+                    .expect("DXIL validation failed");
+            }
+        }
     }
 }
