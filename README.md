@@ -50,6 +50,33 @@ Licensed GPL-3.0-or-later, like VIctory and victory-fork (see `LICENSE`).
   pipeline methods still being worked out (16 of 0x1c8, 400 of 0x218), and
   two examples to study them offline (`examples/disasm_raw.rs`,
   `examples/precompiled.rs`).
+- **Community pull requests to victory-fork not merged there yet**, picked
+  for this PC, checked for unsafe code, merged and tested here (2026-11-24).
+  Thanks to their authors:
+
+  | PR | Author | What it does |
+  |----|--------|--------------|
+  | [#280](https://github.com/fxceless/victory-fork/pull/280) | Kamiloj9 | FP16 interpolation; integer render-target pipelines |
+  | [#270](https://github.com/fxceless/victory-fork/pull/270) | fffluffy-dev | texture refreshes no longer wait for title memory remapping |
+  | [#271](https://github.com/fxceless/victory-fork/pull/271) | fffluffy-dev | parallel detiling of large textures (`VICTORY_TEXTURE_DETILE_WORKERS`) |
+  | [#272](https://github.com/fxceless/victory-fork/pull/272) | fffluffy-dev | a sent-ahead submission is waited for before its staging buffer is reused |
+  | [#240](https://github.com/fxceless/victory-fork/pull/240) | fffluffy-dev | lighter copy-back scratch |
+  | [#241](https://github.com/fxceless/victory-fork/pull/241) | fffluffy-dev | textures refused for lack of memory are tried again |
+  | [#239](https://github.com/fxceless/victory-fork/pull/239) | fffluffy-dev | empty indirect executions end early |
+  | [#255](https://github.com/fxceless/victory-fork/pull/255) | gomeaw | copy-back bounds scanned in 32-byte chunks |
+  | [#253](https://github.com/fxceless/victory-fork/pull/253) | TG0000 | card-memory hash passes with a group per piece |
+  | [#276](https://github.com/fxceless/victory-fork/pull/276) | adritoyalser | static sampler slots keyed by comparison kind |
+  | [#281](https://github.com/fxceless/victory-fork/pull/281) | adritoyalser | concurrent frame waits no longer share a tick |
+  | [#277](https://github.com/fxceless/victory-fork/pull/277) | fluffyflattershy-afk | literal select masks in half-wave lowering |
+  | [#251](https://github.com/fxceless/victory-fork/pull/251) | fluffyflattershy-afk | `VICTORY_WINDOW_MAX` for the title window |
+  | [#262](https://github.com/fxceless/victory-fork/pull/262) | xADEL | `s_cbranch_execz` kept over loops that cannot exit |
+  | [#260](https://github.com/fxceless/victory-fork/pull/260) | Ortomanic | `CalculateLOD` gets only the spatial coordinates |
+  | [#258](https://github.com/fxceless/victory-fork/pull/258) | Ortomanic | the title's FidelityFX upscaler programs translate |
+
+  And [issue #269](https://github.com/fxceless/victory-fork/issues/269) by
+  PatrickSantoZZ found the startup and cutscene flicker:
+  `jugar.ps1` sets `VICTORY_TEXTURE_GUARD=0` for it (`-Fast` keeps the
+  guard).
 
 ## Results on the test PC (2026-11-24)
 
@@ -60,7 +87,8 @@ NVIDIA RTX 2060 SUPER 8 GB, AMD Ryzen 5 5600GT, 32 GB RAM, Windows 11.
 | victory-fork as is (reports 4K), first run | 0.7-1.2 fps | 860-1440 ms | 300 pipelines still being made; GPU 470 ms a frame |
 | `jugar.ps1` (1080p + speed switches), first run at 1080p | 1-2.6 fps | 380-890 ms | GPU 60-200 ms; texture preparation up to 580 ms |
 | `jugar.ps1`, caches warm | 2.4-3.1 fps | 330-410 ms | texture preparation 12-75 ms; copying back 180-280 ms |
-| `jugar.ps1 -Precompiled` | 4.1-4.4 fps | 230-250 ms | the picture goes grey or blank |
+| `jugar.ps1 -Precompiled` | 4.1-12 fps | 85-250 ms | the picture goes grey or blank |
+| `jugar.ps1` with the community PRs above and the texture guard off | ~3 fps | 305-345 ms | opening cutscene clean; the first playable scene readable (sunlit yard, fog, people), textures still coarse; pause menu 28 fps |
 
 What a player sees there: the opening cutscene, credits and title cards, and
 the first playable scene with the player character under control; with warm
