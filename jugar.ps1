@@ -14,8 +14,8 @@
 #                                 but these)
 #         .\jugar.ps1 -Fast      (keeps the texture guard: a little faster,
 #                                 but the intro flickers)
-#         .\jugar.ps1 -CardMB 1024  (more card memory for buffer copies and
-#                                 less for textures; 256 by default, for 8 GB)
+#         .\jugar.ps1 -CardMB 256  (less card memory for buffer copies, more
+#                                 for textures, but much slower; 1024 by default)
 # The title's executable is VICTORY_GAME_DIR if that names an .exe; if it
 # names a folder, the largest .exe in it. Or pass it with -Game.
 param(
@@ -23,7 +23,7 @@ param(
     [switch]$Diag,
     [switch]$Precompiled,
     [switch]$Fast,
-    [int]$CardMB = 256,
+    [int]$CardMB = 1024,
     [string]$Calls = "",
     [string]$Skip = "",
     [string]$Game = $(
@@ -48,9 +48,10 @@ $env:VICTORY_RELAY = "2"
 # Finds what shaders wrote on several threads (faster copy-back).
 $env:VICTORY_WIDE_BACK = "1"
 # Title buffers of 1 MB or more keep a copy in the card's memory (up to
-# -CardMB, 256 by default) instead of being copied every frame. On an 8 GB
-# card 1024 took 941 MB that the textures then lacked: the card filled up
-# and 13,000 textures waited for room for the rest of the run, coarse.
+# -CardMB, 1024 by default) instead of being copied every frame. On an 8 GB
+# card 256 left textures about 700 MB more (10,800 waiting for room instead
+# of 13,100), but copying back what shaders wrote went from 180-280 to
+# 440-620 ms a frame: about 3 fps fell to 1.7.
 $env:VICTORY_CARD_BUFFERS_MIN_MB = "1"
 $env:VICTORY_CARD_BUFFERS_MB = "$CardMB"
 # Textures in view memory are checked at every refresh instead of every 8th
