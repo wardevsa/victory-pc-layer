@@ -1,3 +1,65 @@
+# gta6-pc-layer
+
+A combination of the existing work on running the Xbox Series build of Grand
+Theft Auto VI on Windows, tuned to start on more modest PCs (tested on an
+NVIDIA RTX 2060 SUPER 8 GB, Ryzen 5 5600GT, 32 GB RAM). It is built on
+[victory-gta6](https://github.com/fxceless/victory-gta6), itself a fork of
+[VIctory](https://github.com/Marvisak/VIctory); both projects' full history is
+kept in this repository, and their README follows below unchanged.
+
+**This repository contains no game files, code or assets.** You need your own
+legally obtained copy of the game. It is not affiliated with or endorsed by
+Rockstar Games or Take-Two Interactive.
+
+## Credits
+
+All of the emulation work is theirs:
+
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
+  contributors: the loader, runtime services, Direct3D 12 back end and shader
+  recompiler everything here rests on.
+- **[victory-gta6](https://github.com/fxceless/victory-gta6)** by fxceless and
+  its contributors: the fixes that get the world to render (meshlet culling,
+  descriptor tables, root views, texture streaming, speed switches and more).
+- **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors, which
+  victory-gta6 used as a reference (no XCL code is included: it is
+  GPL-2.0-only).
+
+Licensed GPL-3.0-or-later, like VIctory and victory-gta6 (see `LICENSE`).
+
+## What this repository adds
+
+- `jugar.ps1`: a launcher with the settings that matter on a weaker GPU. The
+  emulator reports a 4K display to the game by default; the launcher reports
+  1920x1080 (`VICTORY_DISPLAY_MODE`), and turns on victory-gta6's speed
+  switches (`VICTORY_RELAY=2`, `VICTORY_WIDE_BACK=1`,
+  `VICTORY_CARD_BUFFERS_MIN_MB=1`, `VICTORY_CARD_BUFFERS_MB=1024`). On the
+  test PC that took the world from about 0.8 to 1-2.6 frames per second.
+
+## Use
+
+Requirements and build steps are those of VIctory (below). Then:
+
+```powershell
+cargo build --release -p victory
+# edit the game path at the top of jugar.ps1, then:
+powershell -ExecutionPolicy Bypass -File .\jugar.ps1            # 1920x1080
+powershell -ExecutionPolicy Bypass -File .\jugar.ps1 1280x720   # faster
+```
+
+**Not playable yet**: about 1-2.6 frames per second in the world on the test
+PC, geometry missing where shaders do not translate yet, textures loading
+late, and everything in shadow black (ray tracing does not run yet).
+
+To take in newer work from victory-gta6:
+
+```powershell
+git remote add victory-gta6 https://github.com/fxceless/victory-gta6
+git pull victory-gta6 main
+```
+
+---
+
 # victory-gta6
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), the
