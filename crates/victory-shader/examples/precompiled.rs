@@ -36,6 +36,10 @@ fn main() {
                     p.used.len()
                 );
                 let container = victory_shader::native::native_container(&p)?;
+                // The hash victory-gpu logs and VICTORY_PRECOMPILED's hash
+                // ranges and skip list go by.
+                let hash = blake3::hash(&container).to_hex()[..16].to_owned();
+                let summary = format!("hash {hash} {summary}");
                 let shader = victory_shader::emit::translate(&container)?;
                 Ok((summary, shader))
             })
