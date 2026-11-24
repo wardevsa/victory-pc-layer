@@ -79,3 +79,4 @@ Thumbs.db
 
 # Run logs of jugar.ps1 and manual runs
 *.log
+pipeline-dumps/

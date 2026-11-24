@@ -396,7 +396,58 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
     }
+    #[cfg(windows)]
+    dump_unknown_pipeline(SLOT, calls, desc);
     E_NOTIMPL
+}
+
+/// With `VICTORY_PIPELINE_DUMP=<folder>`: the first 16 calls of each
+/// unknown pipeline method write what they were given, so that the methods
+/// can be written: `<slot>-<call>-desc.bin` (the description's first 512
+/// bytes), `-obj.bin` (512 bytes at its first word, an object of ours so
+/// far) and `-w<i>.bin` for each (address, size) pair of words `i`, `i+1`
+/// that looks like a block (a size from 1 to 1 MiB after an address).
+#[cfg(windows)]
+fn dump_unknown_pipeline(slot: usize, calls: u32, desc: *const u8) {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    let Some(dir) = DIR.get_or_init(|| {
+        let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_PIPELINE_DUMP")?);
+        std::fs::create_dir_all(&dir).ok()?;
+        tracing::warn!(dir = %dir.display(), "unknown pipeline methods' arguments dumped");
+        Some(dir)
+    }) else {
+        return;
+    };
+    if calls > 16 || desc.is_null() {
+        return;
+    }
+    let read = |at: u64, n: usize| -> Option<Vec<u8>> {
+        let mut bytes = vec![0u8; n];
+        (at != 0 && crate::host::read_into(at as *const u8, &mut bytes)).then_some(bytes)
+    };
+    let name = |what: &str| dir.join(format!("{slot:x}-{calls:02}-{what}.bin"));
+    let Some(head) = read(desc as u64, 512) else {
+        return;
+    };
+    let _ = std::fs::write(name("desc"), &head);
+    let words: Vec<u64> = head
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
+        .collect();
+    if let Some(obj) = read(words[0], 512) {
+        let _ = std::fs::write(name("obj"), obj);
+    }
+    for i in 1..words.len() - 1 {
+        let (at, len) = (words[i], words[i + 1]);
+        if at > 0x10000 && (1..=1 << 20).contains(&len)
+            && let Some(block) = read(at, len as usize)
+        {
+            let _ = std::fs::write(name(&format!("w{i:02}")), block);
+        }
+    }
 }
 
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the

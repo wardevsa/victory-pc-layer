@@ -33,8 +33,45 @@ Licensed GPL-3.0-or-later, like VIctory and victory-gta6 (see `LICENSE`).
   emulator reports a 4K display to the game by default; the launcher reports
   1920x1080 (`VICTORY_DISPLAY_MODE`), and turns on victory-gta6's speed
   switches (`VICTORY_RELAY=2`, `VICTORY_WIDE_BACK=1`,
-  `VICTORY_CARD_BUFFERS_MIN_MB=1`, `VICTORY_CARD_BUFFERS_MB=1024`). On the
-  test PC that took the world from about 0.8 to 1-2.6 frames per second.
+  `VICTORY_CARD_BUFFERS_MIN_MB=1`, `VICTORY_CARD_BUFFERS_MB=1024`).
+  `jugar.ps1 -Diag` runs the diagnostics build instead (see below).
+- `VICTORY_PIPELINE_DUMP=<folder>` (any build): the first 16 calls of each of
+  the two device methods the game creates pipelines with that are not
+  implemented yet (0x1c8 and 0x218) write their arguments to that folder, so
+  the methods can be worked out.
+
+## Results on the test PC (2026-11-24)
+
+NVIDIA RTX 2060 SUPER 8 GB, AMD Ryzen 5 5600GT, 32 GB RAM, Windows 11.
+
+| Run | World frame rate | Frame time | Notes |
+|-----|------------------|------------|-------|
+| victory-gta6 as is (reports 4K), first run | 0.7-1.2 fps | 860-1440 ms | 300 pipelines still being made; GPU 470 ms a frame |
+| `jugar.ps1` (1080p + speed switches), first run at 1080p | 1-2.6 fps | 380-890 ms | GPU 60-200 ms; texture preparation up to 580 ms |
+| `jugar.ps1`, caches warm | 2.4-3.1 fps | 330-410 ms | texture preparation 12-75 ms; copying back 180-280 ms |
+
+What a player sees there: the opening cutscene, credits and title cards,
+and the prologue in the prison with Lucia under control; with warm caches
+input answers at once and her hair renders well.
+
+Still wrong, and why (from the logs and a census of every shader):
+
+- **Missing walls and objects.** Not the shader translator: it translates
+  26,148 of the game's 26,148 programs' IR and emits DXIL for about 99.5 % of
+  them. The game creates thousands of pipelines through two device methods
+  that are not implemented (0x1c8 over 16,000 calls, 0x218 over 2,000 in one
+  session); each fails, and the game silently goes without what they draw.
+  Their descriptions hold a root signature, a 0x184-byte state block, and per
+  stage machine code in GPU memory with a register block beside it; that code
+  is not in `shaders.rpf`, so the game assembles these pipelines at run time.
+  Working them out is the next big step.
+- **Textures late or blurry.** Textures are converted on the CPU within a
+  budget per frame; at 2-3 fps the queue drains slowly.
+- **Dark.** Everything the sun does not reach is black: the game lights it
+  with ray tracing, which does not run yet (about 370 draws a frame of the
+  ray-tracing structure builder are dropped on purpose).
+- **Copying back** what the GPU wrote to the game's memory costs 180-280 ms a
+  frame and is now the largest single cost.
 
 ## Use
 
@@ -47,9 +84,18 @@ powershell -ExecutionPolicy Bypass -File .\jugar.ps1            # 1920x1080
 powershell -ExecutionPolicy Bypass -File .\jugar.ps1 1280x720   # faster
 ```
 
-**Not playable yet**: about 1-2.6 frames per second in the world on the test
-PC, geometry missing where shaders do not translate yet, textures loading
-late, and everything in shadow black (ray tracing does not run yet).
+**Not playable yet**: about 2.4-3.1 frames per second in the world on the
+test PC once its caches are warm (the first run of each resolution is slower),
+geometry missing, textures loading late, and everything in shadow black (see
+the results above).
+
+The diagnostics build logs why draws are dropped and can dump the unknown
+pipeline methods' arguments:
+
+```powershell
+cargo build --release -p victory --features diagnostics --target-dir target\diag
+powershell -ExecutionPolicy Bypass -File .\jugar.ps1 -Diag
+```
 
 To take in newer work from victory-gta6:
 

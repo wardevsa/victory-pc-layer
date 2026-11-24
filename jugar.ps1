@@ -1,10 +1,14 @@
 # Launches Grand Theft Auto VI with the settings that matter on a weaker GPU.
 # Usage:  .\jugar.ps1            (1920x1080)
 #         .\jugar.ps1 1280x720   (another resolution)
+#         .\jugar.ps1 -Diag      (the diagnostics build, target\diag: logs why
+#                                 draws are dropped and dumps the arguments of
+#                                 unknown pipeline methods to pipeline-dumps\)
 # The game's executable is taken from VICTORY_GAME_DIR (the folder holding
 # game_scarlett_master.exe, or that file itself), or pass it with -Game.
 param(
     [string]$Resolution = "1920x1080",
+    [switch]$Diag,
     [string]$Game = $(
         if ($env:VICTORY_GAME_DIR -like "*.exe") { $env:VICTORY_GAME_DIR }
         elseif ($env:VICTORY_GAME_DIR) { Join-Path $env:VICTORY_GAME_DIR "game_scarlett_master.exe" }
@@ -29,4 +33,12 @@ $env:VICTORY_CARD_BUFFERS_MIN_MB = "1"
 $env:VICTORY_CARD_BUFFERS_MB = "1024"
 
 Set-Location $PSScriptRoot
-& .\target\release\victory.exe run $Game --execute 2>&1 | Tee-Object -FilePath "run-$Resolution.log"
+$exe = ".\target\release\victory.exe"
+$log = "run-$Resolution.log"
+if ($Diag) {
+    # cargo build --release -p victory --features diagnostics --target-dir target\diag
+    $exe = ".\target\diag\release\victory.exe"
+    $log = "diag-$Resolution.log"
+    $env:VICTORY_PIPELINE_DUMP = Join-Path $PSScriptRoot "pipeline-dumps"
+}
+& $exe run $Game --execute 2>&1 | Tee-Object -FilePath $log
