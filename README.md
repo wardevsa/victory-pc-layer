@@ -297,6 +297,9 @@ victory config
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
+Set `VICTORY_WINDOW_MAX=1920x1080` to cap the title window. The cap also
+respects the monitor work area. The title keeps its render resolution.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
