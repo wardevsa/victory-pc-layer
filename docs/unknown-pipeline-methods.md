@@ -1,6 +1,6 @@
-# The two pipeline creation methods not implemented yet (0x1c8, 0x218)
+# Two console pipeline creation methods (0x1c8 not implemented yet, 0x218 off by default)
 
-Grand Theft Auto VI creates thousands of pipelines through two console
+The title creates thousands of pipelines through two console
 device methods that the layer does not implement (`device.rs`,
 `unknown_pipeline`). Every call fails and the game silently goes without the
 pipeline, so whatever it draws or computes with it is missing. In one session
@@ -11,11 +11,10 @@ calls of each (`VICTORY_PIPELINE_DUMP`, see the README) and the code they
 carry, disassembled with
 `cargo run -p victory-shader --example disasm_raw -- <file>`.
 
-Neither method's shaders are containers from `shaders.rpf`: their machine
-code is already in GPU memory, and searching `shaders.rpf`, `data.rpf`,
-`textures.rpf`, `common.rpf`, `script.rpf`, `gameos.xvd` and the executable
-for it finds nothing (it may be packed in the larger archives, or built at run
-time). A translation therefore has to start from the native code and the
+Neither method's shaders are containers from the title's shader archive:
+their machine code is already in GPU memory, and searching that archive,
+the title's smaller archives and its executable for it finds nothing (it may
+be packed in the larger archives, or built at run time). A translation therefore has to start from the native code and the
 metadata blocks below rather than from a container's `XDAT`/`FSSM` record
 (`victory-shader/src/native.rs`).
 

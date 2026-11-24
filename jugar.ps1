@@ -1,4 +1,4 @@
-# Launches Grand Theft Auto VI with the settings that matter on a weaker GPU.
+# Launches the title with the settings that matter on a weaker GPU.
 # Usage:  .\jugar.ps1            (1920x1080)
 #         .\jugar.ps1 1280x720   (another resolution)
 #         .\jugar.ps1 -Diag      (the diagnostics build, target\diag: logs why
@@ -7,20 +7,25 @@
 #         .\jugar.ps1 -Precompiled  (makes device method 0x218's compute
 #                                 pipelines, VICTORY_PRECOMPILED=1: faster, but
 #                                 the picture can go grey; work in progress)
-# The game's executable is taken from VICTORY_GAME_DIR (the folder holding
-# game_scarlett_master.exe, or that file itself), or pass it with -Game.
+#         .\jugar.ps1 -Precompiled -Calls 1-500  (only those 0x218 calls)
+# The title's executable is VICTORY_GAME_DIR if that names an .exe; if it
+# names a folder, the largest .exe in it. Or pass it with -Game.
 param(
     [string]$Resolution = "1920x1080",
     [switch]$Diag,
     [switch]$Precompiled,
+    [string]$Calls = "",
     [string]$Game = $(
         if ($env:VICTORY_GAME_DIR -like "*.exe") { $env:VICTORY_GAME_DIR }
-        elseif ($env:VICTORY_GAME_DIR) { Join-Path $env:VICTORY_GAME_DIR "game_scarlett_master.exe" }
+        elseif ($env:VICTORY_GAME_DIR -and (Test-Path $env:VICTORY_GAME_DIR -PathType Container)) {
+            Get-ChildItem $env:VICTORY_GAME_DIR -Filter *.exe -File |
+                Sort-Object Length -Descending | Select-Object -First 1 -ExpandProperty FullName
+        }
     )
 )
 
 if (-not $Game -or -not (Test-Path $Game)) {
-    Write-Error "Game executable not found. Set VICTORY_GAME_DIR to the game's folder or pass -Game <path to game_scarlett_master.exe>."
+    Write-Error "Title executable not found. Set VICTORY_GAME_DIR to it (or to its folder), or pass -Game <path to the .exe>."
     exit 1
 }
 
@@ -36,7 +41,7 @@ $env:VICTORY_WIDE_BACK = "1"
 $env:VICTORY_CARD_BUFFERS_MIN_MB = "1"
 $env:VICTORY_CARD_BUFFERS_MB = "1024"
 
-$env:VICTORY_PRECOMPILED = if ($Precompiled) { "1" } else { "0" }
+$env:VICTORY_PRECOMPILED = if (-not $Precompiled) { "0" } elseif ($Calls) { $Calls } else { "1" }
 
 Set-Location $PSScriptRoot
 $exe = ".\target\release\victory.exe"

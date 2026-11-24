@@ -575,9 +575,8 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
 /// range it lies in (a table at a user-data dword, or a root sampler), as
 /// the console's own records list one layout entry per range.
 ///
-/// The wave size is not known from these blocks: the code says it where it
-/// writes `exec` (64-bit forms for 64 lanes, `exec_lo` for 32); a program
-/// that does neither is taken as 32 lanes, where lane masks do not matter.
+/// The wave size is not known from these blocks: the code says it
+/// ([`code_is_wave64`]).
 pub fn precompiled_compute(regs: &[u8], meta: &[u8], code: Vec<u8>) -> Result<NativeProgram, ShaderError> {
     if regs.len() < 0x1c {
         return Err(Malformed("precompiled compute registers too short"));
@@ -688,22 +687,35 @@ fn precompiled_tables(
     Ok((layout, used))
 }
 
-/// Whether `code` runs in 64-lane waves, by the `exec` writes it makes:
-/// 64-bit `exec` forms say 64 lanes, `exec_lo` 32; neither, 32.
+/// Whether `code` runs in 64-lane waves. The blocks do not say (no field of
+/// theirs follows the wave size across 400 programs), so the code does: a
+/// 64-bit scalar operation on `exec` or `vcc` (the compiler keeps lane masks
+/// in 32-bit operations in 32-lane waves) or a lane read or write of a lane
+/// past 31 says 64 lanes. A program with neither is taken as 32 lanes,
+/// where nothing it does depends on the wave size.
 fn code_is_wave64(code: &[u8]) -> Result<bool, ShaderError> {
     let insts = crate::gfx10::decode(code)?;
-    let mut wide = false;
     for i in &insts {
-        // The text names `exec` for 64-bit operands and `exec_lo` for 32.
+        let name = i.name().unwrap_or("");
+        // The text names `exec`/`vcc` for 64-bit operands (`_lo` for 32).
         let text = i.text(true);
-        if text.contains("exec_lo") || text.contains("exec_hi") {
-            return Ok(false);
+        let mask64 = |reg: &str| {
+            text.split([' ', ',']).any(|op| op == reg)
+        };
+        if name.starts_with("s_") && name.ends_with("_b64") && (mask64("exec") || mask64("vcc")) {
+            return Ok(true);
         }
-        if text.contains("exec") && text.contains("_b64") {
-            wide = true;
+        if matches!(name, "v_readlane_b32" | "v_writelane_b32")
+            && text
+                .rsplit([' ', ','])
+                .next()
+                .and_then(|lane| lane.parse::<u32>().ok())
+                .is_some_and(|lane| lane > 31)
+        {
+            return Ok(true);
         }
     }
-    Ok(wide)
+    Ok(false)
 }
 
 /// A console container holding `program` alone, in the layout

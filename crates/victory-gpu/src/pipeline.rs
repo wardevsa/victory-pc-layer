@@ -601,9 +601,9 @@ pub(crate) struct PrecompiledCompute {
 }
 
 /// Device method 0x218: a compute pipeline from a program the title hands
-/// over as machine code and metadata rather than as a container. Grand
-/// Theft Auto VI makes thousands of them (over 2,000 in a session; the
-/// first ones are its mip-chain programs). The program becomes a console
+/// over as machine code and metadata rather than as a container. The title
+/// makes thousands of them (over 2,000 in a session; the first ones are its
+/// mip-chain programs). The program becomes a console
 /// container of its own ([`victory_shader::native::native_container`]) and
 /// takes the path every compute pipeline does. A program that cannot be
 /// read or described fails the call as before (`E_NOTIMPL`): the title goes
@@ -618,55 +618,73 @@ pub(crate) extern "system" fn create_precompiled_compute(
         // SAFETY: the title's out pointer.
         unsafe { *out = std::ptr::null() };
     }
+    static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     #[cfg(windows)]
-    {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static CALLS: AtomicU32 = AtomicU32::new(0);
-        let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
-        crate::device::dump_unknown_pipeline(0x218, calls, desc.cast());
-    }
-    if !precompiled_on() {
+    crate::device::dump_unknown_pipeline(0x218, call, desc.cast());
+    if !precompiled_on(call) {
         return E_NOTIMPL;
     }
     // SAFETY: the title passes a description (null is tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Made and failed, logged at powers of two with the call number (what
+    // a `VICTORY_PRECOMPILED` range counts).
+    static MADE: AtomicU64 = AtomicU64::new(0);
+    static FAILED: AtomicU64 = AtomicU64::new(0);
     match precompiled_container(desc) {
-        Ok(container) => hand_out(
-            vec![shader("compute", &container)],
-            #[cfg(windows)]
-            None,
-            iid,
-            out,
-        ),
+        Ok(container) => {
+            let n = MADE.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(made = n, call, "precompiled compute pipelines (0x218) made");
+            }
+            hand_out(
+                vec![shader("compute", &container)],
+                #[cfg(windows)]
+                None,
+                iid,
+                out,
+            )
+        }
         Err(why) => {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static FAILED: AtomicU64 = AtomicU64::new(0);
             let n = FAILED.fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_power_of_two() {
-                tracing::warn!(failed = n, %why, "a precompiled compute pipeline (0x218) not made");
+                tracing::warn!(failed = n, call, %why, "a precompiled compute pipeline (0x218) not made");
             }
             E_NOTIMPL
         }
     }
 }
 
-/// Whether 0x218 makes pipelines (`VICTORY_PRECOMPILED=1`; off by default).
-/// On an RTX 2060 SUPER (2026-11-24) the frame rate rose from about 3 to 4
-/// fps with them, but the picture went grey: some of the programs that now
-/// run compute wrongly (a few thread-group sizes read as implausible say
-/// the register block's layout varies). Off, the calls fail as before and
+/// Whether 0x218 makes the pipeline of its `call`-th call (from 1):
+/// `VICTORY_PRECOMPILED=1` for every call, `=<first>-<last>` for those
+/// calls only (to find which pipelines change the picture by halving the
+/// range); off by default. On an RTX 2060 SUPER (2026-11-24) the frame rate
+/// rose from about 3 to 4 fps with every call, but the picture went grey or
+/// blank: some of the programs that now run compute wrongly, or read what
+/// others that still fail never write. Off, the calls fail as before and
 /// the title goes without these pipelines.
-fn precompiled_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var("VICTORY_PRECOMPILED").is_ok_and(|v| v.trim() == "1");
-        if on {
-            tracing::warn!("VICTORY_PRECOMPILED=1: device method 0x218 makes compute pipelines");
-        }
-        on
-    })
+fn precompiled_on(call: u32) -> bool {
+    static RANGE: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+    let range = RANGE.get_or_init(|| {
+        let v = std::env::var("VICTORY_PRECOMPILED").ok()?;
+        let v = v.trim();
+        let range = if v == "1" {
+            (1, u32::MAX)
+        } else {
+            let (a, b) = v.split_once('-')?;
+            (a.trim().parse().ok()?, b.trim().parse().ok()?)
+        };
+        tracing::warn!(
+            first = range.0,
+            last = range.1,
+            "VICTORY_PRECOMPILED: device method 0x218 makes compute pipelines for these calls"
+        );
+        Some(range)
+    });
+    range.is_some_and(|(a, b)| (a..=b).contains(&call))
 }
 
 /// The console container for a 0x218 description.

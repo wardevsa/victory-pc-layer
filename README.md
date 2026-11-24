@@ -1,44 +1,55 @@
-# gta6-pc-layer
+# victory-pc-layer
 
-A combination of the existing work on running the Xbox Series build of Grand
-Theft Auto VI on Windows, tuned to start on more modest PCs (tested on an
-NVIDIA RTX 2060 SUPER 8 GB, Ryzen 5 5600GT, 32 GB RAM). It is built on
-[victory-fork](https://github.com/fxceless/victory-fork) (formerly victory-gta6), itself a fork of
+A combination of the existing work on running an Xbox Series title natively
+on Windows, tuned to start on more modest PCs (tested on an NVIDIA RTX 2060
+SUPER 8 GB, Ryzen 5 5600GT, 32 GB RAM). It is built on
+[victory-fork](https://github.com/fxceless/victory-fork), itself a fork of
 [VIctory](https://github.com/Marvisak/VIctory); both projects' full history is
 kept in this repository, and their README follows below unchanged.
 
 **This repository contains no game files, code or assets.** You need your own
 legally obtained copy of the game. It is not affiliated with or endorsed by
-Rockstar Games or Take-Two Interactive.
+the game's developer or publisher.
 
 ## Credits
 
-All of the emulation work is theirs:
+All of the emulation work this rests on is theirs:
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors: the loader, runtime services, Direct3D 12 back end and shader
-  recompiler everything here rests on.
-- **[victory-fork](https://github.com/fxceless/victory-fork) (formerly victory-gta6)** by fxceless and
+  recompiler.
+- **[victory-fork](https://github.com/fxceless/victory-fork)** by fxceless and
   its contributors: the fixes that get the world to render (meshlet culling,
   descriptor tables, root views, texture streaming, speed switches and more).
 - **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors, which
-  victory-gta6 used as a reference (no XCL code is included: it is
+  victory-fork used as a reference (no XCL code is included: it is
   GPL-2.0-only).
 
-Licensed GPL-3.0-or-later, like VIctory and victory-gta6 (see `LICENSE`).
+Licensed GPL-3.0-or-later, like VIctory and victory-fork (see `LICENSE`).
 
 ## What this repository adds
 
 - `jugar.ps1`: a launcher with the settings that matter on a weaker GPU. The
   emulator reports a 4K display to the game by default; the launcher reports
-  1920x1080 (`VICTORY_DISPLAY_MODE`), and turns on victory-gta6's speed
+  1920x1080 (`VICTORY_DISPLAY_MODE`), and turns on victory-fork's speed
   switches (`VICTORY_RELAY=2`, `VICTORY_WIDE_BACK=1`,
   `VICTORY_CARD_BUFFERS_MIN_MB=1`, `VICTORY_CARD_BUFFERS_MB=1024`).
-  `jugar.ps1 -Diag` runs the diagnostics build instead (see below).
-- `VICTORY_PIPELINE_DUMP=<folder>` (any build): the first 16 calls of each of
-  the two device methods the game creates pipelines with that are not
-  implemented yet (0x1c8 and 0x218) write their arguments to that folder, so
-  the methods can be worked out.
+  `-Diag` runs the diagnostics build, `-Precompiled` turns on device method
+  0x218 (below).
+- **Device method 0x218** (precompiled compute pipelines), off by default:
+  the title hands most of its compute pipelines over as machine code plus
+  register and metadata blocks instead of containers. They are rebuilt as
+  console containers and translated like any other program
+  (`docs/unknown-pipeline-methods.md`). With them the world ran at about 4
+  fps instead of 3, but the picture went grey; `VICTORY_PRECOMPILED=<a>-<b>`
+  makes only calls a to b, to find which pipelines cause it.
+- Translator additions those programs need: `v_permlane16_b32` and
+  `v_permlanex16_b32`, `s_bfm_b32` and 64-bit literal moves in immediate
+  samplers, buffer descriptors made raw after loading.
+- `VICTORY_PIPELINE_DUMP=<folder>`: the arguments of the first calls of the
+  pipeline methods still being worked out (16 of 0x1c8, 400 of 0x218), and
+  two examples to study them offline (`examples/disasm_raw.rs`,
+  `examples/precompiled.rs`).
 
 ## Results on the test PC (2026-11-24)
 
@@ -46,50 +57,47 @@ NVIDIA RTX 2060 SUPER 8 GB, AMD Ryzen 5 5600GT, 32 GB RAM, Windows 11.
 
 | Run | World frame rate | Frame time | Notes |
 |-----|------------------|------------|-------|
-| victory-gta6 as is (reports 4K), first run | 0.7-1.2 fps | 860-1440 ms | 300 pipelines still being made; GPU 470 ms a frame |
+| victory-fork as is (reports 4K), first run | 0.7-1.2 fps | 860-1440 ms | 300 pipelines still being made; GPU 470 ms a frame |
 | `jugar.ps1` (1080p + speed switches), first run at 1080p | 1-2.6 fps | 380-890 ms | GPU 60-200 ms; texture preparation up to 580 ms |
 | `jugar.ps1`, caches warm | 2.4-3.1 fps | 330-410 ms | texture preparation 12-75 ms; copying back 180-280 ms |
+| `jugar.ps1 -Precompiled` | 4.1-4.4 fps | 230-250 ms | the picture goes grey or blank |
 
-What a player sees there: the opening cutscene, credits and title cards,
-and the prologue in the prison with Lucia under control; with warm caches
-input answers at once and her hair renders well.
+What a player sees there: the opening cutscene, credits and title cards, and
+the first playable scene with the player character under control; with warm
+caches input answers at once.
 
 Still wrong, and why (from the logs and a census of every shader):
 
-- **Missing walls and objects.** Not the shader translator: it translates
-  26,148 of the game's 26,148 programs' IR and emits DXIL for about 99.5 % of
-  them. The game creates thousands of pipelines through two device methods
-  that are not implemented (0x1c8 over 16,000 calls, 0x218 over 2,000 in one
-  session); each fails, and the game silently goes without what they draw.
-  Their descriptions hold a root signature, a 0x184-byte state block, and per
-  stage machine code in GPU memory with a register block beside it; that code
-  is not in `shaders.rpf`, so the game assembles these pipelines at run time.
-  Working them out is the next big step.
+- **Missing walls and objects.** Not the shader translator: it emits DXIL for
+  about 99.5 % of the programs in the game's shader archive. The title
+  creates thousands of pipelines through two device methods that were not
+  implemented (0x1c8 over 16,000 calls, 0x218 over 2,000 in one session),
+  and goes without what they draw. 0x218 (compute) is implemented now, off
+  by default; 0x1c8 (vertex and pixel programs) is the next step.
 - **Textures late or blurry.** Textures are converted on the CPU within a
   budget per frame; at 2-3 fps the queue drains slowly.
-- **Dark.** Everything the sun does not reach is black: the game lights it
+- **Dark.** Everything the sun does not reach is black: the title lights it
   with ray tracing, which does not run yet (about 370 draws a frame of the
   ray-tracing structure builder are dropped on purpose).
-- **Copying back** what the GPU wrote to the game's memory costs 180-280 ms a
-  frame and is now the largest single cost.
+- **Copying back** what the GPU wrote to the title's memory costs 180-280 ms
+  a frame and is now the largest single cost.
 
 ## Use
 
-Requirements and build steps are those of VIctory (below). Then:
+Requirements and build steps are those of VIctory (below). Then set
+`VICTORY_GAME_DIR` to the title's executable (or its folder) and:
 
 ```powershell
 cargo build --release -p victory
-# edit the game path at the top of jugar.ps1, then:
 powershell -ExecutionPolicy Bypass -File .\jugar.ps1            # 1920x1080
 powershell -ExecutionPolicy Bypass -File .\jugar.ps1 1280x720   # faster
 ```
 
 **Not playable yet**: about 2.4-3.1 frames per second in the world on the
 test PC once its caches are warm (the first run of each resolution is slower),
-geometry missing, textures loading late, and everything in shadow black (see
-the results above).
+geometry missing, textures loading late, and everything in shadow black.
 
-The diagnostics build logs why draws are dropped and can dump the unknown
+The diagnostics build logs why draws are dropped and dumps the unknown
 pipeline methods' arguments:
 
 ```powershell
@@ -97,11 +105,11 @@ cargo build --release -p victory --features diagnostics --target-dir target\diag
 powershell -ExecutionPolicy Bypass -File .\jugar.ps1 -Diag
 ```
 
-To take in newer work from victory-gta6:
+To take in newer work from victory-fork:
 
 ```powershell
-git remote add victory-gta6 https://github.com/fxceless/victory-fork
-git pull victory-gta6 main
+git remote add victory-fork https://github.com/fxceless/victory-fork
+git pull victory-fork main
 ```
 
 ---

@@ -442,6 +442,15 @@ pub(crate) fn dump_unknown_pipeline(slot: usize, calls: u32, desc: *const u8) {
     if let Some(obj) = read(words[0], 512) {
         let _ = std::fs::write(name("obj"), obj);
     }
+    // 0x218's words 9 and 10 are addresses without a size: 256 bytes of
+    // each, in case the wave size or more state is there.
+    if slot == 0x218 {
+        for i in [9, 10] {
+            if let Some(block) = read(words[i], 256) {
+                let _ = std::fs::write(name(&format!("p{i:02}")), block);
+            }
+        }
+    }
     for i in 1..words.len() - 1 {
         let (at, len) = (words[i], words[i + 1]);
         if at > 0x10000 && (1..=1 << 20).contains(&len)
