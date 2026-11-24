@@ -288,6 +288,9 @@ pub(crate) fn log_removal_context() {
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// Time waiting to reuse texture staging read by a late submission.
+static STAGING_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
 /// frame-rate line.
@@ -1568,7 +1571,10 @@ enum Step {
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>),
+    Texture {
+        staging: std::sync::Arc<crate::texture::Staging>,
+        uploads: bool,
+    },
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2067,7 +2073,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Texture(staging) => {
+                Step::Texture { staging, .. } => {
                     let (at, len) = staging.memory();
                     if touches(written, at, at + len) {
                         if count {
@@ -3848,6 +3854,33 @@ impl Host {
         working(was_working);
     }
 
+    /// A CPU detile must wait for the last GPU read of its staging buffer.
+    /// Called with the submission lock held, so no newer upload can race it.
+    pub(crate) fn wait_for_staging(&self, target: u64) {
+        // SAFETY: the fence belongs to this host. A null event waits inline.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        if completed == u64::MAX {
+            fail(format_args!("device removed while waiting to reuse texture staging"));
+        }
+        if completed < target {
+            let started = std::time::Instant::now();
+            let was_working = working(false);
+            // SAFETY: target was signalled on the host queue before preparation began.
+            let waited = unsafe { self.fence.SetEventOnCompletion(target, HANDLE::default()) };
+            working(was_working);
+            if let Err(error) = waited {
+                fail(format_args!("could not wait to reuse texture staging ({error})"));
+            }
+            // SAFETY: a plain query. Device removal can also wake the wait.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            if completed == u64::MAX || completed < target {
+                fail(format_args!("texture staging upload did not reach fence {target}"));
+            }
+            stood(started);
+            STAGING_WAIT_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+    }
+
     /// [`Host::execute`], or with `late` the first half of
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock
@@ -3989,6 +4022,13 @@ impl Host {
             self.card_sent();
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
+            }
+            for list in runs {
+                for step in &list.deferred().copies {
+                    if let Step::Texture { staging, uploads: true } = step {
+                        staging.note_upload_fence(*submitted);
+                    }
+                }
             }
             let back = declared_writes(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
@@ -5065,8 +5105,8 @@ impl HostList {
 
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>, uploads: bool) {
+        self.deferred().copies.push(Step::Texture { staging, uploads });
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -5142,7 +5182,10 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::Texture(staging) => {
+                Step::Texture { staging, uploads } => {
+                    if *uploads {
+                        staging.note_upload();
+                    }
                     if batch.texture_due(staging) {
                         staging.refresh();
                     }
@@ -5695,11 +5738,13 @@ impl Meter {
         {
             let [own, asking, still, all] =
                 [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            let staging = STAGING_WAIT_US.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames;
             if all >= 1.0 {
                 tracing::info!(
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
                      is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
-                     hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+                     hold still (the runtime remapping it), {staging:.1} ms waiting for the staging upload; \
+                     the rest is reading, hashing and detiling"
                 );
             }
             let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
