@@ -4,11 +4,15 @@
 #         .\jugar.ps1 -Diag      (the diagnostics build, target\diag: logs why
 #                                 draws are dropped and dumps the arguments of
 #                                 unknown pipeline methods to pipeline-dumps\)
+#         .\jugar.ps1 -Precompiled  (makes device method 0x218's compute
+#                                 pipelines, VICTORY_PRECOMPILED=1: faster, but
+#                                 the picture can go grey; work in progress)
 # The game's executable is taken from VICTORY_GAME_DIR (the folder holding
 # game_scarlett_master.exe, or that file itself), or pass it with -Game.
 param(
     [string]$Resolution = "1920x1080",
     [switch]$Diag,
+    [switch]$Precompiled,
     [string]$Game = $(
         if ($env:VICTORY_GAME_DIR -like "*.exe") { $env:VICTORY_GAME_DIR }
         elseif ($env:VICTORY_GAME_DIR) { Join-Path $env:VICTORY_GAME_DIR "game_scarlett_master.exe" }
@@ -31,6 +35,8 @@ $env:VICTORY_WIDE_BACK = "1"
 # instead of being copied every frame.
 $env:VICTORY_CARD_BUFFERS_MIN_MB = "1"
 $env:VICTORY_CARD_BUFFERS_MB = "1024"
+
+$env:VICTORY_PRECOMPILED = if ($Precompiled) { "1" } else { "0" }
 
 Set-Location $PSScriptRoot
 $exe = ".\target\release\victory.exe"

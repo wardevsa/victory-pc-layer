@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::mem::offset_of;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
+use crate::object::{self, E_INVALIDARG, E_NOTIMPL, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
 const PIPELINE_IIDS: [Iid; 4] = [
@@ -582,6 +582,117 @@ pub(crate) extern "system" fn create_compute_x(
     out: *mut This,
 ) -> HRESULT {
     create_compute(this, desc, iid, out)
+}
+
+/// Device method 0x218's description: a compute program the title hands
+/// over already compiled (see `docs/unknown-pipeline-methods.md`). Words
+/// after `meta` (two addresses and a hash) are not needed.
+#[repr(C)]
+pub(crate) struct PrecompiledCompute {
+    root: This,
+    /// 0x1c bytes: thread-group size, `COMPUTE_PGM_RSRC1` and `RSRC2`.
+    regs: Bytecode,
+    /// 0x14 bytes, not needed.
+    info: Bytecode,
+    /// GFX10 machine code in GPU memory.
+    code: Bytecode,
+    /// The descriptors the code loads.
+    meta: Bytecode,
+}
+
+/// Device method 0x218: a compute pipeline from a program the title hands
+/// over as machine code and metadata rather than as a container. Grand
+/// Theft Auto VI makes thousands of them (over 2,000 in a session; the
+/// first ones are its mip-chain programs). The program becomes a console
+/// container of its own ([`victory_shader::native::native_container`]) and
+/// takes the path every compute pipeline does. A program that cannot be
+/// read or described fails the call as before (`E_NOTIMPL`): the title goes
+/// without that pipeline.
+pub(crate) extern "system" fn create_precompiled_compute(
+    _: This,
+    desc: *const PrecompiledCompute,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if !out.is_null() {
+        // SAFETY: the title's out pointer.
+        unsafe { *out = std::ptr::null() };
+    }
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::device::dump_unknown_pipeline(0x218, calls, desc.cast());
+    }
+    if !precompiled_on() {
+        return E_NOTIMPL;
+    }
+    // SAFETY: the title passes a description (null is tolerated).
+    let Some(desc) = (unsafe { desc.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    match precompiled_container(desc) {
+        Ok(container) => hand_out(
+            vec![shader("compute", &container)],
+            #[cfg(windows)]
+            None,
+            iid,
+            out,
+        ),
+        Err(why) => {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static FAILED: AtomicU64 = AtomicU64::new(0);
+            let n = FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::warn!(failed = n, %why, "a precompiled compute pipeline (0x218) not made");
+            }
+            E_NOTIMPL
+        }
+    }
+}
+
+/// Whether 0x218 makes pipelines (`VICTORY_PRECOMPILED=1`; off by default).
+/// On an RTX 2060 SUPER (2026-11-24) the frame rate rose from about 3 to 4
+/// fps with them, but the picture went grey: some of the programs that now
+/// run compute wrongly (a few thread-group sizes read as implausible say
+/// the register block's layout varies). Off, the calls fail as before and
+/// the title goes without these pipelines.
+fn precompiled_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_PRECOMPILED").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::warn!("VICTORY_PRECOMPILED=1: device method 0x218 makes compute pipelines");
+        }
+        on
+    })
+}
+
+/// The console container for a 0x218 description.
+fn precompiled_container(desc: &PrecompiledCompute) -> Result<Vec<u8>, String> {
+    // Title memory, read through the kernel: a page of it may be gone.
+    let block = |b: &Bytecode, max: usize, what: &str| -> Result<Vec<u8>, String> {
+        if b.code.is_null() || b.size == 0 || b.size > max {
+            return Err(format!("{what}: {} bytes at {:p}", b.size, b.code));
+        }
+        let mut bytes = vec![0u8; b.size];
+        #[cfg(windows)]
+        if !crate::host::read_into(b.code, &mut bytes) {
+            return Err(format!("{what} not readable at {:p}", b.code));
+        }
+        #[cfg(not(windows))]
+        // SAFETY: the title passes `size` bytes (no kernel read off Windows).
+        bytes.copy_from_slice(unsafe { std::slice::from_raw_parts(b.code, b.size) });
+        Ok(bytes)
+    };
+    let regs = block(&desc.regs, 0x100, "registers")?;
+    let code = block(&desc.code, 1 << 20, "code")?;
+    let meta = block(&desc.meta, 1 << 16, "metadata")?;
+    let _ = &desc.info;
+    let program = victory_shader::native::precompiled_compute(&regs, &meta, code)
+        .map_err(|e| e.to_string())?;
+    victory_shader::native::native_container(&program).map_err(|e| e.to_string())
 }
 
 /// A pipeline described as a stream: its size and the subobjects, each a

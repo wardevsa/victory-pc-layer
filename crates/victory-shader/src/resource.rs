@@ -1171,6 +1171,9 @@ impl<'a> Tracer<'a> {
         if let Some(source) = self.loaded(words) {
             return Ok(source);
         }
+        if let Some(source) = self.made_raw(words) {
+            return Ok(source);
+        }
         if let [lo, hi, Term::Const(w2), Term::Const(w3)] = *words {
             let (mut hi, mut bits) = (hi, 0);
             while let Term::Value(v) = hi
@@ -2066,6 +2069,82 @@ impl<'a> Tracer<'a> {
         Ok(out)
     }
 
+    /// A buffer descriptor loaded and then made a raw (byte-addressed) view
+    /// of the same memory: dword 0 as loaded, dword 1 with its address bits
+    /// (0-15) kept and the stride cleared (`s_and_b32` with a mask keeping
+    /// them, `s_or_b32` of bits above them), the record count scaled
+    /// (`s_mul_i32`) and dword 3's format bits changed (`s_and_b32`,
+    /// `s_or_b32`). The precompiled compute programs of device method 0x218
+    /// turn structured buffers into raw ones this way before their atomics
+    /// (`buffer_atomic_add ... offen`). The host declares views by how the
+    /// shader reads them (raw for byte offsets) from the descriptor's base,
+    /// so the view as loaded is the same memory read the same way.
+    fn made_raw(&self, words: &[Term]) -> Option<Source> {
+        let [Term::Value(v0), w1, w2, w3] = *words else {
+            return None;
+        };
+        let load = self.defs[v0.0 as usize]?;
+        let inst = self.inst(load);
+        if !inst.name().starts_with("s_load_") {
+            return None;
+        }
+        let first = inst.writes.iter().position(|w| w.1 == v0)?;
+        let loaded = |k: usize| inst.writes.get(first + k).map(|w| w.1);
+        // Whether `t` is the loaded dword `k`, through at most a few of the
+        // operations that dword may take (`address` for dword 1: only those
+        // that keep bits 0-15).
+        let reaches = |t: Term, k: usize, address: bool| -> bool {
+            let Some(target) = loaded(k) else {
+                return false;
+            };
+            let mut t = t;
+            for _ in 0..4 {
+                let Term::Value(v) = t else {
+                    return false;
+                };
+                if v == target {
+                    return true;
+                }
+                let ops: &[&str] = if address {
+                    &["s_and_b32", "s_or_b32"]
+                } else {
+                    &["s_and_b32", "s_or_b32", "s_mul_i32"]
+                };
+                let Some((step, [a, b])) = self.sop2(v, ops) else {
+                    return false;
+                };
+                t = match (step.name(), a, b) {
+                    ("s_and_b32", x, Term::Const(m)) | ("s_and_b32", Term::Const(m), x)
+                        if !address || m & 0xffff == 0xffff =>
+                    {
+                        x
+                    }
+                    ("s_or_b32", x, Term::Const(m)) | ("s_or_b32", Term::Const(m), x)
+                        if !address || m & 0xffff == 0 =>
+                    {
+                        x
+                    }
+                    // The record count times the stride: either operand.
+                    ("s_mul_i32", x, y) => {
+                        if matches!(y, Term::Value(y) if loaded(k) == Some(y)) {
+                            y
+                        } else {
+                            x
+                        }
+                    }
+                    _ => return false,
+                };
+            }
+            false
+        };
+        (reaches(w1, 1, true) && reaches(w2, 2, false) && reaches(w3, 3, false)).then_some(
+            Source::Loaded {
+                load,
+                first: first as u8,
+            },
+        )
+    }
+
     /// Consecutive dwords of one scalar load.
     fn loaded(&self, words: &[Term]) -> Option<Source> {
         let Term::Value(v0) = words[0] else {
@@ -2331,6 +2410,16 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
+    // A bit-field mask of two constants, `((1 << width) - 1) << offset`, as
+    // the compiler builds an immediate sampler's second dword (the
+    // precompiled programs of device method 0x218).
+    if inst.name() == "s_bfm_b32"
+        && let [width, offset] = src.as_slice()
+        && let (Some(width), Some(offset)) = (lane_of(*width), lane_of(*offset))
+    {
+        let mask = 1u32.checked_shl(width & 31).map_or(u32::MAX, |b| b.wrapping_sub(1));
+        return Some(Moved::Const(mask << (offset & 31)));
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
@@ -2343,6 +2432,9 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         // that has no inline form; fold more if descriptors need it.
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
         ("s_not_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(!x)),
+        // A 32-bit literal in a 64-bit integer move fills the low dword; the
+        // high one is zero.
+        ("s_mov_b64", Operand::Literal(x)) => Some(Moved::Const(if k == 0 { x } else { 0 })),
         // 64-bit inline integers are sign-extended.
         ("s_mov_b64", Operand::Const(c @ 128..=208)) => {
             let low = inline(c)?;

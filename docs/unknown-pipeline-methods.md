@@ -71,21 +71,61 @@ entries (likely the user-data layout: which SGPRs hold which root
 parameter), and where the pixel shader's input mapping and export formats
 are.
 
-## 0x218: compute pipelines, several per call
+## 0x218: compute pipelines (implemented, off by default)
 
-The description lists several pipelines in a row, each as four
-(address, size) pairs: a 0x1c-byte block, a 0x14-byte block, the code (GPU
-memory, 0x180-0x400 bytes) and a metadata block (0x118-0x1d8 bytes), with
-other words between groups. The first call's first program samples a 2D
-array texture at a level (`image_sample_l`) and stores the result with
-`image_store`: an ordinary compute program.
+One compute pipeline per call, `(this, description, iid, out)`. The
+description is 12 words (the dumps show several, as descriptions lie side by
+side in memory):
+
+| Word | Contents |
+|------|----------|
+| 0 | the root signature |
+| 1, 2 | the register block (0x1c bytes) |
+| 3, 4 | a 0x14-byte block: a hash, then 3 (not needed) |
+| 5, 6 | machine code (GPU memory) and its size |
+| 7, 8 | the metadata block and its size |
+| 9-11 | two addresses and a 64-bit hash (not needed) |
+
+Register block: `u32 0x4005cf00, u32 0x6c090102, u32 0, u32 x | y << 16,
+u32 z | (something, 0x10 seen) << 16, u32 COMPUTE_PGM_RSRC1,
+u32 COMPUTE_PGM_RSRC2`. Groups of 8x8, 16x16, 32x32, 8x16, 32x1, 64x1, 128x1
+and 1024x1 were seen.
+
+Metadata block: `u32 0x403, u32 (bytes after the first 0x14), u32 (0x20 per
+0x42 entry), u32 0, u32 0`, a stage word, then the 32-byte entries described
+above. The 0x41 entries are the console's used-resource table in another
+packing: `(root type << 8 | resource type)` (resource 0 SRV, 1 sampler,
+2 CBV, 3 UAV; root 0 constants, 1 descriptor, 3 table, 4 immediate sampler),
+table offset, shader register, stride, `dwords | user-data dword << 8 |
+root slot << 16`. Root constants run from their user-data dword to the last
+user SGPR `RSRC2` gives.
+
+The wave size is not in the blocks; `exec` writes in the code tell it
+(64-bit forms: 64 lanes; `exec_lo`: 32), and programs with neither are
+taken as 32 lanes.
+
+`victory_shader::native::precompiled_compute` builds a `NativeProgram` from
+the blocks and `native_container` wraps it as a console container, so the
+pipeline takes the usual translation, cache and creation path
+(`pipeline::create_precompiled_compute`). Offline, `cargo run -p
+victory-shader --features host --example precompiled -- pipeline-dumps`
+translates every dumped call and makes its D3D12 pipeline. Of 400 calls
+dumped in the prologue, 126 translate; what stops the rest is general
+translator ground (addresses with two computed terms 101, lane masks of
+other lanes read as data 51, partial image stores 21, ...).
+
+In the game the pipelines are made only with `VICTORY_PRECOMPILED=1`
+(`jugar.ps1 -Precompiled`): the frame rate rose from about 3 to 4 fps, but the
+picture went grey, most likely because programs that translate now run
+while others of the same chain still fail and leave their outputs unwritten.
 
 ## Next steps
 
 1. Decode the remaining fields from more calls (the dump keeps 16 of each;
    raise the limit in `dump_unknown_pipeline` for more).
-2. Build a `NativeProgram` (`victory-shader/src/native.rs`) from code plus
-   metadata, so that the existing translator can take these programs; 0x218
-   (compute, no input/output signatures) is the simpler place to start.
-3. Implement 0x218, then 0x1c8 with its graphics state, on top of
-   `pipeline::hand_out`.
+2. 0x218: find which running program turns the picture grey (or leave out
+   chains with a member that fails), and cover more of the 274 programs that
+   do not translate.
+3. 0x1c8: the same path for vertex and pixel programs, which need their
+   input and output signatures (the input layout block, the pixel inputs)
+   and the graphics state block.

@@ -401,14 +401,15 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     E_NOTIMPL
 }
 
-/// With `VICTORY_PIPELINE_DUMP=<folder>`: the first 16 calls of each
-/// unknown pipeline method write what they were given, so that the methods
-/// can be written: `<slot>-<call>-desc.bin` (the description's first 512
-/// bytes), `-obj.bin` (512 bytes at its first word, an object of ours so
-/// far) and `-w<i>.bin` for each (address, size) pair of words `i`, `i+1`
-/// that looks like a block (a size from 1 to 1 MiB after an address).
+/// With `VICTORY_PIPELINE_DUMP=<folder>`: the first calls of each pipeline
+/// method still being worked out (16 of 0x1c8, 400 of 0x218, whose
+/// programs vary more) write what they were given: `<slot>-<call>-desc.bin`
+/// (the description's first 512 bytes), `-obj.bin` (512 bytes at its first
+/// word, an object of ours so far) and `-w<i>.bin` for each (address, size)
+/// pair of words `i`, `i+1` that looks like a block (a size from 1 to
+/// 1 MiB after an address).
 #[cfg(windows)]
-fn dump_unknown_pipeline(slot: usize, calls: u32, desc: *const u8) {
+pub(crate) fn dump_unknown_pipeline(slot: usize, calls: u32, desc: *const u8) {
     use std::sync::OnceLock;
     static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
     let Some(dir) = DIR.get_or_init(|| {
@@ -419,7 +420,8 @@ fn dump_unknown_pipeline(slot: usize, calls: u32, desc: *const u8) {
     }) else {
         return;
     };
-    if calls > 16 || desc.is_null() {
+    let limit = if slot == 0x218 { 400 } else { 16 };
+    if calls > limit || desc.is_null() {
         return;
     }
     let read = |at: u64, n: usize| -> Option<Vec<u8>> {
@@ -489,7 +491,7 @@ static FUNCTIONS: Table<160> = {
     f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
-    f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
+    f[67] = pipeline::create_precompiled_compute as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238

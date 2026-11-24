@@ -553,6 +553,297 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     Ok(out)
 }
 
+/// A compute program the title hands to device method 0x218 already split
+/// up: `regs` (0x1c bytes), `meta` and `code` (see
+/// `docs/unknown-pipeline-methods.md`).
+///
+/// ```text
+/// regs  u32 x2 (constant so far), u32 0, u32 thread-group x | y << 16,
+///       u32 thread-group z (low half; the high half is something else),
+///       u32 COMPUTE_PGM_RSRC1, u32 COMPUTE_PGM_RSRC2
+/// meta  u32 x n, then u32 (byte count of what follows the first
+///       block-size-minus-that bytes), a stage word, then entries of 8 u32:
+///       0x41 a descriptor the code loads: (root type << 8 | resource
+///            type), table offset (dwords), shader register, stride,
+///            (dwords | first user-data dword << 8 | root slot << 16),
+///            0xffffffff, 0
+///       0x42 a descriptor range (not needed here)
+///       0x43 a 16-byte hash
+/// ```
+///
+/// The root layout is not stored apart: each descriptor entry gives the
+/// range it lies in (a table at a user-data dword, or a root sampler), as
+/// the console's own records list one layout entry per range.
+///
+/// The wave size is not known from these blocks: the code says it where it
+/// writes `exec` (64-bit forms for 64 lanes, `exec_lo` for 32); a program
+/// that does neither is taken as 32 lanes, where lane masks do not matter.
+pub fn precompiled_compute(regs: &[u8], meta: &[u8], code: Vec<u8>) -> Result<NativeProgram, ShaderError> {
+    if regs.len() < 0x1c {
+        return Err(Malformed("precompiled compute registers too short"));
+    }
+    let group = u32_at(regs, 0x0c)?;
+    // z in the low half of the next word; its high half holds something
+    // else (0x10 seen with groups of 32 x 1).
+    let threads = [group & 0xffff, group >> 16, u32_at(regs, 0x10)? & 0xffff];
+    if threads.iter().any(|&t| t == 0 || t > 1024) || threads.iter().product::<u32>() > 1024 {
+        return Err(Malformed("implausible precompiled thread-group size"));
+    }
+    let rsrc1 = u32_at(regs, 0x14)?;
+    let rsrc2 = u32_at(regs, 0x18)?;
+    let user_sgprs = (rsrc2 >> 1 & 0x1f) as u8;
+    let (layout, used) = precompiled_tables(meta, user_sgprs)?;
+    let wave64 = code_is_wave64(&code)?;
+    // RSRC1 counts VGPRs in granules of 8 (32 lanes) or 4 (64 lanes).
+    let granule = if wave64 { 4 } else { 8 };
+    let vgprs = ((rsrc1 & 0x3f) + 1) * granule;
+    Ok(NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs: vgprs.min(256) as u16,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo { rsrc2, threads }),
+        code,
+    })
+}
+
+/// The root layout and used-resource tables of a precompiled program's
+/// metadata block ([`precompiled_compute`]). Root constants (an inline
+/// constant buffer) take the user SGPRs from their first dword to the last
+/// the program has (`user_sgprs`), at most as many as the entry's size byte
+/// says: in the programs seen, the constants come last.
+fn precompiled_tables(
+    meta: &[u8],
+    user_sgprs: u8,
+) -> Result<(Vec<RootParam>, Vec<UsedResource>), ShaderError> {
+    let rest = u32_at(meta, 4)? as usize;
+    let entries = meta
+        .len()
+        .checked_sub(rest)
+        .map(|head| head + 4)
+        .filter(|&at| at <= meta.len())
+        .ok_or(Malformed("precompiled metadata size disagrees"))?;
+    let mut layout: Vec<RootParam> = Vec::new();
+    let mut used = Vec::new();
+    for e in meta[entries..].as_chunks::<32>().0 {
+        if le32(e, 0) != 0x41 {
+            continue;
+        }
+        let a = le32(e, 4);
+        let root = RootType::from_raw(a >> 8 & 0xff);
+        let kind = match a & 0xff {
+            0 => ResourceType::Srv,
+            1 => ResourceType::Sampler,
+            2 => ResourceType::Cbv,
+            3 => ResourceType::Uav,
+            n => ResourceType::Other(n as u8),
+        };
+        let (table_offset_dwords, register, stride, packed) =
+            (le32(e, 8), le32(e, 12), le32(e, 16), le32(e, 20));
+        let (dwords, user_data, slot) = (packed as u8, (packed >> 8) as u8, (packed >> 16) as u8);
+        let sgprs = match root {
+            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => 1,
+            RootType::Descriptor => 2,
+            RootType::ImmediateSampler => 0,
+            RootType::Constants => {
+                let held = user_sgprs.saturating_sub(user_data);
+                if held == 0 {
+                    return Err(ShaderError::Unsupported {
+                        offset: 0,
+                        what: "a precompiled program's root constants past its user SGPRs",
+                    });
+                }
+                u32::from(held.min(dwords.max(1)))
+            }
+            _ => {
+                return Err(ShaderError::Unsupported {
+                    offset: 0,
+                    what: "a precompiled program's root parameter of an unknown type",
+                });
+            }
+        };
+        let param = RootParam {
+            root,
+            table_offset_dwords,
+            sgprs,
+            base_register: register,
+            user_data,
+            slot,
+        };
+        if !layout.contains(&param) {
+            layout.push(param);
+        }
+        used.push(UsedResource {
+            kind,
+            root,
+            table_offset_dwords,
+            lower_bound: register,
+            stride,
+            dwords,
+            user_data,
+            slot,
+        });
+    }
+    Ok((layout, used))
+}
+
+/// Whether `code` runs in 64-lane waves, by the `exec` writes it makes:
+/// 64-bit `exec` forms say 64 lanes, `exec_lo` 32; neither, 32.
+fn code_is_wave64(code: &[u8]) -> Result<bool, ShaderError> {
+    let insts = crate::gfx10::decode(code)?;
+    let mut wide = false;
+    for i in &insts {
+        // The text names `exec` for 64-bit operands and `exec_lo` for 32.
+        let text = i.text(true);
+        if text.contains("exec_lo") || text.contains("exec_hi") {
+            return Ok(false);
+        }
+        if text.contains("exec") && text.contains("_b64") {
+            wide = true;
+        }
+    }
+    Ok(wide)
+}
+
+/// A console container holding `program` alone, in the layout
+/// [`native_programs`] reads: a `DXBC` container with one `DXIL` part whose
+/// `XDAT` index names one `XBCH` blob, the zlib-packed `FSSM` payload with
+/// the program's record, stage data, root tables and code. For programs the
+/// title hands over already split up (code in GPU memory, metadata beside
+/// it) rather than as a container, so that they take the same translation,
+/// cache and pipeline path as every other program.
+///
+/// Only compute programs (`StageIo::Cs`) so far; other stages are refused.
+pub fn native_container(program: &NativeProgram) -> Result<Vec<u8>, ShaderError> {
+    let StageIo::Cs(cs) = &program.io else {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "a native container for a stage other than compute",
+        });
+    };
+    if program.layout.len() > 255 || program.used.len() > 255 {
+        return Err(Malformed("too many root table entries for a native container"));
+    }
+    let put32 = |v: &mut Vec<u8>, at: usize, x: u32| v[at..at + 4].copy_from_slice(&x.to_le_bytes());
+    let put64 = |v: &mut Vec<u8>, at: usize, x: u64| v[at..at + 8].copy_from_slice(&x.to_le_bytes());
+
+    // Payload: slot table, the compute record and its stage data, then the
+    // root tables and the code.
+    const SLOT_TABLE: usize = 0x68;
+    const CS_STAGE_DATA: usize = CS_THREADS + 12;
+    let record = SLOT_TABLE;
+    let layout_at = record + RECORD_SIZE as usize + CS_STAGE_DATA;
+    let used_at = layout_at + ENTRY_SIZE as usize * program.layout.len();
+    let code_at = (used_at + ENTRY_SIZE as usize * program.used.len()).next_multiple_of(256);
+    let mut payload = vec![0u8; code_at + program.code.len()];
+    put64(&mut payload, 0, GRAPHICS_SLOT_COUNT);
+    for (stage, at) in SLOTS {
+        let value = if stage == HwStage::Cs { record as u64 } else { ABSENT };
+        put64(&mut payload, at, value);
+    }
+    put64(&mut payload, record, code_at as u64);
+    put64(&mut payload, record + 8, program.code.len() as u64);
+    put32(
+        &mut payload,
+        record + RECORD_FLAGS,
+        if program.wave64 { 0 } else { FLAG_WAVE32 },
+    );
+    put64(&mut payload, record + RECORD_LAYOUT, layout_at as u64);
+    put64(&mut payload, record + RECORD_USED, used_at as u64);
+    put32(&mut payload, record + RECORD_COUNTS, program.layout.len() as u32);
+    put32(&mut payload, record + RECORD_COUNTS + 4, program.used.len() as u32);
+    put32(&mut payload, record + RECORD_LDS, cs.lds_bytes());
+    put32(&mut payload, record + RECORD_REGS, u32::from(program.vgprs.min(256)));
+    let stage_data = record + RECORD_SIZE as usize;
+    put32(&mut payload, stage_data + CS_RSRC2, cs.rsrc2);
+    for (k, t) in cs.threads.iter().enumerate() {
+        put32(&mut payload, stage_data + CS_THREADS + 4 * k, *t);
+    }
+    let raw_root = |r: RootType| -> Result<u32, ShaderError> {
+        Ok(match r {
+            RootType::Constants => 0,
+            RootType::Descriptor => 1,
+            RootType::Table => 3,
+            RootType::ImmediateSampler => 4,
+            RootType::ResourceHeap => 5,
+            RootType::SamplerHeap => 6,
+            RootType::Other(n) => n,
+        })
+    };
+    for (i, p) in program.layout.iter().enumerate() {
+        let at = layout_at + ENTRY_SIZE as usize * i;
+        put32(&mut payload, at, raw_root(p.root)?);
+        put32(&mut payload, at + 4, p.table_offset_dwords);
+        put32(&mut payload, at + 8, p.sgprs);
+        put32(&mut payload, at + 12, p.base_register);
+        payload[at + 16] = p.user_data;
+        payload[at + 17] = p.slot;
+    }
+    for (i, u) in program.used.iter().enumerate() {
+        let at = used_at + ENTRY_SIZE as usize * i;
+        payload[at] = match u.kind {
+            ResourceType::Srv => 0,
+            ResourceType::Sampler => 1,
+            ResourceType::Cbv => 2,
+            ResourceType::Uav => 3,
+            ResourceType::Other(n) => n,
+        };
+        payload[at + 1] = u8::try_from(raw_root(u.root)?)
+            .map_err(|_| Malformed("root type past a byte in a native container"))?;
+        put32(&mut payload, at + 4, u.table_offset_dwords);
+        put32(&mut payload, at + 8, u.lower_bound);
+        put32(&mut payload, at + 12, u.stride);
+        payload[at + 16] = u.dwords;
+        payload[at + 17] = u.user_data;
+        payload[at + 18] = u.slot;
+    }
+    payload[code_at..].copy_from_slice(&program.code);
+
+    let mut fssm = Vec::with_capacity(FSSM_HEADER + payload.len());
+    fssm.extend_from_slice(b"FSSM");
+    fssm.extend_from_slice(&FSSM_VERSION.to_le_bytes());
+    fssm.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    fssm.extend_from_slice(&payload);
+    let packed = miniz_oxide::deflate::compress_to_vec_zlib(&fssm, 1);
+
+    let mut blob = Vec::with_capacity(XBCH_HEADER + packed.len());
+    blob.extend_from_slice(b"XBCH");
+    blob.extend_from_slice(&XBCH_VERSION.to_le_bytes());
+    blob.extend_from_slice(&(packed.len() as u64).to_le_bytes());
+    blob.extend_from_slice(&(fssm.len() as u64).to_le_bytes());
+    blob.extend_from_slice(&packed);
+
+    // DXIL part data: a program header we leave zero, the XDAT index with
+    // one native entry, then the blob.
+    let index_end = XDAT_OFFSET + 12 + 12;
+    let mut part = vec![0u8; index_end];
+    part[XDAT_OFFSET..XDAT_OFFSET + 4].copy_from_slice(b"XDAT");
+    put32(&mut part, XDAT_OFFSET + 4, 1);
+    put32(&mut part, XDAT_OFFSET + 8, 0x24);
+    put32(&mut part, XDAT_OFFSET + 12, KIND_NATIVE);
+    put32(&mut part, XDAT_OFFSET + 16, index_end as u32);
+    put32(&mut part, XDAT_OFFSET + 20, blob.len() as u32);
+    part.extend_from_slice(&blob);
+
+    // The container: header, one part offset, the part.
+    const HEADER: usize = 0x20;
+    let part_at = HEADER + 4;
+    let total = part_at + 8 + part.len();
+    let mut out = vec![0u8; part_at];
+    out[0..4].copy_from_slice(b"DXBC");
+    // The digest stays zero: nothing checks it, and the shader cache keys
+    // on the bytes themselves.
+    out[0x14..0x16].copy_from_slice(&1u16.to_le_bytes());
+    put32(&mut out, 0x18, total as u32);
+    put32(&mut out, 0x1C, 1);
+    put32(&mut out, HEADER, part_at as u32);
+    out.extend_from_slice(b"DXIL");
+    out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+    out.extend_from_slice(&part);
+    Ok(out)
+}
+
 /// The entries of `size` bytes from `at`, with their count at `count_at`.
 fn semantics(data: &[u8], at: usize, size: usize, count_at: usize) -> Result<&[u8], ShaderError> {
     let count = u32_at(data, count_at)?;
