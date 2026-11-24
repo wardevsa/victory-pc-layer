@@ -1308,6 +1308,85 @@ fn fills(desc: &ResourceDesc) -> bool {
     desc.dimension != BUFFER && desc.flags & TARGET_DEPTH_UNORDERED == 0
 }
 
+/// How many of its most detailed mip levels the host copy of a texture
+/// described by `desc` goes without (`VICTORY_TEXTURE_DROP_MIPS`, 0 to 2;
+/// 0 by default): a texture quality setting, as PC games have, for cards
+/// with less memory than the console's 16 GB. Each level left out quarters
+/// the texture's memory and its upload; shaders sample the next level in its
+/// place (sampling coordinates are normalized, so they read the same
+/// picture, coarser). On an 8 GB card the full textures filled it and
+/// 13,000 of them waited for room for the rest of the run (2026-11-24).
+///
+/// Only plain 2D textures and arrays the title fills from its memory
+/// ([`fills`]: no target, depth or unordered access, so no view writes them
+/// and nothing renders to them), single-sampled, with more levels than are
+/// dropped and at least 256 texels on each side, whose smaller size is still
+/// a multiple of 4 (block-compressed formats need that of their first level).
+/// shortcut: a shader that reads texels by integer coordinates or asks the
+/// texture's size gets the smaller texture's; copies to or from it are
+/// skipped (`crate::list`), and it takes no aliased views' texels.
+#[cfg(windows)]
+fn mips_to_drop(desc: &ResourceDesc) -> u16 {
+    const TEXTURE2D: u32 = 3;
+    static DROP: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    let drop = *DROP.get_or_init(|| {
+        let n = std::env::var("VICTORY_TEXTURE_DROP_MIPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u16>().ok())
+            .unwrap_or(0)
+            .min(2);
+        if n > 0 {
+            tracing::warn!(
+                levels = n,
+                "VICTORY_TEXTURE_DROP_MIPS: large textures the title fills go without their most detailed levels"
+            );
+        }
+        n
+    });
+    let (w, h) = (desc.width >> drop, u64::from(desc.height >> drop));
+    let fits = drop > 0
+        && fills(desc)
+        && desc.dimension == TEXTURE2D
+        && desc.sample_count <= 1
+        && desc.mip_levels > drop
+        && desc.width >= 256
+        && desc.height >= 256
+        && w.is_multiple_of(4)
+        && h.is_multiple_of(4);
+    if fits { drop } else { 0 }
+}
+
+/// How many of the title texture `this`'s most detailed levels its host
+/// copy goes without ([`mips_to_drop`]); 0 without a host copy.
+#[cfg(windows)]
+pub(crate) fn dropped_mips(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return 0;
+    }
+    host_resource(this).map_or(0, |host| {
+        // SAFETY: a live resource.
+        mips_dropped_from(&r.desc, &unsafe { host.GetDesc() })
+    })
+}
+
+/// How many of the most detailed levels of a title texture described by
+/// `desc` the host texture described by `host` goes without.
+#[cfg(windows)]
+pub(crate) fn mips_dropped_from(
+    desc: &ResourceDesc,
+    host: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+) -> u32 {
+    if desc.dimension != BUFFER && host.Width < desc.width {
+        u32::from(desc.mip_levels.saturating_sub(host.MipLevels))
+    } else {
+        0
+    }
+}
+
 /// Whether the title fills texture `this` itself ([`fills`]).
 #[cfg(windows)]
 pub(crate) fn title_fills(this: This) -> bool {
@@ -1716,6 +1795,18 @@ fn host_texture(
     d.layout = 0;
     d.alignment = 0;
     d.flags &= PC_FLAGS;
+    // A lower texture quality: the most detailed levels left out.
+    let drop = mips_to_drop(desc);
+    if drop > 0 {
+        d.width >>= drop;
+        d.height >>= drop;
+        d.mip_levels -= drop;
+        static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(textures = n, levels = drop, "host textures made without their most detailed levels");
+        }
+    }
     // PC refuses depth targets that are also unordered-access (the console
     // allows both; the title's shadow maps ask for it).
     // The host copy loses the unordered access: shaders write a colour

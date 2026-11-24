@@ -14,6 +14,8 @@
 #                                 but these)
 #         .\jugar.ps1 -Fast      (keeps the texture guard: a little faster,
 #                                 but the intro flickers)
+#         .\jugar.ps1 -Texturas alta|media|baja  (texture quality; media by
+#                                 default, which fits an 8 GB card)
 #         .\jugar.ps1 -CardMB 256  (less card memory for buffer copies, more
 #                                 for textures, but much slower; 1024 by default)
 # The title's executable is VICTORY_GAME_DIR if that names an .exe; if it
@@ -24,6 +26,8 @@ param(
     [switch]$Precompiled,
     [switch]$Fast,
     [int]$CardMB = 1024,
+    [ValidateSet("alta", "media", "baja")]
+    [string]$Texturas = "media",
     [string]$Calls = "",
     [string]$Skip = "",
     [string]$Game = $(
@@ -59,6 +63,11 @@ $env:VICTORY_CARD_BUFFERS_MB = "$CardMB"
 # cutscene otherwise flicker and repeat frames (victory-fork issue #269).
 # Costs some milliseconds a frame; -Fast keeps the guard.
 $env:VICTORY_TEXTURE_GUARD = if ($Fast) { "1" } else { "0" }
+# Texture quality: large textures the title fills go without their most
+# detailed level (media: a quarter of the memory and upload) or two (baja).
+# With every level (alta) an 8 GB card filled up and 13,000 textures waited
+# for room for the rest of the run.
+$env:VICTORY_TEXTURE_DROP_MIPS = switch ($Texturas) { "alta" { "0" } "media" { "1" } "baja" { "2" } }
 # Large tiled textures detiled on 4 CPU threads (victory-fork PR #271).
 $env:VICTORY_TEXTURE_DETILE_WORKERS = "4"
 

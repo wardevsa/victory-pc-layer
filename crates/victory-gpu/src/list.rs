@@ -828,6 +828,10 @@ extern "system" fn copy_buffer_region(
 /// Whether one of two resources is a target in a stand-in format and the
 /// other is not ([`crate::resource::target_format`]): their texels differ
 /// in size, so the host cannot copy between them (logged once).
+/// Also whether either is a texture whose host copy goes without its most
+/// detailed levels (`crate::resource::dropped_mips`): its levels and sizes
+/// are not the title's, so a copy would name subresources and corners it
+/// does not have.
 #[cfg(windows)]
 fn unlike(dst: This, src: This) -> bool {
     let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src);
@@ -836,8 +840,17 @@ fn unlike(dst: This, src: This) -> bool {
         ONCE.call_once(|| {
             tracing::warn!(?dst, ?src, "copy between a stand-in target and title-format texels skipped")
         });
+        return true;
     }
-    unlike
+    let dropped = crate::resource::dropped_mips(dst) != 0 || crate::resource::dropped_mips(src) != 0;
+    if dropped {
+        static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::warn!(skipped = n, ?dst, ?src, "copy with a texture of lower quality (VICTORY_TEXTURE_DROP_MIPS) skipped");
+        }
+    }
+    dropped
 }
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
@@ -1065,6 +1078,9 @@ fn read_back(
     }
     if (x, y, z) != (0, 0, 0) {
         return Err("a destination corner other than the footprint's");
+    }
+    if crate::resource::dropped_mips(src.resource) != 0 {
+        return Err("a texture of lower quality (VICTORY_TEXTURE_DROP_MIPS)");
     }
     let host = crate::host::host().ok_or("no host")?;
     let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;

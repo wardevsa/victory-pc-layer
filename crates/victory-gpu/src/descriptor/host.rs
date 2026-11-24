@@ -1400,6 +1400,52 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     }
 }
 
+/// A view of a host texture that goes without the title texture's
+/// `dropped` most detailed levels (`crate::resource::dropped_mips`): its
+/// first level and level count shift by them, and so does its smallest
+/// level-of-detail clamp. A view of only the levels left out gets the most
+/// detailed one there is. Views of other dimensions are left as they are
+/// (only 2D textures and arrays lose levels).
+fn shift_levels(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, dropped: u32) {
+    // (first, count, clamp) -> the same on the host copy.
+    let shift = |first: u32, count: u32, clamp: f32| -> (u32, u32, f32) {
+        let host_first = first.saturating_sub(dropped);
+        let count = if count == u32::MAX {
+            u32::MAX
+        } else {
+            let end = first.saturating_add(count).saturating_sub(dropped);
+            end.max(host_first + 1) - host_first
+        };
+        (host_first, count, (clamp - dropped as f32).max(0.0))
+    };
+    // SAFETY: the union member the view's dimension names.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let t = &mut desc.Anonymous.Texture2D;
+                (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp) =
+                    shift(t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let t = &mut desc.Anonymous.Texture2DArray;
+                (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp) =
+                    shift(t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let t = &mut desc.Anonymous.TextureCube;
+                (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp) =
+                    shift(t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let t = &mut desc.Anonymous.TextureCubeArray;
+                (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp) =
+                    shift(t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);
@@ -1919,6 +1965,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
+                }
+                // A host copy without its most detailed levels: the view's
+                // levels shift with them.
+                let dropped = crate::resource::dropped_mips(resource);
+                if dropped != 0
+                    && let Some(d) = desc.as_mut()
+                {
+                    shift_levels(d, dropped);
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
@@ -2486,6 +2540,49 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    #[test]
+    fn views_shift_past_dropped_levels() {
+        let view = |first: u32, count: u32, clamp: f32| {
+            let mut d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+            d.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                MostDetailedMip: first,
+                MipLevels: count,
+                PlaneSlice: 0,
+                ResourceMinLODClamp: clamp,
+            };
+            super::shift_levels(&mut d, 1);
+            // SAFETY: the member just written.
+            let t = unsafe { d.Anonymous.Texture2D };
+            (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp)
+        };
+        // Every level: the host's every level.
+        assert_eq!(view(0, u32::MAX, 0.0), (0, u32::MAX, 0.0));
+        // Levels 0-9 of 10: the host's 0-8.
+        assert_eq!(view(0, 10, 0.0), (0, 9, 0.0));
+        // From level 3: the host's level 2 on, as many as remain.
+        assert_eq!(view(3, 2, 0.0), (2, 2, 0.0));
+        // Only the level left out: the most detailed one there is.
+        assert_eq!(view(0, 1, 0.0), (0, 1, 0.0));
+        // The clamp moves with the levels.
+        assert_eq!(view(0, u32::MAX, 2.5), (0, u32::MAX, 1.5));
+        // Other dimensions are left as they are.
+        let mut d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE3D,
+            ..Default::default()
+        };
+        d.Anonymous.Texture3D = D3D12_TEX3D_SRV {
+            MostDetailedMip: 1,
+            MipLevels: 3,
+            ResourceMinLODClamp: 0.0,
+        };
+        super::shift_levels(&mut d, 1);
+        // SAFETY: the member just written.
+        assert_eq!(unsafe { d.Anonymous.Texture3D }.MostDetailedMip, 1);
     }
 
     #[test]

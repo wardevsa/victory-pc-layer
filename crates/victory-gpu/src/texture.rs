@@ -41,8 +41,12 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
-    /// Mips per array slice.
+    /// Mips per array slice (of the host copy).
     mips: u32,
+    /// The title texture's most detailed levels the host copy goes without
+    /// (`crate::resource::dropped_mips`): host level k is title level
+    /// k + `skip`.
+    skip: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
@@ -123,6 +127,11 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     ) else {
         return false;
     };
+    // Copies of every level as they are: not between a host copy that goes
+    // without its most detailed levels and one that has them.
+    if crate::resource::dropped_mips(placed) != crate::resource::dropped_mips(source) {
+        return false;
+    }
     let Some(host) = host() else { return false };
     let through = {
         let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
@@ -812,7 +821,8 @@ impl Staging {
         let started = std::time::Instant::now();
         let workers = detile_workers();
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            // The title's level for the host's: past the ones left out.
+            let (mip, slice) = (i as u32 % self.mips + self.skip, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
@@ -1079,6 +1089,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        skip: crate::resource::mips_dropped_from(&desc, &d),
         bytes: total,
         memory,
         last: Mutex::default(),
