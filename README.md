@@ -3,7 +3,7 @@
 A combination of the existing work on running the Xbox Series build of Grand
 Theft Auto VI on Windows, tuned to start on more modest PCs (tested on an
 NVIDIA RTX 2060 SUPER 8 GB, Ryzen 5 5600GT, 32 GB RAM). It is built on
-[victory-gta6](https://github.com/fxceless/victory-gta6), itself a fork of
+[victory-fork](https://github.com/fxceless/victory-fork) (formerly victory-gta6), itself a fork of
 [VIctory](https://github.com/Marvisak/VIctory); both projects' full history is
 kept in this repository, and their README follows below unchanged.
 
@@ -18,7 +18,7 @@ All of the emulation work is theirs:
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors: the loader, runtime services, Direct3D 12 back end and shader
   recompiler everything here rests on.
-- **[victory-gta6](https://github.com/fxceless/victory-gta6)** by fxceless and
+- **[victory-fork](https://github.com/fxceless/victory-fork) (formerly victory-gta6)** by fxceless and
   its contributors: the fixes that get the world to render (meshlet culling,
   descriptor tables, root views, texture streaming, speed switches and more).
 - **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors, which
@@ -100,23 +100,23 @@ powershell -ExecutionPolicy Bypass -File .\jugar.ps1 -Diag
 To take in newer work from victory-gta6:
 
 ```powershell
-git remote add victory-gta6 https://github.com/fxceless/victory-gta6
+git remote add victory-gta6 https://github.com/fxceless/victory-fork
 git pull victory-gta6 main
 ```
 
 ---
 
-# victory-gta6
+# VIctory fork (work in progress)
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), the
-compatibility layer that runs the Xbox Series build of Grand Theft Auto VI
-natively on Windows from files the user supplies. This fork follows upstream
+A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
+compatibility layer that runs an Xbox Series title natively on Windows from
+files the user supplies. This fork follows upstream
 `main` and adds fixes aimed at one goal: getting the game's world to render
 correctly and playably on one particular PC.
 
 **This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by Rockstar Games or
-Take-Two Interactive.
+copy of the game. It is not affiliated with or endorsed by the game's
+developer or publisher.
 
 ## Credits
 
@@ -188,7 +188,7 @@ status section describes upstream, not this fork.
 
 # VIctory
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
+Runs the title (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 
 The title's x86-64 code runs unchanged inside our process; VIctory supplies

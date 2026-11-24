@@ -1,5 +1,5 @@
 //! Instructions the console's CPU (Zen 2) has and an Intel PC's lacks, emulated: the title's
-//! code raises STATUS_ILLEGAL_INSTRUCTION on them (GTA VI zeroes memory with a `clzero` loop at
+//! code raises STATUS_ILLEGAL_INSTRUCTION on them (the title zeroes memory with a `clzero` loop at
 //! its first frames), and the vectored handler steps over them here.
 //!
 //! Ported from XCL (github.com/ivall/xcl, GPL-2.0-only): `insn.rs` (decoder, as
