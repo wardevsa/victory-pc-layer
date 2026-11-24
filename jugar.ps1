@@ -14,6 +14,8 @@
 #                                 but these)
 #         .\jugar.ps1 -Fast      (keeps the texture guard: a little faster,
 #                                 but the intro flickers)
+#         .\jugar.ps1 -CardMB 1024  (more card memory for buffer copies and
+#                                 less for textures; 256 by default, for 8 GB)
 # The title's executable is VICTORY_GAME_DIR if that names an .exe; if it
 # names a folder, the largest .exe in it. Or pass it with -Game.
 param(
@@ -21,6 +23,7 @@ param(
     [switch]$Diag,
     [switch]$Precompiled,
     [switch]$Fast,
+    [int]$CardMB = 256,
     [string]$Calls = "",
     [string]$Skip = "",
     [string]$Game = $(
@@ -44,10 +47,12 @@ $env:VICTORY_DISPLAY_MODE = $Resolution
 $env:VICTORY_RELAY = "2"
 # Finds what shaders wrote on several threads (faster copy-back).
 $env:VICTORY_WIDE_BACK = "1"
-# Title buffers of 1 MB or more keep a copy in the card's memory (up to 1 GB)
-# instead of being copied every frame.
+# Title buffers of 1 MB or more keep a copy in the card's memory (up to
+# -CardMB, 256 by default) instead of being copied every frame. On an 8 GB
+# card 1024 took 941 MB that the textures then lacked: the card filled up
+# and 13,000 textures waited for room for the rest of the run, coarse.
 $env:VICTORY_CARD_BUFFERS_MIN_MB = "1"
-$env:VICTORY_CARD_BUFFERS_MB = "1024"
+$env:VICTORY_CARD_BUFFERS_MB = "$CardMB"
 # Textures in view memory are checked at every refresh instead of every 8th
 # frame while their guard sees no write: the startup screens and the opening
 # cutscene otherwise flicker and repeat frames (victory-fork issue #269).
