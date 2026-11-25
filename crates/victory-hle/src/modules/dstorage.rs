@@ -955,7 +955,7 @@ fn into_destination(
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        return writable_for(request.destination as usize, len, || fill(out)).map(drop);
     }
     let offset = (request.page_offset & 0xffff) as usize;
     // SAFETY: the title passes a page number per 64 KiB of destination,
@@ -988,6 +988,66 @@ fn into_destination(
         );
         Err(E_INVALIDARG)
     }
+}
+
+/// Runs `write` with the read-only parts of `[at, at + len)` writable, and
+/// gives them their protection back after.
+///
+/// The console's DirectStorage writes through the hardware, whatever the
+/// CPU may do with the destination, and the title asks for memory it only
+/// streams into as read-only for the CPU (the GPU bits above the host's
+/// protection are dropped, `xmem.rs`). Our inflate writes with the CPU: the
+/// prologue died in `decompress_fast` writing such a destination (run of
+/// 2026-11-25, "write 0x11a350000: read-only"), and a plain read into one
+/// fails in the kernel. The GPU side's own guard is opened before this
+/// (`kernel_will_write`), so what is still read-only here is the title's.
+fn writable_for<R>(at: usize, len: usize, write: impl FnOnce() -> R) -> R {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_READONLY, PAGE_READWRITE,
+        VirtualProtect, VirtualQuery,
+    };
+    let end = at.saturating_add(len);
+    let mut opened = Vec::new();
+    let mut p = at;
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(p as *const c_void, &mut info, size_of_val(&info)) } == 0 {
+            break;
+        }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+        if next <= p {
+            break;
+        }
+        let base = info.Protect & 0xff;
+        if info.State == MEM_COMMIT && (base == PAGE_READONLY || base == PAGE_EXECUTE_READ) {
+            let mut old = 0;
+            // SAFETY: committed title memory; only its protection changes.
+            if unsafe { VirtualProtect(p as *const c_void, next - p, PAGE_READWRITE, &mut old) } != 0 {
+                opened.push((p, next - p, old));
+            }
+        }
+        p = next;
+    }
+    if !opened.is_empty() {
+        static SAID: AtomicU32 = AtomicU32::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+            tracing::info!(
+                at = format_args!("{at:#x}"),
+                len,
+                parts = opened.len(),
+                "dstorage: a destination the title keeps read-only for the CPU, written as the console's hardware would"
+            );
+        }
+    }
+    let out = write();
+    for (p, n, old) in opened {
+        let mut was = 0;
+        // SAFETY: as above, back to what it was.
+        unsafe { VirtualProtect(p as *const c_void, n, old, &mut was) };
+    }
+    out
 }
 
 /// Slots by the 2020 order, which the argument shapes at
@@ -1141,6 +1201,38 @@ mod tests {
 
     fn pattern(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
+    }
+
+    #[test]
+    fn a_read_only_destination_is_written_and_stays_read_only() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READONLY,
+            PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery,
+        };
+        let len = 3 * 4096;
+        // SAFETY: a fresh allocation of our own.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!at.is_null());
+        let mut old = 0;
+        // The middle page read-only, as the title asks for streamed memory.
+        // SAFETY: inside the allocation.
+        assert_ne!(unsafe { VirtualProtect(at.cast::<u8>().add(4096).cast(), 4096, PAGE_READONLY, &mut old) }, 0);
+        // SAFETY: the allocation, `len` bytes.
+        let out = unsafe { std::slice::from_raw_parts_mut(at.cast::<u8>(), len) };
+        writable_for(at as usize, len, || out.fill(0xab));
+        assert!(out.iter().all(|&b| b == 0xab));
+        let protection = |offset: usize| {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { VirtualQuery(at.cast::<u8>().add(offset).cast(), &mut info, size_of_val(&info)) };
+            info.Protect
+        };
+        assert_eq!(protection(0), PAGE_READWRITE);
+        assert_eq!(protection(4096), PAGE_READONLY);
+        assert_eq!(protection(8192), PAGE_READWRITE);
+        // SAFETY: ours, released once.
+        unsafe { VirtualFree(at, 0, MEM_RELEASE) };
     }
 
     #[test]
