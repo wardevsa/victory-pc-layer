@@ -25,3 +25,23 @@ repository on that date; their claims are theirs, not checked here.
 - The black shadows are the title's ray tracing; XCL has that working and is
   the reference to learn from (rewriting, not copying, because of its
   licence).
+
+## Tried on the test PC (2026-11-25)
+
+NVIDIA RTX 2060 SUPER 8 GB, built from source after reading the changes
+for network, process and file-deletion code; each with its own cache and a
+copy of the saves.
+
+| Project | Base | On this PC | Taken from it |
+|---------|------|------------|---------------|
+| [VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD) (Belobug) | VIctory | the world in blocks of colour: 152 shaders do not translate for 32-lane waves (made for AMD) | nothing kept: its ambient light was tried and taken back out |
+| [DexNom/VIctory](https://github.com/DexNom/VIctory) (DexNom) | VIctory | every shader translates for 32 lanes, but 25 s a frame and the picture grey and black | nothing |
+| [victory-perf](https://github.com/vitutu1/victory-perf) (vitutu1) | victory-fork | 3-4 fps at half render scale (Series S), blurry and dark | nothing yet |
+| [victory-fork](https://github.com/fxceless/victory-fork) `d510ee4` | VIctory | with its newer switches on, the loading picture and grey flicker over the world | merged (`9c184b3`); the newer switches behind `-Rapido` |
+| [Flamingo](https://github.com/realblastex/flamingo) (realblastex) | victory-fork | 2.4-2.5 fps (Series S), no shader untranslated or refused; the card about 230 ms busy of 410 | the `DispatchX` thread-count fix for the structure builder |
+| [VIctory](https://github.com/Marvisak/VIctory) `2e319e5` | own | being tried | |
+
+Looked at, not tried: [VItoriaBr](https://github.com/uiliannn/VItoriaBr)
+(uiliannn; NVIDIA RTX 5060 Ti, up to 6 fps, 397 compute pipelines refused
+there), [ztrx](https://github.com/Zettrox/ztrx), and a repository named
+for an emulator that had no code in it, only a README.

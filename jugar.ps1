@@ -18,6 +18,11 @@
 #                                 the card hangs with it)
 #         .\jugar.ps1 -SinRT     (no ray-tracing structure builder: if the
 #                                 title crashes with it)
+#         .\jugar.ps1 -RTCompleto  (the builder's results copied back into
+#                                 title memory, no quarantine: a test now that
+#                                 its dispatches stay inside their arrays)
+#         .\jugar.ps1 -Rapido    (victory-fork's newer speed switches: faster
+#                                 on its PC, flickered on this one)
 #         .\jugar.ps1 -CopiasRT 1023  (copies of memory the ray tracing
 #                                 reaches: fewer for less RAM; 2047 by default)
 #         .\jugar.ps1 -Texturas alta|media|baja  (texture quality; media by
@@ -33,6 +38,8 @@ param(
     [switch]$Fast,
     [switch]$SinWide,
     [switch]$SinRT,
+    [switch]$RTCompleto,
+    [switch]$Rapido,
     [int]$CopiasRT = 2047,
     [int]$CardMB = 1024,
     [ValidateSet("alta", "media", "baja")]
@@ -79,9 +86,27 @@ $env:VICTORY_TEXTURE_GUARD = if ($Fast) { "1" } else { "0" }
 $env:VICTORY_TEXTURE_DROP_MIPS = switch ($Texturas) { "alta" { "0" } "media" { "1" } "baja" { "2" } }
 # Textures picked by index: up to 384 MB and 400 ms of uploads a frame
 # (192 MB / 250 ms otherwise), so the queue drains faster at 3 fps (after
-# klbf-lab's VICTORY_TEXTURE_QUEUE_MB/MS).
-$env:VICTORY_TEXTURE_QUEUE_MB = "384"
-$env:VICTORY_TEXTURE_QUEUE_MS = "400"
+# klbf-lab's per-frame budget; victory-fork names it VICTORY_TEXTURE_STAGE_MB/MS
+# and triples it on its own while a backlog of 1,024 or more drains).
+$env:VICTORY_TEXTURE_STAGE_MB = "384"
+$env:VICTORY_TEXTURE_STAGE_MS = "400"
+if ($Rapido) {
+    # victory-fork's newer switches, each measured in its README (first rooms
+    # 7-10 fps on an RTX 4070): draw windows with plain copies, fetches on a
+    # copy queue, parts joined, copy-back through our own view, scattered
+    # indirect records clamped once per list, card rehash runs joined, texture
+    # refreshes that do not wait for remaps. Off by default: on this PC
+    # victory-fork with all of them on flickered between the loading picture
+    # and grey in the prologue (2026-11-25).
+    $env:VICTORY_INDIRECT_WINDOW = "1"
+    $env:VICTORY_COPY_PLAIN = "1"
+    $env:VICTORY_QUEUE2 = "1"
+    $env:VICTORY_JOIN_PARTS = "1"
+    $env:VICTORY_BACK_OWN_VIEW = "1"
+    $env:VICTORY_INDIRECT_GATHER = "1"
+    $env:VICTORY_CARD_REHASH_RUNS = "1"
+    $env:VICTORY_TEXTURE_NO_WAIT = "1"
+}
 # Console wave64 compute programs that share memory inside per-lane branches
 # run as two 32-lane halves with their branches taken wave-wide
 # (VICTORY_WAVE_WIDE=1): on a 32-lane card they were otherwise emitted for
@@ -101,9 +126,13 @@ $env:VICTORY_WAVE_WIDE = if ($SinWide) { "0" } else { "1" }
 # empty-box bounds (+-infinity) in its pointers, and comparing 1 GB a frame
 # for it took the run to 0.1 fps. The programs that walk the structures
 # read the host's copies anyway.
-# -SinRT turns it off (if the title crashes with it).
+# The cause was found since (after Flamingo): the builder dispatches by
+# thread counts, which the layer took as groups, and stored past its
+# arrays. With that fixed, -RTCompleto copies its results back (no
+# quarantine), so the title also gets the sizes and counters it reads.
+# -SinRT turns the builder off (if the title crashes with it).
 $env:VICTORY_BVH_BUILDER = if ($SinRT) { "0" } else { "1" }
-$env:VICTORY_BVH_QUARANTINE = if ($SinRT) { "0" } else { "1" }
+$env:VICTORY_BVH_QUARANTINE = if ($SinRT -or $RTCompleto) { "0" } else { "1" }
 # Copies of title memory the ray-tracing programs reach by address (4 MiB
 # windows mostly): 1023 ran out within a second of the builder starting and
 # left about 40 pages a frame reading zeros. 2047 hold up to 8 GB of this

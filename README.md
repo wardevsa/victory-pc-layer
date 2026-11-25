@@ -29,61 +29,78 @@ Licensed GPL-3.0-or-later, like VIctory and victory-fork (see `LICENSE`).
 
 ## What this repository adds
 
+This tree follows victory-fork's `main` (merged up to `9c184b3`,
+2026-11-25) and adds, on top of it:
+
 - `jugar.ps1`: a launcher with the settings that matter on a weaker GPU. The
   emulator reports a 4K display to the game by default; the launcher reports
-  1920x1080 (`VICTORY_DISPLAY_MODE`), and turns on victory-fork's speed
-  switches (`VICTORY_RELAY=2`, `VICTORY_WIDE_BACK=1`,
+  1920x1080 (`VICTORY_DISPLAY_MODE`), and turns on victory-fork's proven
+  speed switches (`VICTORY_RELAY=2`, `VICTORY_WIDE_BACK=1`,
   `VICTORY_CARD_BUFFERS_MIN_MB=1`, `VICTORY_CARD_BUFFERS_MB=1024`).
-  `-Diag` runs the diagnostics build, `-Precompiled` turns on device method
-  0x218 (below). It also turns on, each with a switch to turn it off:
+  `-Diag` runs the diagnostics build. It also turns on, each with a switch to
+  turn it off:
   - texture quality (`-Texturas alta|media|baja`, `VICTORY_TEXTURE_DROP_MIPS`):
     large textures the title fills go without their most detailed level
     (media) or two (baja), which an 8 GB card otherwise fills up with;
-  - a bigger texture upload queue per frame (`VICTORY_TEXTURE_QUEUE_MB/MS`,
-    after klbf-lab by PastiiJay);
+  - a bigger texture upload budget per frame (`VICTORY_TEXTURE_STAGE_MB/MS`,
+    after klbf-lab by PastiiJay) and detiling on 4 threads
+    (`VICTORY_TEXTURE_DETILE_WORKERS`, pull request #271);
   - the wave-wide form of console wave64 compute programs
     (`VICTORY_WAVE_WIDE=1`, `-SinWide`): on a 32-lane card 10 of the 14
-    lighting, shadow, reflection and culling programs it refused now run;
-    the four particle light-atlas programs that once hung a card stay out;
+    lighting, shadow, reflection and culling programs it refused run; the
+    four particle light-atlas programs that once hung a card stay out
+    (`VICTORY_WAVE_WIDE_SKIP` adds more);
   - **the ray-tracing structure builder** (`VICTORY_BVH_BUILDER=1`,
-    `-SinRT`): all 52 programs of `XboxBvhBuilder.dll` translate and are
-    made on a 32-lane card, so the builder runs. Its stores are kept out of
-    title memory (`VICTORY_BVH_QUARANTINE=1`, now covering every shader that
-    reads title memory by address): copied back they crashed the title
-    within seconds. `-CopiasRT` sets how many copies of title memory those
-    programs reach (`VICTORY_MEMORY_COPIES`, 2047; 1023 ran out).
+    `-SinRT`): all 52 programs of `XboxBvhBuilder.dll` translate, pass the
+    DXIL validator and are made on a 32-lane card. Its stores are kept out of
+    title memory by default (`VICTORY_BVH_QUARANTINE=1`, covering every shader
+    that reads title memory by address); `-RTCompleto` copies them back.
+    `-CopiasRT` sets how many copies of title memory those programs reach
+    (`VICTORY_MEMORY_COPIES`, 2047; 1023 ran out).
+  - `-Rapido`: victory-fork's newer speed switches (draw windows, plain
+    copies, copy queue fetches, joined parts, copy-back through our own view,
+    gathered indirect clamps, joined rehash runs, textures that do not wait
+    for remaps). Faster on victory-fork's PC; on this one victory-fork with
+    all of them flickered between the loading picture and grey, so they are
+    off by default.
+- **`DispatchX` by thread counts** (after realblastex's
+  [Flamingo](https://github.com/realblastex/flamingo), commit `f7ffbce`, and
+  victory-fork pull request #814): the structure builder dispatches with
+  `USE_THREAD_DIMENSIONS`, thread counts that the layer took as groups, so it
+  ran up to 64 times its threads and stored past its arrays into the title's
+  own objects. That was the crash of 2026-11-24 with the builder on (pointers
+  made of empty-box bounds), which the quarantine only hid. The host now runs
+  the groups that hold the threads and the translated program masks the
+  lanes past them (`State::dispatch_x`, `Lower::dispatch_threads_prologue`).
 - DirectStorage destinations the title keeps read-only for the CPU are
   written (the console's hardware writes them whatever the CPU may do);
   inflating into one crashed the prologue at the window scene.
-- **Device method 0x218** (precompiled compute pipelines), off by default:
-  the title hands most of its compute pipelines over as machine code plus
-  register and metadata blocks instead of containers. They are rebuilt as
-  console containers and translated like any other program
+- **Device method 0x218** (precompiled compute pipelines), off by default
+  (`-Precompiled`): the title hands most of its compute pipelines over as
+  machine code plus register and metadata blocks instead of containers. They
+  are rebuilt as console containers and translated like any other program
   (`docs/unknown-pipeline-methods.md`). With them the world ran at about 4
-  fps instead of 3, but the picture went grey; `VICTORY_PRECOMPILED=<a>-<b>`
-  makes only calls a to b, to find which pipelines cause it.
-- Translator additions those programs need: `v_permlane16_b32` and
-  `v_permlanex16_b32`, `s_bfm_b32` and 64-bit literal moves in immediate
-  samplers, buffer descriptors made raw after loading.
+  fps instead of 3, but the picture went grey.
+- Diagnostics for the ray-tracing memory: why pages a shader touched have no
+  copy (not the title's memory, no copy, read-only, no number left) and how
+  many MB the copies hold.
 - `VICTORY_PIPELINE_DUMP=<folder>`: the arguments of the first calls of the
   pipeline methods still being worked out (16 of 0x1c8, 400 of 0x218), and
   two examples to study them offline (`examples/disasm_raw.rs`,
   `examples/precompiled.rs`).
-- **Community pull requests to victory-fork not merged there yet**, picked
-  for this PC, checked for unsafe code, merged and tested here (2026-11-24).
-  Thanks to their authors:
+- **Community pull requests to victory-fork**, picked for this PC, checked for
+  unsafe code and merged here on 2026-11-24. Where victory-fork has since
+  rewritten the same code its version is kept; the rest are still in. Thanks
+  to their authors:
 
   | PR | Author | What it does |
   |----|--------|--------------|
   | [#280](https://github.com/fxceless/victory-fork/pull/280) | Kamiloj9 | FP16 interpolation; integer render-target pipelines |
-  | [#270](https://github.com/fxceless/victory-fork/pull/270) | fffluffy-dev | texture refreshes no longer wait for title memory remapping |
   | [#271](https://github.com/fxceless/victory-fork/pull/271) | fffluffy-dev | parallel detiling of large textures (`VICTORY_TEXTURE_DETILE_WORKERS`) |
-  | [#272](https://github.com/fxceless/victory-fork/pull/272) | fffluffy-dev | a sent-ahead submission is waited for before its staging buffer is reused |
-  | [#240](https://github.com/fxceless/victory-fork/pull/240) | fffluffy-dev | lighter copy-back scratch |
-  | [#241](https://github.com/fxceless/victory-fork/pull/241) | fffluffy-dev | textures refused for lack of memory are tried again |
   | [#239](https://github.com/fxceless/victory-fork/pull/239) | fffluffy-dev | empty indirect executions end early |
-  | [#255](https://github.com/fxceless/victory-fork/pull/255) | gomeaw | copy-back bounds scanned in 32-byte chunks |
-  | [#253](https://github.com/fxceless/victory-fork/pull/253) | TG0000 | card-memory hash passes with a group per piece |
+  | [#270](https://github.com/fxceless/victory-fork/pull/270), [#272](https://github.com/fxceless/victory-fork/pull/272), [#240](https://github.com/fxceless/victory-fork/pull/240), [#241](https://github.com/fxceless/victory-fork/pull/241) | fffluffy-dev | texture refreshes, staging reuse, copy-back scratch, refused textures (superseded by victory-fork's own versions of that code) |
+  | [#255](https://github.com/fxceless/victory-fork/pull/255) | gomeaw | copy-back bounds scanned in 32-byte chunks (superseded likewise) |
+  | [#253](https://github.com/fxceless/victory-fork/pull/253) | TG0000 | card-memory hash passes with a group per piece (superseded likewise) |
   | [#276](https://github.com/fxceless/victory-fork/pull/276) | adritoyalser | static sampler slots keyed by comparison kind |
   | [#281](https://github.com/fxceless/victory-fork/pull/281) | adritoyalser | concurrent frame waits no longer share a tick |
   | [#277](https://github.com/fxceless/victory-fork/pull/277) | fluffyflattershy-afk | literal select masks in half-wave lowering |
@@ -97,38 +114,44 @@ Licensed GPL-3.0-or-later, like VIctory and victory-fork (see `LICENSE`).
   `jugar.ps1` sets `VICTORY_TEXTURE_GUARD=0` for it (`-Fast` keeps the
   guard).
 
-## Results on the test PC (2026-11-24)
+Other projects looked at and tried on this PC (2026-11-25), for anyone
+comparing: [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)
+and [DexNom/VIctory](https://github.com/DexNom/VIctory) are tuned for AMD
+cards and did not render on this NVIDIA one;
+[vitutu1/victory-perf](https://github.com/vitutu1/victory-perf) and
+[realblastex/flamingo](https://github.com/realblastex/flamingo) ran at 2-4
+fps here (Flamingo: no shader untranslated or refused, the card about 230 ms
+a frame busy); upstream [VIctory](https://github.com/Marvisak/VIctory)'s
+latest is being tried. `docs/other-projects.md` has more.
+
+## Results on the test PC
 
 NVIDIA RTX 2060 SUPER 8 GB, AMD Ryzen 5 5600GT, 32 GB RAM, Windows 11.
 
 | Run | World frame rate | Frame time | Notes |
 |-----|------------------|------------|-------|
-| victory-fork as is (reports 4K), first run | 0.7-1.2 fps | 860-1440 ms | 300 pipelines still being made; GPU 470 ms a frame |
-| `jugar.ps1` (1080p + speed switches), first run at 1080p | 1-2.6 fps | 380-890 ms | GPU 60-200 ms; texture preparation up to 580 ms |
-| `jugar.ps1`, caches warm | 2.4-3.1 fps | 330-410 ms | texture preparation 12-75 ms; copying back 180-280 ms |
+| victory-fork as is (reports 4K), first run (2026-11-24) | 0.7-1.2 fps | 860-1440 ms | 300 pipelines still being made; GPU 470 ms a frame |
+| `jugar.ps1` (1080p + speed switches), caches warm | 2.4-3.1 fps | 330-410 ms | texture preparation 12-75 ms; copying back 180-280 ms |
 | `jugar.ps1 -Precompiled` | 4.1-12 fps | 85-250 ms | the picture goes grey or blank |
-| `jugar.ps1` with the community PRs above and the texture guard off | ~3 fps | 305-345 ms | opening cutscene clean; the first playable scene readable (sunlit yard, fog, people), textures still coarse; pause menu 28 fps |
-| `jugar.ps1` with wave-wide, the structure builder (quarantined) and the DirectStorage fix (2026-11-24, evening) | 2-3 fps | 310-420 ms | every cutscene loads; no crash through the cell and window scenes; 2-5 draws a frame dropped; interiors and shaded sides still dark: the ray-traced light does not arrive yet (its programs read 20-60 pages a frame at addresses that are not the title's memory) |
+| `jugar.ps1` with the community PRs above and the texture guard off | ~3 fps | 305-345 ms | opening cutscene clean; the first playable scene readable (sunlit yard, fog, people), textures still coarse |
+| `jugar.ps1` with wave-wide, the structure builder (quarantined) and the DirectStorage fix (2026-11-24, evening) | 2-3 fps | 310-420 ms | every cutscene loads; no crash through the cell and window scenes; 2-5 draws a frame dropped; interiors and shaded sides still dark: the ray-traced light does not arrive yet |
+| this tree, with victory-fork `9c184b3` and the `DispatchX` fix (2026-11-25) | not measured yet | | to be tested: `jugar.ps1`, then `-RTCompleto` and `-Rapido` |
 
 What a player sees there: the opening cutscene, credits and title cards, and
-the first playable scene with the player character under control; with warm
-caches input answers at once.
+the first playable scene with the player character under control.
 
-Still wrong, and why (from the logs and a census of every shader):
+Still wrong, and why:
 
-- **Missing walls and objects.** Not the shader translator: it emits DXIL for
-  about 99.5 % of the programs in the game's shader archive. The title
-  creates thousands of pipelines through two device methods that were not
-  implemented (0x1c8 over 16,000 calls, 0x218 over 2,000 in one session),
-  and goes without what they draw. 0x218 (compute) is implemented now, off
-  by default; 0x1c8 (vertex and pixel programs) is the next step.
+- **Dark.** Everything the sun does not reach is black: the title lights it
+  with ray tracing. Its structure builder now runs and stays inside its
+  arrays; whether the traced light arrives is the next thing to see.
+- **Missing walls and objects.** The title creates thousands of pipelines
+  through two device methods: 0x218 (compute) is implemented, off by default;
+  0x1c8 (vertex and pixel programs, over 16,000 calls a session) is not.
 - **Textures late or blurry.** Textures are converted on the CPU within a
   budget per frame; at 2-3 fps the queue drains slowly.
-- **Dark.** Everything the sun does not reach is black: the title lights it
-  with ray tracing, which does not run yet (about 370 draws a frame of the
-  ray-tracing structure builder are dropped on purpose).
-- **Copying back** what the GPU wrote to the title's memory costs 180-280 ms
-  a frame and is now the largest single cost.
+- **Speed.** The card is busy most of each frame at 1080p, and copying back
+  what the GPU wrote to the title's memory costs 100-280 ms a frame.
 
 ## Use
 
@@ -762,9 +785,9 @@ What each part does today and what it still needs:
 
 | Subsystem | Today | Needs |
 |-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
+| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | â€“ |
 | Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | – |
+| Network | Offline by design: the title cannot reach the network | â€“ |
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
 | Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
@@ -781,7 +804,7 @@ shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
 The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
+Check **Committed** under **Task Manager â†’ Performance â†’ Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
 
