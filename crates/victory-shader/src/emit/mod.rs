@@ -295,6 +295,22 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+thread_local! {
+    /// This thread's translation leaves out the wave-wide form whatever
+    /// `VICTORY_WAVE_WIDE` says ([`without_wave_wide`]).
+    static NO_WAVE_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) without the wave-wide form of wave64 programs
+/// (`VICTORY_WAVE_WIDE=1`): for programs known to hang a card in that form,
+/// while the others take it.
+pub fn without_wave_wide<T>(f: impl FnOnce() -> T) -> T {
+    let before = NO_WAVE_WIDE.replace(true);
+    let out = f();
+    NO_WAVE_WIDE.set(before);
+    out
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -377,7 +393,8 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
+            && !NO_WAVE_WIDE.get();
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {

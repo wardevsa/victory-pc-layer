@@ -14,6 +14,8 @@
 #                                 but these)
 #         .\jugar.ps1 -Fast      (keeps the texture guard: a little faster,
 #                                 but the intro flickers)
+#         .\jugar.ps1 -SinWide   (no wave-wide form of wave64 programs: if
+#                                 the card hangs with it)
 #         .\jugar.ps1 -Texturas alta|media|baja  (texture quality; media by
 #                                 default, which fits an 8 GB card)
 #         .\jugar.ps1 -CardMB 256  (less card memory for buffer copies, more
@@ -25,6 +27,7 @@ param(
     [switch]$Diag,
     [switch]$Precompiled,
     [switch]$Fast,
+    [switch]$SinWide,
     [int]$CardMB = 1024,
     [ValidateSet("alta", "media", "baja")]
     [string]$Texturas = "media",
@@ -73,6 +76,14 @@ $env:VICTORY_TEXTURE_DROP_MIPS = switch ($Texturas) { "alta" { "0" } "media" { "
 # klbf-lab's VICTORY_TEXTURE_QUEUE_MB/MS).
 $env:VICTORY_TEXTURE_QUEUE_MB = "384"
 $env:VICTORY_TEXTURE_QUEUE_MS = "400"
+# Console wave64 compute programs that share memory inside per-lane branches
+# run as two 32-lane halves with their branches taken wave-wide
+# (VICTORY_WAVE_WIDE=1): on a 32-lane card they were otherwise emitted for
+# 64-lane waves and refused (shadow masks, screen-space reflections, culling,
+# decals: 10 of the 14 refused in the prologue). The particle light-atlas
+# programs that once hung a card in this form stay out (shader_cache.rs).
+# -SinWide turns it off.
+$env:VICTORY_WAVE_WIDE = if ($SinWide) { "0" } else { "1" }
 # Large tiled textures detiled on 4 CPU threads (victory-fork PR #271).
 $env:VICTORY_TEXTURE_DETILE_WORKERS = "4"
 

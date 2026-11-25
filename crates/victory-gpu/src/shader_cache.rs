@@ -62,6 +62,7 @@ fn build() -> &'static [u8; 32] {
                 // executable had cached with the switch unset.
                 for name in [
                     "VICTORY_WAVE_WIDE",
+                    "VICTORY_WAVE_WIDE_SKIP",
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
@@ -92,11 +93,47 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let wide_skipped = wave_wide_skipped(container);
+    let translate = move |c: &[u8]| {
+        let run = || victory_shader::emit::translate(c).map_err(|e| e.to_string());
+        if wide_skipped {
+            victory_shader::emit::without_wave_wide(run)
+        } else {
+            run()
+        }
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),
     }
+}
+
+/// Programs translated without the wave-wide form even with
+/// `VICTORY_WAVE_WIDE=1`, by their hash as logged: the particle light-atlas
+/// programs (`ptfx_CS_lightAtlas_Sprite`, `_Trail` and their non-local-light
+/// forms), with which that form lost the card (victory-fork runs 121-124),
+/// and whatever `VICTORY_WAVE_WIDE_SKIP` (hashes separated by commas) adds.
+/// They stay as before: 64-lane programs a 32-lane card refuses.
+const WAVE_WIDE_SKIP: [&str; 4] = [
+    "2561af9577c47289",
+    "c06aa62112ffba4c",
+    "cabb87599722e59a",
+    "e8f6ae0597846841",
+];
+
+fn wave_wide_skipped(container: &[u8]) -> bool {
+    static EXTRA: OnceLock<Vec<String>> = OnceLock::new();
+    let extra = EXTRA.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    let hash = blake3::hash(container).to_hex();
+    let hash = &hash[..16];
+    WAVE_WIDE_SKIP.contains(&hash) || extra.iter().any(|h| h == hash)
 }
 
 /// The cache entry's converter: the build and the container in, the
