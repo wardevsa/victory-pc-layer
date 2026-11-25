@@ -55,8 +55,41 @@ use crate::host::{HostList, host};
 use crate::shadow::Shadow;
 
 /// Copies that can be numbered (the run of heap slots is one longer). A
-/// listed frame of the opening cutscene names about 50 windows.
+/// listed frame of the opening cutscene names about 50 windows; with the
+/// structure builder running the prologue used all 1023 within a second
+/// and then left about 40 pages a frame reading zeros.
 const COPIES: u32 = 1023;
+
+/// [`COPIES`], or `VICTORY_MEMORY_COPIES` (up to 16383). Each copy is
+/// kept for the run, mostly a 4 MiB window: 1023 hold up to 4 GiB.
+fn copies_limit() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_MEMORY_COPIES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .map_or(COPIES, |n| n.clamp(1, 16383))
+    })
+}
+
+/// What [`Memory::map`] did with a page.
+#[derive(Clone, Copy)]
+enum Mapped {
+    /// It got a copy.
+    Made,
+    /// It had one already.
+    Had,
+    /// Past the directory's reach.
+    Past,
+    /// Not memory the title has.
+    Refused,
+    /// No title buffer or window copy holds the whole page.
+    NoCopy,
+    /// Its copy is one shaders cannot write.
+    ReadOnly,
+    /// Every number is taken.
+    Full,
+}
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
@@ -116,27 +149,27 @@ impl Memory {
 
     /// Gives the page of `address` its copy, if it has none and the memory
     /// is the title's.
-    fn map(&mut self, address: u64) {
+    fn map(&mut self, address: u64) -> Mapped {
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
         if page >= u64::from(MEMORY_PAGES) - 1 {
-            return;
+            return Mapped::Past;
         }
         // SAFETY: inside the directory's mapping.
         let entry = unsafe { self.directory.1.add(page as usize * 2) };
         // SAFETY: as above.
         if unsafe { entry.read() } != 0 {
-            return;
+            return Mapped::Had;
         }
         let start = page * PAGE;
         // A shader's pointer, or a constant taken for an address, may be
         // anything: only memory the title has.
         if self.refused.contains(&page) {
-            return;
+            return Mapped::Refused;
         }
         if !crate::texture::committed(start as *const u8, PAGE as usize) {
             self.refused.insert(page);
-            return;
+            return Mapped::Refused;
         }
         // The copy a root view at that address would get; a buffer that
         // ends inside the page is passed over for what holds all of it.
@@ -145,16 +178,16 @@ impl Memory {
             .filter(whole)
             .or_else(|| crate::shadow::find(start, PAGE).filter(whole))
         else {
-            return;
+            return Mapped::NoCopy;
         };
         // SAFETY: a live buffer.
         let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-            return;
+            return Mapped::ReadOnly;
         }
         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
             Some(n) => n,
-            None if self.copies.len() < COPIES as usize => {
+            None if self.copies.len() < copies_limit() as usize => {
                 self.copies.push(shadow.clone());
                 let n = self.copies.len() - 1;
                 // Every page the copy holds whole, not only the one asked
@@ -180,9 +213,12 @@ impl Memory {
             None => {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
-                    tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
+                    tracing::warn!(
+                        copies = copies_limit(),
+                        "title memory by address: no number left for another copy; its pages read zeros (VICTORY_MEMORY_COPIES raises the limit)"
+                    )
                 });
-                return;
+                return Mapped::Full;
             }
         };
         let offset = shadow.offset_in(start).unwrap_or(0);
@@ -192,6 +228,7 @@ impl Memory {
             entry.add(1).write_volatile(offset as u32);
             entry.write_volatile(n as u32 + 1);
         }
+        Mapped::Made
     }
 
     /// The pages shaders found empty since the last frame.
@@ -209,27 +246,43 @@ impl Memory {
                 unsafe { at.write_volatile(0) };
             }
         }
-        if !pages.is_empty() {
-            // Each is an access that read 0 or was dropped.
-            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
-                tracing::warn!(
-                    pages = pages.len(),
-                    first = format_args!("{:#x}", u64::from(pages[0]) * PAGE),
-                    "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); the copies are made now"
-                );
-            }
+        if pages.is_empty() {
+            return;
         }
-        for page in pages {
-            self.map(u64::from(page) * PAGE);
+        let first = u64::from(pages[0]) * PAGE;
+        // What became of each: [made, had one meanwhile, past the
+        // directory, not the title's memory, in no copy, in a copy shaders
+        // cannot write, no number left].
+        let mut seen = [0u32; 7];
+        for &page in &pages {
+            seen[self.map(u64::from(page) * PAGE) as usize] += 1;
+        }
+        // Each is an access that read 0 or was dropped.
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
+            let bytes: u64 = self.copies.iter().map(|c| c.span().1).sum();
+            tracing::warn!(
+                pages = pages.len(),
+                first = format_args!("{first:#x}"),
+                made = seen[Mapped::Made as usize],
+                had = seen[Mapped::Had as usize],
+                past = seen[Mapped::Past as usize],
+                not_title = seen[Mapped::Refused as usize],
+                no_copy = seen[Mapped::NoCopy as usize],
+                read_only = seen[Mapped::ReadOnly as usize],
+                no_number = seen[Mapped::Full as usize],
+                copies = self.copies.len(),
+                copies_mb = bytes >> 20,
+                "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped)"
+            );
         }
     }
 
     /// What a dispatch names: the copy around `address` and the 4 MiB
     /// after it.
     fn name(&mut self, address: u64) {
-        self.map(address);
-        self.map((address & !(CELL - 1)) + CELL);
+        let _ = self.map(address);
+        let _ = self.map((address & !(CELL - 1)) + CELL);
     }
 }
 
@@ -280,7 +333,7 @@ pub(crate) fn ready(
         Some(&run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
+            let base = heap.dynamic(copies_limit() + 1)?;
             heap.null_raw_uav_at(base);
             (base, 0)
         }

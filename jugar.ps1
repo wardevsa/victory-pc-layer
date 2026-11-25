@@ -18,6 +18,8 @@
 #                                 the card hangs with it)
 #         .\jugar.ps1 -SinRT     (no ray-tracing structure builder: if the
 #                                 title crashes with it)
+#         .\jugar.ps1 -CopiasRT 1023  (copies of memory the ray tracing
+#                                 reaches: fewer for less RAM; 2047 by default)
 #         .\jugar.ps1 -Texturas alta|media|baja  (texture quality; media by
 #                                 default, which fits an 8 GB card)
 #         .\jugar.ps1 -CardMB 256  (less card memory for buffer copies, more
@@ -31,6 +33,7 @@ param(
     [switch]$Fast,
     [switch]$SinWide,
     [switch]$SinRT,
+    [int]$CopiasRT = 2047,
     [int]$CardMB = 1024,
     [ValidateSet("alta", "media", "baja")]
     [string]$Texturas = "media",
@@ -101,6 +104,12 @@ $env:VICTORY_WAVE_WIDE = if ($SinWide) { "0" } else { "1" }
 # -SinRT turns it off (if the title crashes with it).
 $env:VICTORY_BVH_BUILDER = if ($SinRT) { "0" } else { "1" }
 $env:VICTORY_BVH_QUARANTINE = if ($SinRT) { "0" } else { "1" }
+# Copies of title memory the ray-tracing programs reach by address (4 MiB
+# windows mostly): 1023 ran out within a second of the builder starting and
+# left about 40 pages a frame reading zeros. 2047 hold up to 8 GB of this
+# PC's RAM; the log's "touched pages that had no copy" lines say how many
+# still find no number (no_number) and how many MB the copies hold.
+$env:VICTORY_MEMORY_COPIES = "$CopiasRT"
 # Large tiled textures detiled on 4 CPU threads (victory-fork PR #271).
 $env:VICTORY_TEXTURE_DETILE_WORKERS = "4"
 
