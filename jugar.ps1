@@ -68,6 +68,11 @@ $env:VICTORY_TEXTURE_GUARD = if ($Fast) { "1" } else { "0" }
 # With every level (alta) an 8 GB card filled up and 13,000 textures waited
 # for room for the rest of the run.
 $env:VICTORY_TEXTURE_DROP_MIPS = switch ($Texturas) { "alta" { "0" } "media" { "1" } "baja" { "2" } }
+# Textures picked by index: up to 384 MB and 400 ms of uploads a frame
+# (192 MB / 250 ms otherwise), so the queue drains faster at 3 fps (after
+# klbf-lab's VICTORY_TEXTURE_QUEUE_MB/MS).
+$env:VICTORY_TEXTURE_QUEUE_MB = "384"
+$env:VICTORY_TEXTURE_QUEUE_MS = "400"
 # Large tiled textures detiled on 4 CPU threads (victory-fork PR #271).
 $env:VICTORY_TEXTURE_DETILE_WORKERS = "4"
 
