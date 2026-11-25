@@ -165,8 +165,13 @@ pub(crate) extern "system" fn wait(
             break (S_OK, tick);
         }
     };
-    #[cfg(feature = "diagnostics")]
     let waited = started.elapsed();
+    #[cfg(windows)]
+    {
+        let us = waited.min(limit).as_micros() as u64;
+        crate::framelog::add(crate::framelog::T::PaceUs, us);
+        crate::framelog::here(crate::framelog::H::PaceUs, us);
+    }
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         use crate::copystat::{C, add};

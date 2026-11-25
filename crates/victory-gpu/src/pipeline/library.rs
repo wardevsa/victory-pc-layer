@@ -363,13 +363,16 @@ pub(crate) fn removal_note() -> String {
 /// (hundreds of thousands of pages), once after each burst of loads.
 /// `VICTORY_LIBRARY_TRIM=0`: the pages stay until Windows takes them.
 pub(crate) fn trim() {
-    const QUIET_MS: u64 = 10_000;
     static ON: OnceLock<bool> = OnceLock::new();
     let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
     if at == 0
         || TRIMMED.load(Ordering::Relaxed)
-        || crate::host::now_ms() < LOADED_AT.load(Ordering::Relaxed) + QUIET_MS
         || !*ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_TRIM").is_none_or(|v| v != "0"))
+    {
+        return;
+    }
+    let quiet_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    if crate::host::now_ms() < LOADED_AT.load(Ordering::Relaxed) + quiet_ms
         || TRIMMED.swap(true, Ordering::Relaxed)
     {
         return;
@@ -426,6 +429,8 @@ fn one_call() -> Option<MutexGuard<'static, ()>> {
 }
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
+/// A library the driver refused, kept as it was ([`open`]).
+const REJECTED_FILE: &str = "host-pipelines.rejected.bin";
 /// A saved library that could not replace [`LIBRARY_FILE`] while this run
 /// had it mapped (a system that refuses to replace a mapped file): the next
 /// start renames it over the library first ([`Blob::of`]).
@@ -438,6 +443,14 @@ fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
+            // With RenderDoc loaded the device is RenderDoc's: the card's
+            // library is not for it, and what it would save is not for
+            // the card. Neither read nor written in such a run.
+            #[cfg(feature = "diagnostics")]
+            if crate::renderdoc::loaded() {
+                tracing::info!("RenderDoc is loaded: the host pipeline library is neither read nor saved in this run");
+                return None;
+            }
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
@@ -458,6 +471,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
             device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
         }
     };
+    let mut rejected = false;
     if !blob.bytes().is_empty() {
         match make(blob.bytes()) {
             Ok(library) => {
@@ -476,7 +490,10 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     saving: RwLock::new(()),
                 });
             }
-            Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
+            Err(e) => {
+                rejected = true;
+                tracing::warn!(error = %e, "host pipeline library rejected; starting an empty one (the rejected file is kept as {REJECTED_FILE})");
+            }
         }
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
@@ -484,6 +501,16 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
     drop(blob);
+    // And the file is kept under another name, not written over by this
+    // run's first save: a refusal may be this device's alone (run 263:
+    // RenderDoc's device refused the card's library, an empty one was
+    // saved over 366 MB of built pipelines, and the next run drew black
+    // until they were built again).
+    if rejected && let Some(dir) = DIR.get() {
+        if let Err(e) = std::fs::rename(dir.join(LIBRARY_FILE), dir.join(REJECTED_FILE)) {
+            tracing::warn!(error = %e, "the rejected host pipeline library could not be kept under its other name");
+        }
+    }
     let library = make(&[]).ok()?;
     Some(Library {
         library,
