@@ -16,6 +16,8 @@
 #                                 but the intro flickers)
 #         .\jugar.ps1 -SinWide   (no wave-wide form of wave64 programs: if
 #                                 the card hangs with it)
+#         .\jugar.ps1 -SinRT     (no ray-tracing structure builder: if the
+#                                 title crashes with it)
 #         .\jugar.ps1 -Texturas alta|media|baja  (texture quality; media by
 #                                 default, which fits an 8 GB card)
 #         .\jugar.ps1 -CardMB 256  (less card memory for buffer copies, more
@@ -28,6 +30,7 @@ param(
     [switch]$Precompiled,
     [switch]$Fast,
     [switch]$SinWide,
+    [switch]$SinRT,
     [int]$CardMB = 1024,
     [ValidateSet("alta", "media", "baja")]
     [string]$Texturas = "media",
@@ -84,6 +87,14 @@ $env:VICTORY_TEXTURE_QUEUE_MS = "400"
 # programs that once hung a card in this form stay out (shader_cache.rs).
 # -SinWide turns it off.
 $env:VICTORY_WAVE_WIDE = if ($SinWide) { "0" } else { "1" }
+# Ray tracing: the title's indirect light, bounce and lamp and sun shadows
+# walk structures that the 52 builder programs of XboxBvhBuilder.dll build
+# and refit on the GPU every frame. The layer runs those stages only all
+# together, and only with VICTORY_BVH_BUILDER=1; on a 32-lane card all 52
+# now translate and are made (victory translate --pipelines on the dll).
+# Without them whatever the sun does not reach directly stays black.
+# -SinRT turns it off (if the title crashes with it).
+$env:VICTORY_BVH_BUILDER = if ($SinRT) { "0" } else { "1" }
 # Large tiled textures detiled on 4 CPU threads (victory-fork PR #271).
 $env:VICTORY_TEXTURE_DETILE_WORKERS = "4"
 
