@@ -23,6 +23,9 @@
 #                                 its dispatches stay inside their arrays)
 #         .\jugar.ps1 -Rapido    (victory-fork's newer speed switches: faster
 #                                 on its PC, flickered on this one)
+#         .\jugar.ps1 -Mejor     (victory-fork's best set, run 279: 9-12 fps
+#                                 on an RTX 4070, water read back; with
+#                                 -SinRT it is that set as tested there)
 #         .\jugar.ps1 -CopiasRT 1023  (copies of memory the ray tracing
 #                                 reaches: fewer for less RAM; 2047 by default)
 #         .\jugar.ps1 -Texturas alta|media|baja  (texture quality; media by
@@ -40,6 +43,7 @@ param(
     [switch]$SinRT,
     [switch]$RTCompleto,
     [switch]$Rapido,
+    [switch]$Mejor,
     [int]$CopiasRT = 2047,
     [int]$CardMB = 1024,
     [ValidateSet("alta", "media", "baja")]
@@ -90,6 +94,33 @@ $env:VICTORY_TEXTURE_DROP_MIPS = switch ($Texturas) { "alta" { "0" } "media" { "
 # and triples it on its own while a backlog of 1,024 or more drains).
 $env:VICTORY_TEXTURE_STAGE_MB = "384"
 $env:VICTORY_TEXTURE_STAGE_MS = "400"
+if ($Mejor) {
+    # victory-fork's run 279 (2026-11-25), "the set that plays best so far":
+    # the switches of its diagnostics/README.md plus VICTORY_CARD_HASH_LEN=1.
+    # 9-12 fps in rooms and on the water on an RTX 4070 12 GB, water right
+    # (boats float: VICTORY_TEXTURE_BACK=1). Card windows and buffer copies as
+    # victory-nvidia-8gb sizes them for an 8 GB card (2048 / 1024 MB).
+    $env:VICTORY_LEVELS_ON_DEMAND = "1"
+    $env:VICTORY_ASYNC_SUBMIT = "1"
+    $env:VICTORY_QUEUE2 = "1"
+    $env:VICTORY_INDIRECT_WINDOW = "1"
+    $env:VICTORY_TEXTURE_NO_WAIT = "1"
+    $env:VICTORY_MERGE_GAP = "64"
+    $env:VICTORY_MERGE_RUNS = "4096"
+    $env:VICTORY_STAGING_POOL = "0"
+    $env:VICTORY_COPY_PLAIN = "1"
+    $env:VICTORY_JOIN_PARTS = "1"
+    $env:VICTORY_BACK_OWN_VIEW = "1"
+    $env:VICTORY_INDIRECT_GATHER = "1"
+    $env:VICTORY_CARD_REHASH_RUNS = "1"
+    $env:VICTORY_CARD_WINDOWS_MB = "2048"
+    $env:VICTORY_CARD_BUFFERS_MIN_KB = "64"
+    $env:VICTORY_CARD_BUFFERS_MB = "$CardMB"
+    $env:VICTORY_TEXTURE_BACK = "1"
+    $env:VICTORY_CARD_HASH_LEN = "1"
+    # Not in that set.
+    Remove-Item Env:VICTORY_RELAY, Env:VICTORY_WIDE_BACK, Env:VICTORY_CARD_BUFFERS_MIN_MB -ErrorAction SilentlyContinue
+}
 if ($Rapido) {
     # victory-fork's newer switches, each measured in its README (first rooms
     # 7-10 fps on an RTX 4070): draw windows with plain copies, fetches on a

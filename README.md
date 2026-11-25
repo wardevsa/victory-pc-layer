@@ -29,8 +29,8 @@ Licensed GPL-3.0-or-later, like VIctory and victory-fork (see `LICENSE`).
 
 ## What this repository adds
 
-This tree follows victory-fork's `main` (merged up to `9c184b3`,
-2026-11-25) and adds, on top of it:
+This tree follows victory-fork's `main` (merged up to `32b31f7`,
+2026-11-25, late) and adds, on top of it:
 
 - `jugar.ps1`: a launcher with the settings that matter on a weaker GPU. The
   emulator reports a 4K display to the game by default; the launcher reports
@@ -63,6 +63,15 @@ This tree follows victory-fork's `main` (merged up to `9c184b3`,
     for remaps). Faster on victory-fork's PC; on this one victory-fork with
     all of them flickered between the loading picture and grey, so they are
     off by default.
+  - `-Mejor`: victory-fork's run 279, "the set that plays best so far" there
+    (9-12 fps in rooms and on the water on an RTX 4070 12 GB, the water read
+    back so boats float: `VICTORY_TEXTURE_BACK=1`, `VICTORY_CARD_HASH_LEN=1`
+    and the switches of its `diagnostics/README.md`), with the card windows
+    and buffer copies sized as soldsawn's
+    [victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb) sizes
+    them for an 8 GB card.
+- Thin LTO in the release build (after victory-nvidia-8gb, victory-fork pull
+  request #1117).
 - **`DispatchX` by thread counts** (after realblastex's
   [Flamingo](https://github.com/realblastex/flamingo), commit `f7ffbce`, and
   victory-fork pull request #814): the structure builder dispatches with
@@ -122,7 +131,9 @@ cards and did not render on this NVIDIA one;
 [realblastex/flamingo](https://github.com/realblastex/flamingo) ran at 2-4
 fps here (Flamingo: no shader untranslated or refused, the card about 230 ms
 a frame busy); upstream [VIctory](https://github.com/Marvisak/VIctory)'s
-latest is being tried. `docs/other-projects.md` has more.
+latest and [soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb)
+(victory-fork plus about 40 community pull requests, 8-10 fps on an RTX 4060
+Laptop 8 GB) are being tried. `docs/other-projects.md` has more.
 
 ## Results on the test PC
 
@@ -135,7 +146,9 @@ NVIDIA RTX 2060 SUPER 8 GB, AMD Ryzen 5 5600GT, 32 GB RAM, Windows 11.
 | `jugar.ps1 -Precompiled` | 4.1-12 fps | 85-250 ms | the picture goes grey or blank |
 | `jugar.ps1` with the community PRs above and the texture guard off | ~3 fps | 305-345 ms | opening cutscene clean; the first playable scene readable (sunlit yard, fog, people), textures still coarse |
 | `jugar.ps1` with wave-wide, the structure builder (quarantined) and the DirectStorage fix (2026-11-24, evening) | 2-3 fps | 310-420 ms | every cutscene loads; no crash through the cell and window scenes; 2-5 draws a frame dropped; interiors and shaded sides still dark: the ray-traced light does not arrive yet |
-| this tree, with victory-fork `9c184b3` and the `DispatchX` fix (2026-11-25) | not measured yet | | to be tested: `jugar.ps1`, then `-RTCompleto` and `-Rapido` |
+| this tree, with victory-fork `9c184b3` and the `DispatchX` fix (2026-11-25) | | | `jugar.ps1`: no crash, but the picture poor and dark |
+| the same, `-RTCompleto` (the builder's results copied back) | about 0.1 fps | | **the first ray-traced light seen**: a lit window, warm reflections, the yard in detail; still dark overall and far too slow to play |
+| this tree, with victory-fork `32b31f7` and Thin LTO, `-Mejor` | not measured yet | | to be tested |
 
 What a player sees there: the opening cutscene, credits and title cards, and
 the first playable scene with the player character under control.
