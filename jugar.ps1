@@ -93,8 +93,14 @@ $env:VICTORY_WAVE_WIDE = if ($SinWide) { "0" } else { "1" }
 # together, and only with VICTORY_BVH_BUILDER=1; on a 32-lane card all 52
 # now translate and are made (victory translate --pipelines on the dll).
 # Without them whatever the sun does not reach directly stays black.
+# What the builder stores stays in the host's copies (quarantine): copied
+# back into title memory it crashed the title within seconds, with
+# empty-box bounds (+-infinity) in its pointers, and comparing 1 GB a frame
+# for it took the run to 0.1 fps. The programs that walk the structures
+# read the host's copies anyway.
 # -SinRT turns it off (if the title crashes with it).
 $env:VICTORY_BVH_BUILDER = if ($SinRT) { "0" } else { "1" }
+$env:VICTORY_BVH_QUARANTINE = if ($SinRT) { "0" } else { "1" }
 # Large tiled textures detiled on 4 CPU threads (victory-fork PR #271).
 $env:VICTORY_TEXTURE_DETILE_WORKERS = "4"
 

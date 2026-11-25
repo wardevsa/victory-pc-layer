@@ -259,8 +259,25 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 /// memory when the title writes them.
 #[cfg(windows)]
 pub(crate) fn builder_quarantined(this: This) -> bool {
+    is_builder(this) && quarantine()
+}
+
+/// `VICTORY_BVH_QUARANTINE=1` also keeps in the host's copies what any
+/// other shader stores through raw addresses: what shaders wrote is found
+/// per copy and submission (`Shadow::writing`), so a submission with a
+/// builder stage and another shader that declares the copies written
+/// copied the builder's stores back all the same (a quarantined run died
+/// within a second of the first builder submission with empty-box bounds,
+/// `0x7f800000_7f800000`, in its pointers).
+#[cfg(windows)]
+pub(crate) fn memory_quarantined() -> bool {
+    quarantine()
+}
+
+#[cfg(windows)]
+fn quarantine() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.

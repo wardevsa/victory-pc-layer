@@ -907,10 +907,15 @@ impl State {
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
+            let by_address = t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY);
+            // Quarantined, nothing a shader that walks title memory by
+            // address stores (through it or its root views) is copied back
+            // either (`pipeline::memory_quarantined`).
             let writes = (t.stores || !write_skip())
-                && !crate::pipeline::builder_quarantined(self.pipeline as This);
+                && !crate::pipeline::builder_quarantined(self.pipeline as This)
+                && !(by_address && crate::pipeline::memory_quarantined());
             // Title memory by address: what the shader finds it by.
-            let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
+            let memory = if by_address {
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
