@@ -187,6 +187,14 @@ struct Lower<'a> {
     /// DXIL block per IR block (unreachable: none).
     block: Vec<Option<usize>>,
     cur: usize,
+    /// After Flamingo (and victory-fork #814): whether the lane being lowered is inside the
+    /// thread counts of a `DispatchX` by threads, for a structure-builder program whose lanes
+    /// past them cannot return at once ([`Self::dispatch_threads_prologue`]).
+    partial_active: Option<V>,
+    /// The first DXIL block of the program's body: `s.entry`, or the arm that runs after a
+    /// partial dispatch's early return ([`Self::dispatch_threads_prologue`]); where the
+    /// program's input lane masks are read.
+    body_entry: usize,
     bools: HashMap<(usize, Bool), V>,
     lane_bits: HashMap<Value, V>,
     /// IR phi location by value.
@@ -1483,6 +1491,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let body_entry = s.entry;
         Lower {
             s,
             x,
@@ -1492,6 +1501,8 @@ impl<'a> Lower<'a> {
             floats: HashMap::new(),
             block: vec![None; p.blocks.len()],
             cur: 0,
+            partial_active: None,
+            body_entry,
             bools: HashMap::new(),
             lane_bits: HashMap::new(),
             phi_at,
@@ -1680,7 +1691,7 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&(b, i))
             .ok_or("an untracked global address")?;
-        let guard = self.guard(b, i)?;
+        let guard = self.effect_guard(b, i)?;
         let Some(Operand::Vector { reg, .. }) = *dst else {
             return Err("a global load result");
         };
@@ -2228,6 +2239,8 @@ impl<'a> Lower<'a> {
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
+        } else if self.s.threads.is_some() && crate::spill::is_spilled(self.x.native) {
+            self.dispatch_threads_prologue(&order).map_err(|w| unsupported(0, w))?;
         }
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
@@ -2908,7 +2921,7 @@ impl<'a> Lower<'a> {
         };
         let (lo, hi) = (word(self, 0)?, word(self, 1)?);
         let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
-        let guard = self.guard(b, i)?;
+        let guard = self.effect_guard(b, i)?;
         let c = self.cur;
         let (i32t, res, void) = (self.s.t.i32, self.s.t.res_ret, self.s.t.void);
         let iu = self.s.m.undef(i32t);
@@ -3151,7 +3164,7 @@ impl<'a> Lower<'a> {
             None => {
                 let at = match self.def_block.get(&lo) {
                     // Program inputs (EXEC on entry).
-                    None => self.s.entry,
+                    None => self.body_entry,
                     Some(&b) if b == self.cur_ir => self.cur,
                     Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
@@ -3859,7 +3872,7 @@ impl<'a> Lower<'a> {
         }
         let made = self.def_block.get(&scc).copied();
         let at = match made {
-            None => self.s.entry,
+            None => self.body_entry,
             Some(b) if b == self.cur_ir => self.cur,
             Some(b) => self.tail[b].ok_or("a lane mask written after its use")?,
         };
@@ -3993,6 +4006,86 @@ impl<'a> Lower<'a> {
             None => Ok(None),
             Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
         }
+    }
+
+    /// [`Self::guard`] for an instruction that touches memory: also without a lane past a
+    /// `DispatchX`'s thread counts ([`Self::partial_active`]).
+    fn effect_guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
+        let g = self.guard(b, i)?;
+        match (g, self.partial_active) {
+            (Some(g), Some(a)) => Ok(Some(self.s.m.bin(self.cur, Bin::And, g, a))),
+            (g, a) => Ok(g.or(a)),
+        }
+    }
+
+    /// After Flamingo (realblastex, f7ffbce) and victory-fork #814: a `DispatchX` with
+    /// `USE_THREAD_DIMENSIONS` gives thread counts, and the console runs no lane at or past
+    /// them in a partial last group. The ray-tracing structure builder dispatches so (its
+    /// programs are the spilled ones). The host runs whole groups and passes the counts
+    /// (`USER_DISPATCH_THREADS`, 0: none). Lanes past them return at once where no group
+    /// barrier, lane exchange or half-wave form needs them; otherwise they stay, with their
+    /// memory stores and loads masked ([`Self::effect_guard`]). Taken as groups they ran up
+    /// to 64 times the threads and stored past the builder's arrays into the title's own
+    /// objects: the title died on pointers made of empty-box bounds (Flamingo's runs 88 and
+    /// 113; ours of 2026-11-24 with the builder on).
+    /// shortcut: ballots, votes and reductions still count the lanes past the threads
+    /// (Flamingo masks those too, in its paired form).
+    fn dispatch_threads_prologue(&mut self, order: &[usize]) -> Result<(), Why> {
+        use super::shader::USER_DISPATCH_THREADS;
+        let StageIo::Cs(cs) = self.x.native.io else {
+            return Ok(());
+        };
+        let e = self.s.entry;
+        let zero = self.s.m.i32(0);
+        let mut axes = Vec::new();
+        for (c, &dim) in cs.threads.iter().enumerate() {
+            if dim > 1 {
+                let limit = self.host_word(RootType::Other(USER_DISPATCH_THREADS), 0, c as u32);
+                let Val::I32(group) = self.compute_id("groupId.i32", 94, c as u8) else {
+                    unreachable!()
+                };
+                axes.push((c as u8, dim, limit, group));
+            }
+        }
+        if axes.is_empty() {
+            return Ok(());
+        }
+        let mut active: Option<V> = None;
+        for &(c, dim, limit, group) in &axes {
+            let Val::I32(tid) = self.thread_id(c) else {
+                unreachable!()
+            };
+            let dim = self.s.m.i32(dim);
+            let base = self.s.m.bin(e, Bin::Mul, group, dim);
+            let global = self.s.m.bin(e, Bin::Add, base, tid);
+            let no_limit = self.s.m.cmp(e, pred::EQ, limit, zero);
+            let inside = self.s.m.cmp(e, pred::IULT, global, limit);
+            let ok = self.s.m.bin(e, Bin::Or, no_limit, inside);
+            active = Some(match active {
+                None => ok,
+                Some(prev) => self.s.m.bin(e, Bin::And, prev, ok),
+            });
+        }
+        let active = active.ok_or("a partial dispatch without an axis")?;
+        let barrier = self.x.p.blocks.iter().enumerate().any(|(b, blk)| {
+            !self.no_barrier.contains(&b) && blk.insts.iter().any(|i| i.name() == "s_barrier")
+        });
+        let early = self.exchange.is_none()
+            && self.halves.is_none()
+            && !barrier
+            && self.x.p.blocks[order[0]].preds.is_empty();
+        if early {
+            let body = self.s.m.new_block();
+            let exit = self.s.m.new_block();
+            self.s.m.terminate(e, Term::CondBr(active, body, exit));
+            self.s.m.terminate(exit, Term::Ret);
+            self.body_entry = body;
+            self.block[order[0]] = Some(body);
+            self.cur = body;
+        } else {
+            self.partial_active = Some(active);
+        }
+        Ok(())
     }
 
     // ---- results ----
@@ -4442,7 +4535,8 @@ impl<'a> Lower<'a> {
             return Err("GDS");
         }
         let name = inst.name();
-        let guard = self.guard(b, i)?;
+        // (lanes past a DispatchX's threads keep out of shared memory too)
+        let guard = if name == "ds_swizzle_b32" || name.contains("permute") { self.guard(b, i)? } else { self.effect_guard(b, i)? };
         let c = self.cur;
         let offset = u32::from(*offset0) | u32::from(*offset1) << 8;
         let dst_reg = match dst {
@@ -9580,7 +9674,7 @@ impl<'a> Lower<'a> {
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
-        let guard = self.guard(b, i)?;
+        let guard = self.effect_guard(b, i)?;
         let c = self.cur;
         let (kind, coords) = match dim {
             0 => (1, 1),
@@ -10411,7 +10505,7 @@ impl<'a> Lower<'a> {
             return Err(name);
         }
         let site = (b, i);
-        let guard = self.guard(b, i)?;
+        let guard = self.effect_guard(b, i)?;
         let c = self.cur;
         let store = name.starts_with("buffer_store_");
         // DXIL atomic operations: add, and, or, xor, signed and unsigned

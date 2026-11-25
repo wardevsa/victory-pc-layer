@@ -401,6 +401,10 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// While a `DispatchX` by threads binds, its thread counts along the
+    /// axes whose last group is partial
+    /// (`victory_shader::emit::USER_DISPATCH_THREADS`; after Flamingo).
+    dispatch_threads: [u32; 3],
 }
 
 impl Drop for State {
@@ -650,6 +654,41 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
+}
+
+/// `COMPUTE_DISPATCH_INITIATOR` bit 5, `USE_THREAD_DIMENSIONS`: a
+/// `DispatchX` counts threads, not groups (after Flamingo and victory-fork
+/// #814).
+const DISPATCH_USE_THREAD_DIMENSIONS: u32 = 0x20;
+
+/// The groups of `group` threads that hold `threads` threads, and the
+/// thread counts along the axes whose last group is partial (0 along the
+/// others). `None` for no thread at all.
+fn dispatch_dimensions(threads: [u32; 3], group: [u32; 3]) -> Option<([u32; 3], [u32; 3])> {
+    if threads.contains(&0) {
+        return None;
+    }
+    let (mut groups, mut partial) = ([0; 3], [0; 3]);
+    for i in 0..3 {
+        let g = group[i].max(1);
+        groups[i] = threads[i].div_ceil(g);
+        if !threads[i].is_multiple_of(g) {
+            partial[i] = threads[i];
+        }
+    }
+    Some((groups, partial))
+}
+
+#[cfg(test)]
+mod dispatch_x_tests {
+    #[test]
+    fn thread_counts_become_groups_and_partial_axes() {
+        use super::dispatch_dimensions as d;
+        assert_eq!(d([100, 1, 1], [64, 1, 1]), Some(([2, 1, 1], [100, 0, 0])));
+        assert_eq!(d([128, 3, 1], [64, 1, 1]), Some(([2, 3, 1], [0, 0, 0])));
+        assert_eq!(d([10, 10, 1], [8, 8, 1]), Some(([2, 2, 1], [10, 10, 0])));
+        assert_eq!(d([0, 1, 1], [64, 1, 1]), None);
+    }
 }
 
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
@@ -935,7 +974,10 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_DISPATCH_THREADS, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        if kind == USER_DISPATCH_THREADS {
+            return self.dispatch_threads.get(dword as usize).copied().unwrap_or(0);
+        }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
@@ -2204,6 +2246,35 @@ impl State {
     /// a window ([`windows`]).
     fn may_store(&self) -> bool {
         crate::pipeline::host_pipeline(self.pipeline as This).is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
+    }
+
+    /// A console `DispatchX(x, y, z, flags)` (after Flamingo, f7ffbce, and
+    /// victory-fork #814). With `USE_THREAD_DIMENSIONS`
+    /// ([`DISPATCH_USE_THREAD_DIMENSIONS`]) `x, y, z` count threads, not
+    /// groups: the host runs the groups that hold them, and the translated
+    /// program leaves out the lanes past them
+    /// (`victory_shader::emit::USER_DISPATCH_THREADS`). Taken as groups they
+    /// ran up to 64 times the threads, which stored past the structure
+    /// builder's arrays into the title's own objects (with the builder on,
+    /// the title died on pointers made of empty-box bounds, 2026-11-24).
+    pub(crate) fn dispatch_x(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+        if flags & DISPATCH_USE_THREAD_DIMENSIONS == 0 {
+            return self.dispatch(list, x, y, z);
+        }
+        let Some(group) = crate::pipeline::console_threads(self.pipeline as This) else {
+            once!(flags, "a dispatch by threads of a program whose group size is not known: dropped");
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            if crate::pipeline::is_builder(self.pipeline as This) {
+                crate::pipeline::builder_off("a dispatch by threads of a program whose group size is not known");
+            }
+            return;
+        };
+        let Some((groups, partial)) = dispatch_dimensions([x, y, z], group) else {
+            return;
+        };
+        self.dispatch_threads = partial;
+        self.dispatch(list, groups[0], groups[1], groups[2]);
+        self.dispatch_threads = [0; 3];
     }
 
     /// Runs a dispatch on the host.
