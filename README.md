@@ -35,7 +35,26 @@ Licensed GPL-3.0-or-later, like VIctory and victory-fork (see `LICENSE`).
   switches (`VICTORY_RELAY=2`, `VICTORY_WIDE_BACK=1`,
   `VICTORY_CARD_BUFFERS_MIN_MB=1`, `VICTORY_CARD_BUFFERS_MB=1024`).
   `-Diag` runs the diagnostics build, `-Precompiled` turns on device method
-  0x218 (below).
+  0x218 (below). It also turns on, each with a switch to turn it off:
+  - texture quality (`-Texturas alta|media|baja`, `VICTORY_TEXTURE_DROP_MIPS`):
+    large textures the title fills go without their most detailed level
+    (media) or two (baja), which an 8 GB card otherwise fills up with;
+  - a bigger texture upload queue per frame (`VICTORY_TEXTURE_QUEUE_MB/MS`,
+    after klbf-lab by PastiiJay);
+  - the wave-wide form of console wave64 compute programs
+    (`VICTORY_WAVE_WIDE=1`, `-SinWide`): on a 32-lane card 10 of the 14
+    lighting, shadow, reflection and culling programs it refused now run;
+    the four particle light-atlas programs that once hung a card stay out;
+  - **the ray-tracing structure builder** (`VICTORY_BVH_BUILDER=1`,
+    `-SinRT`): all 52 programs of `XboxBvhBuilder.dll` translate and are
+    made on a 32-lane card, so the builder runs. Its stores are kept out of
+    title memory (`VICTORY_BVH_QUARANTINE=1`, now covering every shader that
+    reads title memory by address): copied back they crashed the title
+    within seconds. `-CopiasRT` sets how many copies of title memory those
+    programs reach (`VICTORY_MEMORY_COPIES`, 2047; 1023 ran out).
+- DirectStorage destinations the title keeps read-only for the CPU are
+  written (the console's hardware writes them whatever the CPU may do);
+  inflating into one crashed the prologue at the window scene.
 - **Device method 0x218** (precompiled compute pipelines), off by default:
   the title hands most of its compute pipelines over as machine code plus
   register and metadata blocks instead of containers. They are rebuilt as
@@ -89,6 +108,7 @@ NVIDIA RTX 2060 SUPER 8 GB, AMD Ryzen 5 5600GT, 32 GB RAM, Windows 11.
 | `jugar.ps1`, caches warm | 2.4-3.1 fps | 330-410 ms | texture preparation 12-75 ms; copying back 180-280 ms |
 | `jugar.ps1 -Precompiled` | 4.1-12 fps | 85-250 ms | the picture goes grey or blank |
 | `jugar.ps1` with the community PRs above and the texture guard off | ~3 fps | 305-345 ms | opening cutscene clean; the first playable scene readable (sunlit yard, fog, people), textures still coarse; pause menu 28 fps |
+| `jugar.ps1` with wave-wide, the structure builder (quarantined) and the DirectStorage fix (2026-11-24, evening) | 2-3 fps | 310-420 ms | every cutscene loads; no crash through the cell and window scenes; 2-5 draws a frame dropped; interiors and shaded sides still dark: the ray-traced light does not arrive yet (its programs read 20-60 pages a frame at addresses that are not the title's memory) |
 
 What a player sees there: the opening cutscene, credits and title cards, and
 the first playable scene with the player character under control; with warm
