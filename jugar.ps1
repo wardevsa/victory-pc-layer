@@ -109,6 +109,20 @@ if (-not $Fabrica -and -not $Rapido) {
     $env:VICTORY_JOIN_COPIES = "1"
     # What shaders wrote looked for on several threads.
     $env:VICTORY_WIDE_BACK = "1"
+    # With those (88cbf04): 6.3 fps median at the boat (3.2 before), the card
+    # 58 ms a frame but idle 35-50 ms of it in short gaps while the CPU
+    # prepares: the driver lowers its clocks. One small compute group on a
+    # queue of its own keeps them up (host/awake.rs).
+    $env:VICTORY_CARD_AWAKE = "1"
+    if ([Environment]::ProcessorCount -le 12) {
+        # Helper pools sized for a 24-thread CPU share 6 cores with the title
+        # here: fewer of each (Maykzera's victory-rtx3060, measured on a
+        # Ryzen 5 5600X: 13.0 -> 14.0 fps, preparing 72 -> 55 ms a frame).
+        $env:VICTORY_THIN_THREADS = "5"
+        $env:VICTORY_UNDER_THREADS = "3"
+        $env:VICTORY_VIEW_THREADS = "3"
+        $env:VICTORY_PIPELINE_WORKERS = "4"
+    }
     # Left out from Play-VIctory.cmd's set (-Rapido), which made the card
     # slower here (250-380 ms a frame): the renderer ports (constants read by
     # the card from the PC's memory), the relay and the texture switches.
