@@ -18,6 +18,12 @@
 #                                      constant level; 0.8 default)
 #         .\jugar.ps1 -Fabrica        (none of our speed switches: cool_fox's
 #                                      defaults alone, to compare)
+#         .\jugar.ps1 -Diag           (the diagnostics build, target\diag: the
+#                                      same switches, and the log names what
+#                                      each wait for the card waited for;
+#                                      build it with cargo build --release -p
+#                                      victory --features diagnostics
+#                                      --target-dir target\diag)
 #         .\jugar.ps1 -Preparar       (no game: every shader translated into
 #                                      the cache, then the host pipelines of
 #                                      earlier runs made for the driver's cache;
@@ -36,6 +42,7 @@ param(
     [string]$Luz = "0.8",
     [switch]$Preparar,
     [switch]$Fabrica,
+    [switch]$Diag,
     [string]$Exe = "$PSScriptRoot\target\release\victory.exe",
     [string]$Game = $(
         if ($env:VICTORY_GAME_DIR -like "*.exe") { $env:VICTORY_GAME_DIR }
@@ -50,6 +57,7 @@ if (-not $Game -or -not (Test-Path $Game)) {
     Write-Error "Title executable not found. Set VICTORY_GAME_DIR to it (or to its folder), or pass -Game <path to the .exe>."
     exit 1
 }
+if ($Diag) { $Exe = "$PSScriptRoot\target\diag\release\victory.exe" }
 if (-not (Test-Path $Exe)) {
     Write-Error "No build at $Exe. Build it first: cargo build --release -p victory"
     exit 1
@@ -123,13 +131,9 @@ if (-not $Fabrica -and -not $Rapido) {
     # without the wait (host.rs fill_is_titles; cool_fox measured two thirds
     # of that wait gone).
     $env:VICTORY_FILL_TITLE = "1"
-    # With that (09fab1c): 7-10 fps, settles down to 1 a frame; copying back
-    # was then the most, 81 ms a frame, 86 ms of the landing thread's time
-    # waiting for about 10 fetches of what shaders wrote (36 MB), each behind
-    # everything sent to the drawing queue meanwhile. On the card's copy
-    # queue a fetch runs as soon as its own flights are done (host.rs
-    # relay_copy; bytes the title sent later are left out of the merge).
-    $env:VICTORY_RELAY_COPY = "1"
+    # Not VICTORY_RELAY_COPY (tried in d516213): copying back fell from 81 to
+    # 28 ms a frame, but preparing rose from 66 to 95 and the frame rate
+    # stayed, and textures showed torn for a moment as they appeared.
     if ([Environment]::ProcessorCount -le 12) {
         # Helper pools sized for a 24-thread CPU share 6 cores with the title
         # here: fewer of each (Maykzera's victory-rtx3060, measured on a
@@ -197,7 +201,7 @@ if ($Escala) {
     }
 }
 
-$log = "run-$console.log"
+$log = if ($Diag) { "diag-$console.log" } else { "run-$console.log" }
 Write-Host "VIctory (cool_fox base): $console$(if ($Rapido) { ', Play-VIctory.cmd switches' } else { ', defaults' })$(if ($SinPelo) { ', no hair strands' }); log in $log"
 # A writer of our own, not Tee-Object: Windows PowerShell 5.1's wraps long
 # lines at the window's width and writes UTF-16.
