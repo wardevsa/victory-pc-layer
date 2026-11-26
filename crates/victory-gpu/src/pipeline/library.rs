@@ -46,11 +46,20 @@
 //! with a 64 MB file written past the system's cache, mapped and replaced:
 //! 16,352 of 16,384 pages read zeros with the handle closed, none with it
 //! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.
+//!
+//! A save holds the library alone while it asks the size of and writes out
+//! all of it (1.3 to 1.5 GB), and a pipeline made meanwhile waited to be
+//! stored before it was handed out: 270 to 660 s of a run had frames over
+//! 200 ms, nearly all while pipelines were being made (`docs/findings.md`).
+//! `VICTORY_LIBRARY_STORE_LATER=1` hands such a pipeline out at once and
+//! stores it with the save ([`store_later`]); `VICTORY_LIBRARY=0` keeps no
+//! library at all ([`library`]); `VICTORY_LIBRARY_SAVE_S` sets how often a
+//! save may come ([`save_every`]). All three off or unset: as before.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, TryLockError};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -75,7 +84,7 @@ pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
 /// that size is made, filled and written every time pipelines were added,
-/// at most every 20 s).
+/// at most every [`save_every`]).
 pub(crate) static BLOB: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SAVED: AtomicU64 = AtomicU64::new(0);
 
@@ -442,10 +451,20 @@ const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 100_000;
 
+/// The host's pipeline library, made on first use.
+///
+/// `VICTORY_LIBRARY=0`: none, said once. Every pipeline is then made
+/// ([`pipeline`]), nothing is saved, the early and slow lists included
+/// ([`save`]), and there are no pages to let go ([`trim`]): for measuring
+/// the run's memory and frames without the library.
 fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
+            if std::env::var_os("VICTORY_LIBRARY").is_some_and(|v| v == "0") {
+                tracing::info!("no host pipeline library (VICTORY_LIBRARY=0): pipelines not kept");
+                return None;
+            }
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
@@ -559,29 +578,124 @@ pub(crate) fn pipeline(
         )
     });
     let _all = one_call();
-    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
-    let _call = call("store", name);
-    // SAFETY: a live pipeline; a name already stored (a description that
-    // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-        library.added.fetch_add(1, Ordering::Relaxed);
+    if stores_later() {
+        let made = Later(wide, pso.clone());
+        let stored = |Later(wide, pso)| store(library, &wide, &pso);
+        store_or_defer(&library.saving, &LATER, made, stored);
+        return Ok(pso);
     }
+    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+    store(library, &wide, &pso);
     Ok(pso)
 }
 
+/// Stores `pso` as `wide`; the caller holds [`one_call`] and a read of
+/// `saving`, in that order.
+fn store(library: &Library, wide: &HSTRING, pso: &ID3D12PipelineState) {
+    let _call = call("store", &wide.to_string_lossy());
+    // SAFETY: a live pipeline; a name already stored (a description that
+    // differs, or one made twice at once) is refused, which leaves the
+    // library as it was.
+    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), pso) }.is_ok() {
+        library.added.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether a pipeline made while a save holds the library is handed out at
+/// once and stored by the save ([`store_later`]) instead of waiting for it.
+/// Off by default; `VICTORY_LIBRARY_STORE_LATER=1` turns it on. With
+/// `VICTORY_LIBRARY_LOCK=1` it changes nothing: a save holds [`one_call`]
+/// throughout, and the store waits on that first.
+fn stores_later() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_STORE_LATER").is_some_and(|v| v == "1"))
+}
+
+/// A pipeline made while a save held the library, with its name: stored by
+/// the next save ([`store_later`]).
+struct Later(HSTRING, ID3D12PipelineState);
+// SAFETY: D3D12 objects are free-threaded; it is only moved into and out
+// of `LATER`.
+unsafe impl Send for Later {}
+
+static LATER: Mutex<Vec<Later>> = Mutex::new(Vec::new());
+
+/// Stores `item` under a read of `saving`, or, while a save holds it alone,
+/// puts it in `later` without waiting.
+fn store_or_defer<T>(saving: &RwLock<()>, later: &Mutex<Vec<T>>, item: T, store: impl FnOnce(T)) {
+    let _stores = match saving.try_read() {
+        Ok(stores) => stores,
+        Err(TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            later.lock().unwrap_or_else(|e| e.into_inner()).push(item);
+            return;
+        }
+    };
+    store(item);
+}
+
+/// Takes everything in `later` and stores each under `locks` (nothing taken
+/// when there is nothing to store). What a store refuses is dropped.
+fn drain<T, G>(later: &Mutex<Vec<T>>, locks: impl FnOnce() -> G, mut store: impl FnMut(T)) {
+    let items = std::mem::take(&mut *later.lock().unwrap_or_else(|e| e.into_inner()));
+    if items.is_empty() {
+        return;
+    }
+    let _locks = locks();
+    for item in items {
+        store(item);
+    }
+}
+
+/// Stores the pipelines a save kept waiting ([`stores_later`]), under
+/// [`one_call`] then a read of `saving`, as [`pipeline`] does. A name
+/// stored meanwhile (made again by another thread) is refused, as there.
+fn store_later(library: &Library) {
+    let locks = || {
+        let all = one_call();
+        let stores = library.saving.read();
+        (all, stores.unwrap_or_else(|e| e.into_inner()))
+    };
+    let stored = |Later(wide, pso)| store(library, &wide, &pso);
+    drain(&LATER, locks, stored);
+}
+
+/// How often a save may come: `VICTORY_LIBRARY_SAVE_S` seconds, 20 by
+/// default and at least 5 (each writes the whole library).
+fn save_every() -> std::time::Duration {
+    static EVERY: OnceLock<std::time::Duration> = OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let value = std::env::var("VICTORY_LIBRARY_SAVE_S").ok();
+        std::time::Duration::from_secs(save_seconds(value.as_deref()))
+    })
+}
+
+fn save_seconds(value: Option<&str>) -> u64 {
+    let seconds = value.and_then(|v| v.trim().parse().ok());
+    seconds.unwrap_or(20).max(5)
+}
+
 /// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// last save and [`save_every`] has passed (or `now`). With no library
+/// (`VICTORY_LIBRARY=0`) nothing is written, the early and slow lists
+/// neither.
+///
+/// The pipelines kept waiting by a save ([`store_later`]) are stored first,
+/// and again once the save lets the library go: one kept waiting by a save
+/// that returns early is stored by the next. Not before the interval is
+/// looked at: the workers call this after every pipeline, and would wait
+/// there for a save that holds the library.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        if !now && last.is_some_and(|t| t.elapsed() < save_every()) {
             return;
         }
         *last = Some(std::time::Instant::now());
     }
+    store_later(library);
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
@@ -615,6 +729,7 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
+    store_later(library);
     // Through `used`: a process that asked for none yet (`victory shaders`)
     // must not write the earlier runs' list over with nothing.
     let used: Vec<String> = used().iter().flatten().cloned().collect();
@@ -907,6 +1022,63 @@ mod tests {
             pattern(page * 4096, &mut expected);
             assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
         }
+    }
+
+    #[test]
+    fn the_save_interval_is_read_with_a_floor() {
+        assert_eq!(save_seconds(None), 20);
+        assert_eq!(save_seconds(Some("60")), 60);
+        assert_eq!(save_seconds(Some(" 30 ")), 30);
+        assert_eq!(save_seconds(Some("5")), 5);
+        assert_eq!(save_seconds(Some("1")), 5);
+        assert_eq!(save_seconds(Some("0")), 5);
+        assert_eq!(save_seconds(Some("")), 20);
+        assert_eq!(save_seconds(Some("-3")), 20);
+        assert_eq!(save_seconds(Some("ten")), 20);
+    }
+
+    /// `VICTORY_LIBRARY_STORE_LATER=1`, with a plain lock for the library's:
+    /// a pipeline made during a save is kept, not waited for, and every one
+    /// is stored once, by the save that ends it or (when that save returns
+    /// early) the next.
+    #[test]
+    fn pipelines_made_during_a_save_are_stored_once() {
+        let saving = RwLock::new(());
+        let later: Mutex<Vec<&str>> = Mutex::new(Vec::new());
+        let mut stored: Vec<&str> = Vec::new();
+        // No save: stored at once.
+        store_or_defer(&saving, &later, "a", |n| stored.push(n));
+        // A save that returns early holds the library while two are made.
+        {
+            let _alone = saving.write().unwrap();
+            store_or_defer(&saving, &later, "b", |n| stored.push(n));
+            store_or_defer(&saving, &later, "c", |n| stored.push(n));
+        }
+        assert_eq!(stored, ["a"]);
+        assert_eq!(later.lock().unwrap().len(), 2);
+        store_or_defer(&saving, &later, "d", |n| stored.push(n));
+        // The next save: first what the last one kept waiting.
+        drain(&later, || saving.read().unwrap(), |n| stored.push(n));
+        {
+            let _alone = saving.write().unwrap();
+            store_or_defer(&saving, &later, "e", |n| stored.push(n));
+        }
+        drain(&later, || saving.read().unwrap(), |n| stored.push(n));
+        // Nothing left: the drain takes no lock.
+        let locked = std::cell::Cell::new(false);
+        drain(&later, || locked.set(true), |n| stored.push(n));
+        assert!(!locked.get());
+        assert!(later.lock().unwrap().is_empty());
+        stored.sort_unstable();
+        assert_eq!(stored, ["a", "b", "c", "d", "e"]);
+        // A poisoned lock still stores.
+        let _ = std::panic::catch_unwind(|| {
+            let _alone = saving.write().unwrap();
+            panic!("a save that failed");
+        });
+        let mut after: Vec<&str> = Vec::new();
+        store_or_defer(&saving, &later, "f", |n| after.push(n));
+        assert_eq!(after, ["f"]);
     }
 
     #[test]

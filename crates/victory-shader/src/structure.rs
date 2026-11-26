@@ -892,6 +892,36 @@ impl<'a> Lanes<'a> {
         }
     }
 
+    /// The source pair of two adjacent dword moves in one block.
+    fn moved_pair(&self, k: Key) -> Option<Key> {
+        let moved = |v| {
+            let &(b, i) = self.defs.get(&v)?;
+            let inst = &self.p.blocks[b].insts[i];
+            if inst.name() != "s_mov_b32" {
+                return None;
+            }
+            let Fields::Sop {
+                dst: Some(Operand::Scalar { code: dst, .. }),
+                src,
+                ..
+            } = &inst.fields
+            else {
+                return None;
+            };
+            let [Operand::Scalar { code: src, .. }] = src.as_slice() else {
+                return None;
+            };
+            if inst.write(Reg::S(*dst)) != Some(v) {
+                return None;
+            }
+            Some((b, *dst, *src, inst.read(Reg::S(*src))?))
+        };
+        let (lb, ld, ls, lv) = moved(k.0)?;
+        let (hb, hd, hs, hv) = moved(k.1)?;
+        (lb == hb && ld.checked_add(1) == Some(hd) && ls.checked_add(1) == Some(hs))
+            .then_some((lv, hv))
+    }
+
     fn exec(&mut self, inst: &Inst) -> Bool {
         match self.key(|r| inst.read(r), EXEC) {
             Some(k) => self.mask(k).0,
@@ -925,26 +955,37 @@ impl<'a> Lanes<'a> {
             None => {
                 let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
                 let def = |d: Option<(usize, usize)>| d.map(|(b, i)| &p.blocks[b].insts[i]);
-                let m = match (lo, hi) {
-                    (Some(at), Some(hi)) if at == hi => def(lo)
-                        .and_then(|i| self.sop(i))
-                        .and_then(|r| r.dst)
-                        .map(|d| d.1),
-                    _ => None,
-                };
                 // What an EXEC write the pass does not follow leaves there.
                 let exec_write = |d: Option<(usize, usize)>, v: Value| {
                     def(d).is_some_and(|i| {
                         i.write(Reg::S(EXEC)) == Some(v) || i.write(Reg::S(EXEC + 1)) == Some(v)
                     })
                 };
-                let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
+                let (m, derived) = match (lo, hi) {
+                    (Some(at), Some(hi)) if at == hi => {
+                        let m = def(lo)
+                            .and_then(|i| self.sop(i))
+                            .and_then(|r| r.dst)
+                            .map(|d| d.1);
+                        (m, exec_write(lo, k.0) || exec_write(Some(hi), k.1))
+                    }
+                    _ => {
+                        let copied = self.moved_pair(k).and_then(|source| {
+                            let (m, derived) = self.mask(source);
+                            self.b
+                                .support(m)
+                                .iter()
+                                .all(|a| !matches!(a, Atom::Opaque(_)))
+                                .then_some((m, derived))
+                        });
+                        copied.map_or_else(
+                            || (None, exec_write(lo, k.0) || exec_write(hi, k.1)),
+                            |(m, derived)| (Some(m), derived),
+                        )
+                    }
+                };
                 // shortcut: the atom names the pair by its low dword, and
-                // lowering takes the high dword written beside it. For halves
-                // written apart (two `s_mov_b32`) lanes 32-63 are wrong unless
-                // lowering has no value for the low dword (EXEC, compares)
-                // and refuses. Give the atom both dwords when such code
-                // turns up.
+                // lowering takes the high dword written beside it.
                 let m = m.unwrap_or_else(|| {
                     let born = self.born(k.0);
                     self.b.atom(Atom::Opaque(k.0), born)
@@ -1781,6 +1822,47 @@ mod tests {
                 "{reader:#x}: vcc_hi was zeroed after the compare"
             );
         }
+    }
+
+    #[test]
+    fn paired_dword_moves_keep_exec_mask_provenance() {
+        let p = build(
+            &[
+                0xBE82_047E, // s_mov_b64 s[2:3], exec
+                0xBE84_0302, // s_mov_b32 s4, s2
+                0xBE85_0303, // s_mov_b32 s5, s3
+                0xBE86_0304, // s_mov_b32 s6, s4
+                0xBE87_0305, // s_mov_b32 s7, s5
+                0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert_eq!(guarded(&s), 0, "{:?}", s.guards);
+    }
+
+    #[test]
+    fn paired_dword_moves_do_not_make_unknown_values_into_masks() {
+        let p = build(
+            &[
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0301, // s_mov_b32 s5, s1
+                0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let guard = s.guards[0][3].expect("unknown mask still guards the vector op");
+        assert!(
+            s.bools
+                .support(guard)
+                .iter()
+                .any(|a| matches!(a, Atom::Opaque(_)))
+        );
     }
 
     #[test]

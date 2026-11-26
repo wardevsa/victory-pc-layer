@@ -121,10 +121,20 @@ pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
+    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS,
+    SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, SLOT_VIEW_ADDRESSES,
+    USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X,
+    USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS, constants_raw, raw_views,
+    set_raw_views, set_view_heap_limit, view_heap_limit,
 };
+
+/// Whether programs that reach memory by address (ray tracing and what
+/// builds its structures) translate: `VICTORY_RAYS=1`.
+// shortcut: off until they run without stopping the host GPU.
+pub fn rays() -> bool {
+    static RAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *RAYS.get_or_init(|| cfg!(test) || std::env::var("VICTORY_RAYS").is_ok_and(|v| v == "1"))
+}
 
 /// The stack for threads that make host pipelines from translated shaders.
 /// vkd3d-proton converts DXIL on the calling thread, recursively over its
@@ -437,6 +447,39 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+thread_local! {
+    /// The hash-scoped wave policy for this thread's current translation.
+    static WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Uses the wave-wide form only for the named container hashes.
+pub fn wave_wide_only(hash: &str) -> bool {
+    static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    ONLY.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_owned)
+            .collect()
+    })
+    .iter()
+    .any(|candidate| candidate.eq_ignore_ascii_case(hash))
+}
+
+/// Runs one translation with its own wave-wide policy on this thread.
+pub fn with_wave_wide<T>(on: bool, translate: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WIDE_HERE.set(self.0);
+        }
+    }
+    let _restore = Restore(WIDE_HERE.replace(on));
+    translate()
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -449,6 +492,17 @@ pub fn emit(
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
+    // Keep the general wave-wide form opt-in: the game run lost the GPU after these
+    // barriers were enabled automatically for every one-wave group. The insertion guard
+    // below still applies to opt-in shaders.
+    let wide_option = std::env::var_os("VICTORY_WAVE_WIDE");
+    let scene_kernel = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
+        && matches!(
+            c.digest,
+            [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
+                | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
+        );
+    let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -461,8 +515,15 @@ pub fn emit(
     };
     // (a mask with lanes elsewhere is only helped by the exact forms: not by each half-wave
     // on its own)
-    let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
-    if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
+    let exact_only = matches!(
+        &original,
+        Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE
+    );
+    if stuck
+        && native.stage == HwStage::Cs
+        && native.wave64
+        && lower::host_max_wave() == 32
+    {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
@@ -556,11 +617,13 @@ pub fn emit(
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
             );
-        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        let wide_on = wide_option
+            .as_ref()
+            .map_or_else(|| scene_kernel || WIDE_HERE.get(), |v| v == "1");
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
-        let driver_loop = wide_option.is_none()
+        let driver_loop = wide_on
             && c.part(FourCC::DXIL).is_none()
             && c.part(FourCC::ACCC).is_some()
             && matches!(&original, Err(ShaderError::Unsupported { what, .. })
@@ -573,8 +636,8 @@ pub fn emit(
                 // Every skip left out that the code after it cannot see
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
                 // lane runs, where the two host waves can exchange.
-                // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
-                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+                // (`VICTORY_WAVE_DEEP_SKIPS=1` opts in.)
+                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_some_and(|v| v == "1");
                 let deep = if deep_on { form("without skips, scalars followed", ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
@@ -652,9 +715,7 @@ pub fn emit(
     // lowering has named the skipped blocks).
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
-            if native.stage == HwStage::Cs
-                && what == lower::LANE_MASK
-                && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
+            if native.stage == HwStage::Cs && what == lower::LANE_MASK && wide_on =>
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
             match again {

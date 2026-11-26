@@ -230,20 +230,16 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             );
         }
     }
-    // Names of arbitrary semantics (system values use ""), then indices.
+    // Arbitrary names occur once per element (repeats included); system values use "". Indices follow.
     let mut strings = vec![0u8];
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
         let name = if e.kind == 0 {
             let needle: Vec<u8> = e.name.bytes().chain([0]).collect();
-            match find(&strings, &needle) {
-                Some(at) => at,
-                None => {
-                    strings.extend(&needle);
-                    strings.len() - needle.len()
-                }
-            }
+            let at = strings.len();
+            strings.extend(needle);
+            at
         } else {
             0
         };
@@ -300,10 +296,6 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         }
     }
     out
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// The container: parts in order, hashed.
@@ -471,6 +463,36 @@ mod tests {
         assert_eq!(recovered.iter().map(|e| e.interp).collect::<Vec<_>>(), [1, 1, 2]);
         assert!(super::super::vertex_output_interpolation(&psv[..psv.len() - 1], &mut recovered)
             .is_err());
+    }
+
+    #[test]
+    fn psv_keeps_repeated_arbitrary_semantic_names() {
+        let element = SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let psv = psv(&Psv {
+            stage: 1,
+            flag: false,
+            inputs: &[element.clone()],
+            outputs: &[element],
+            prims: &[],
+            mesh: None,
+            geometry: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+        });
+        let strings = u32::from_le_bytes(psv[56..60].try_into().unwrap()) as usize;
+        assert_eq!(&psv[60..60 + strings], b"\0TEXCOORD\0TEXCOORD\0\0");
     }
 
     #[test]

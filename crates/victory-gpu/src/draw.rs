@@ -88,6 +88,27 @@ impl TablePlan {
 }
 
 impl TableGroup {
+    fn snapshot_required(&self, state: &State, compute: bool) -> bool {
+        self.has_cbv
+            || match state.roots_ref(compute).get(usize::from(self.slot)) {
+                Some(&Root::Table(table)) => state.heap_of(table).is_some_and(|heap| {
+                    heap.host().is_some_and(|host| self.needs_snapshot(heap, host.count(), table))
+                }),
+                _ => false,
+            }
+    }
+
+    fn indexed_descriptor(&self, state: &State, compute: bool, index: &RootIndexedView) -> u32 {
+        let constant = state.user_value(compute, index.constant_slot, RootType::Constants, index.constant_dword);
+        // Match the shader's wrapping i32 byte offset and shift by five.
+        index.byte_offset.wrapping_add(constant << index.shift) / 32
+    }
+
+    fn snapshot_count(&self, state: &State, compute: bool) -> u32 {
+        self.indexed.iter().map(|index| self.indexed_descriptor(state, compute, index))
+            .fold(self.max_dword / 8, u32::max) + 1
+    }
+
     fn entry(&self, descriptor: u32) -> Option<&UsedResource> {
         let i = self
             .by_descriptor
@@ -1637,13 +1658,20 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
+        // Stages reading different lengths of the same native table share
+        // its largest snapshot. Resource readiness remains stage-specific.
+        let extents = if p.stages.len() > 1 {
+            self.table_extents(p.stages.iter().map(|stage| &stage.translated().tables), compute)
+        } else {
+            Few::default()
+        };
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.tables, compute);
+            let made = self.tables_with_extents(list, &t.tables, compute, &extents);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1762,6 +1790,21 @@ impl State {
                                 }
                             },
                             None => once!("a shader inspects table view kinds without a view heap set"),
+                        }
+                        continue;
+                    }
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_ADDRESSES {
+                        match self.heap_addresses(list) {
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => {
+                                once!("a shader reads dynamic view addresses without a view heap set")
+                            }
                         }
                         continue;
                     }
@@ -2134,6 +2177,24 @@ impl State {
         // Tag bit 1 (distinct from `heap_buffers`'s `| 1` and aligned guest pointers).
         if list.first_use(gpu as usize | 2)
             && let Some(buffer) = host.strides_buffer()
+        {
+            list.keep(buffer);
+        }
+        Some(gpu)
+    }
+
+    /// The GPU address of the bound view heap's title-view addresses.
+    fn heap_addresses(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let gpu = host.addresses_gpu()?;
+        if list.first_use(gpu as usize | 4)
+            && let Some(buffer) = host.addresses_buffer()
         {
             list.keep(buffer);
         }
@@ -3625,25 +3686,60 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    pub(crate) fn tables(
+    /// Only valid fresh ranges participate: direct heap users keep their
+    /// original binding, and an invalid stage cannot enlarge another stage.
+    fn table_extents<'a>(
+        &self,
+        plans: impl IntoIterator<Item = &'a TablePlan>,
+        compute: bool,
+    ) -> Few<(u8, u32), 16> {
+        let mut extents: Few<(u8, u32), 16> = Few::default();
+        for group in plans.into_iter().flat_map(|plan| &plan.groups) {
+            if !group.snapshot_required(self, compute) {
+                continue;
+            }
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(group.slot)) else { continue };
+            let Some(heap) = self.heap_of(table) else { continue };
+            if heap.samplers() || !(table - heap.start).is_multiple_of(32) || heap.host().is_none() {
+                continue;
+            }
+            let n = group.snapshot_count(self, compute);
+            if n > crate::descriptor::host::DYNAMIC
+                || table.checked_add(u64::from(n - 1) * 32).and_then(|handle| heap.index(handle)).is_none()
+            {
+                continue;
+            }
+            if let Some((_, count)) = extents.iter_mut().find(|(slot, _)| *slot == group.slot) {
+                *count = (*count).max(n);
+            } else {
+                extents.push((group.slot, n));
+            }
+        }
+        extents
+    }
+
+    #[cfg(test)]
+    fn tables(
         &mut self,
         list: &HostList,
         plan: &TablePlan,
         compute: bool,
     ) -> Few<(u8, u32), 16> {
+        self.tables_with_extents(list, plan, compute, &[])
+    }
+
+    fn tables_with_extents(
+        &mut self,
+        list: &HostList,
+        plan: &TablePlan,
+        compute: bool,
+        extents: &[(u8, u32)],
+    ) -> Few<(u8, u32), 16> {
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
         for group in &plan.groups {
             let slot = group.slot;
-            let needs_snapshot = group.has_cbv
-                || match self.roots_ref(compute).get(usize::from(slot)) {
-                    Some(&Root::Table(table)) => self.heap_of(table).is_some_and(|heap| {
-                        heap.host()
-                            .is_some_and(|host| group.needs_snapshot(heap, host.count(), table))
-                    }),
-                    _ => false,
-                };
-            if needs_snapshot {
+            if group.snapshot_required(self, compute) {
                 fresh[usize::from(slot / 64)] |= 1u64 << (slot % 64);
             }
         }
@@ -3675,20 +3771,12 @@ impl State {
             let mut selected: Vec<u32> = group
                 .indexed
                 .iter()
-                .map(|index| {
-                    let constant = self.user_value(
-                        compute,
-                        index.constant_slot,
-                        RootType::Constants,
-                        index.constant_dword,
-                    );
-                    // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
+                .map(|index| group.indexed_descriptor(self, compute, index))
                 .collect();
             selected.sort_unstable();
             selected.dedup();
-            let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
+            let own_count = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
+            let n = extents.iter().find(|(s, _)| *s == slot).map_or(own_count, |(_, n)| own_count.max(*n));
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
@@ -3725,10 +3813,29 @@ impl State {
                 }
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
+                let title_first = heap.index(table).filter(|first| first + own_count <= host.count());
+                if let Some(title) = title_first {
+                    for k in (0..own_count).filter(|&k| own_count <= 64 || group.entry(k).is_some()) {
+                        host.slot_tabled(title + k);
+                    }
+                }
+                let read_view = |handle, kind, view: &View| {
+                    readable(list, kind, view);
+                    // Another stage may be the first reader of this texture
+                    // in the shared snapshot. Mirror its title slot just as
+                    // when this stage makes a snapshot of its own.
+                    if let Some(title) = title_first
+                        && crate::descriptor::host::is_texture_view(view)
+                    {
+                        let k = ((handle - table) / 32) as u32;
+                        host.texture_slot_tabled(title + k, true);
+                        host.mirror_after(list, title + k, handle);
+                    }
+                };
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                        read_view(handle, u.kind, &view);
                     }
                 }
                 for k in selected {
@@ -3739,7 +3846,7 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
-                        readable(list, kind, &view);
+                        read_view(handle, kind, &view);
                     }
                 }
                 let depth = TESTED_DEPTH.get().1;
@@ -3773,12 +3880,12 @@ impl State {
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
-            let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            let title_first = heap.index(table).filter(|first| first + own_count <= host.count());
             // They are such a table's, whatever they hold. (Of a big one,
             // which may lie over slots shaders pick by index, only the ones
             // the shader names.)
             if let Some(title) = title_first {
-                for k in (0..n).filter(|&k| n <= 64 || group.entry(k).is_some()) {
+                for k in (0..own_count).filter(|&k| own_count <= 64 || group.entry(k).is_some()) {
                     host.slot_tabled(title + k);
                 }
             }
@@ -3821,6 +3928,7 @@ impl State {
                         }
                     }
                     if let Some(title) = title_first
+                        && k < own_count
                         && listed.texture
                         && listed.tabled != Some((title + k, kind.is_some()))
                     {
@@ -3874,6 +3982,7 @@ impl State {
                         // place as the texture pass would have made it,
                         // for a shader that picks it by index all the same.
                         if let Some(title) = title_first
+                            && k < own_count
                             && crate::descriptor::host::is_texture_view(&view)
                         {
                             host.texture_slot_tabled(title + k, kind.is_some());
@@ -4946,5 +5055,135 @@ mod record_hash_tests {
         // (One record of zeros is among the above.)
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+}
+
+#[cfg(test)]
+mod shared_table_tests {
+    use super::*;
+    use windows::core::s;
+
+    fn cbv(slot: u8, descriptor: u32) -> UsedResource {
+        UsedResource {
+            kind: ResourceType::Cbv, root: RootType::Table,
+            table_offset_dwords: descriptor * 8, lower_bound: descriptor,
+            stride: 8, dwords: 4, user_data: 0, slot,
+        }
+    }
+
+    /// Different stage extents formerly exhausted a heap with 130 slots
+    /// left (6 + 128). Both now read the original slots from one snapshot,
+    /// including constants written between recording and submission.
+    #[test]
+    fn stages_share_a_snapshot_under_descriptor_pressure() {
+        let host = crate::host::host().expect("D3D12 device required for this regression");
+        let mut title: This = std::ptr::null_mut();
+        let desc = [0u32, 128, 1, 0, 0, 0, 0, 0];
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(std::ptr::null_mut(), desc.as_ptr().cast(), &iid, &mut title), 0);
+        struct Title(This);
+        impl Drop for Title { fn drop(&mut self) { crate::object::release(self.0); } }
+        let _title = Title(title);
+        let heap = crate::descriptor::heap(title);
+        let h = heap.host().unwrap();
+        let reserved = h.dynamic_capacity() - 130;
+        let first = h.dynamic(reserved).unwrap();
+        struct Reservation<'a>(&'a crate::descriptor::host::HostHeap, u32, u32);
+        impl Drop for Reservation<'_> { fn drop(&mut self) { self.0.release(self.1, self.2); } }
+        let _reservation = Reservation(h, first, reserved);
+        #[repr(C, align(256))]
+        struct Constants([u32; 64]);
+        let mut a = Box::new(Constants([0; 64]));
+        let mut b = Box::new(Constants([0; 64]));
+        for (slot, data) in [(5, &a.0), (127, &b.0)] {
+            let address = data.as_ptr() as u64;
+            crate::descriptor::create_cbv(std::ptr::null_mut(), &[address as u32, (address >> 32) as u32, 256, 0], heap.start + slot * 32);
+        }
+        let vs = TablePlan::new(&[cbv(0, 5)], &[]);
+        let ps = TablePlan::new(&[cbv(0, 127)], &[]);
+        let mut state = State::default();
+        state.heaps = [title as usize, 0];
+        state.graphics = vec![Root::Table(heap.start)];
+        // Establish the old separate-allocation failure without dispatching it.
+        {
+            let list = host.new_list().unwrap();
+            let mut separate = State::default();
+            separate.heaps = state.heaps;
+            separate.graphics = state.graphics.clone();
+            assert_ne!(separate.tables(&list, &vs, false)[0].1, u32::MAX);
+            assert_eq!(separate.tables(&list, &ps, false)[0].1, u32::MAX);
+        }
+        let extents = state.table_extents([&vs, &ps], false);
+        assert_eq!(&*extents, &[(0, 128)]);
+        // A stage bound directly into title slots needs no snapshot and
+        // must not enlarge another stage's allocation.
+        let mut direct = cbv(0, 127);
+        direct.kind = ResourceType::Srv;
+        let direct = TablePlan::new(&[direct], &[]);
+        assert_eq!(&*state.table_extents([&vs, &direct], false), &[(0, 6)]);
+        let invalid = TablePlan::new(&[cbv(0, 128)], &[]);
+        assert_eq!(&*state.table_extents([&vs, &invalid], false), &[(0, 6)]);
+        // Dynamic descriptor offsets use the currently bound constants.
+        state.graphics.push(Root::Constants(vec![127]));
+        let indexed = TablePlan::new(&[cbv(0, 5)], &[RootIndexedView {
+            table_slot: 0, constant_slot: 1, constant_dword: 0, byte_offset: 0, shift: 5,
+        }]);
+        assert_eq!(&*state.table_extents([&vs, &indexed], false), &[(0, 128)]);
+        state.graphics[1] = Root::Constants(vec![128]);
+        assert_eq!(&*state.table_extents([&vs, &indexed], false), &[(0, 6)]);
+        let list = host.new_list().unwrap();
+        let v = state.tables_with_extents(&list, &vs, false, &extents);
+        let p = state.tables_with_extents(&list, &ps, false, &extents);
+        assert_eq!(&*v, &*p);
+        assert_ne!(v[0].1, u32::MAX);
+        assert_eq!(state.dynamic.len(), 1);
+        assert_eq!(state.dynamic[0].2, 128);
+
+        const SOURCE: &str = r#"
+#define RS "DescriptorTable(CBV(b0, numDescriptors=128)), UAV(u0)"
+cbuffer A : register(b5) { uint a; };
+cbuffer B : register(b127) { uint b; };
+RWByteAddressBuffer output : register(u0);
+[RootSignature(RS)] [numthreads(1,1,1)]
+void main() { output.Store(0, a); output.Store(4, b); }
+"#;
+        let code = crate::host::compile(SOURCE, s!("main"), s!("cs_5_1")).unwrap();
+        // SAFETY: compiled code and resources live until GPU completion.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root = host.device.CreateRootSignature(0, &code).unwrap();
+            let pso = host.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+                ..Default::default()
+            }).unwrap();
+            (root, pso)
+        };
+        let output = host.uav_buffer(256).unwrap();
+        let readback = host.read_back_buffer(256).unwrap();
+        // SAFETY: open list, valid root arguments and resources.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(h.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list.SetComputeRootDescriptorTable(0, h.gpu_handle(v[0].1 / 32));
+            list.list.SetComputeRootUnorderedAccessView(1, output.GetGPUVirtualAddress());
+            list.list.ResourceBarrier(&[crate::host::transition(&output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            list.list.Dispatch(1, 1, 1);
+            list.list.ResourceBarrier(&[crate::host::transition(&output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            list.list.CopyBufferRegion(&readback, 0, &output, 0, 8);
+            list.list.Close().unwrap();
+        }
+        a.0[0] = 0x12345678;
+        b.0[0] = 0xabcdef01;
+        host.execute_sync_internal(&list);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: completed readback, reading its first two dwords.
+        unsafe {
+            readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 8 }), Some(&mut mapped)).unwrap();
+            assert_eq!(std::slice::from_raw_parts(mapped.cast::<u32>(), 2), &[a.0[0], b.0[0]]);
+            readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+            assert!(host.device.GetDeviceRemovedReason().is_ok());
+        }
+        state.tables_done();
     }
 }

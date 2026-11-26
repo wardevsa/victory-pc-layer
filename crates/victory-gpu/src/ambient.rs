@@ -85,6 +85,12 @@ enum Set {
 
 fn parse(set: &str) -> Set {
     let set = set.trim();
+    if set.is_empty() {
+        return Set::Estimate(1.0);
+    }
+    if set == "off" || set == "0" {
+        return Set::Off;
+    }
     let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
     match set.strip_prefix("constant:") {
         Some(level) => number(level).map_or(Set::Off, Set::Constant),
@@ -517,7 +523,7 @@ mod tests {
 
     #[test]
     fn settings() {
-        assert_eq!(parse(""), Set::Off);
+        assert_eq!(parse(""), Set::Estimate(1.0));
         assert_eq!(parse("off"), Set::Off);
         assert_eq!(parse("0"), Set::Off);
         assert_eq!(parse("0.8"), Set::Estimate(0.8));

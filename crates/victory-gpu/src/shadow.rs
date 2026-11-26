@@ -2794,6 +2794,19 @@ pub(crate) fn window_use() -> [u64; 8] {
     out
 }
 
+/// How long a window nothing asked for is kept, in milliseconds, in place
+/// of what free memory decides (`VICTORY_WINDOW_IDLE_MS`; unset, that; no
+/// less than 2 s, `crate::texture::idle_ms`). With 12 GiB or more free that
+/// is five minutes.
+fn window_idle_ms() -> Option<u64> {
+    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_WINDOW_IDLE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    })
+}
+
 /// Lets go of the copies of windows outside buffers that nothing names any
 /// more. They were never freed, and the world's streaming keeps asking for
 /// new ones: 648 windows (2.8 GB) when the cutscene began, 974 (4.3 GB)
@@ -2817,7 +2830,10 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+        let idle_ms = crate::texture::idle_ms(
+            window_idle_ms(),
+            crate::host::ram_idle_ms(crate::host::available_physical_ram()),
+        );
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {

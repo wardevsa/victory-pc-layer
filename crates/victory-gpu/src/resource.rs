@@ -1517,6 +1517,20 @@ fn fills(desc: &ResourceDesc) -> bool {
     desc.dimension != BUFFER && desc.flags & TARGET_DEPTH_UNORDERED == 0
 }
 
+/// Read-only textures over title-mapped memory can have a sparse mip chain
+/// whether the title provided a resource object or only a placed view.
+/// Committed copies and textures the GPU writes retain their existing path.
+#[cfg(windows)]
+fn streamed_mip_levels(r: &Resource) -> Option<u32> {
+    const TEXTURE_2D: u32 = 3;
+    let levels = mip_count(&r.desc);
+    (fills(&r.desc) && r.desc.dimension == TEXTURE_2D
+        && r.desc.depth_or_array_size == 1 && levels > 1 && r.desc.sample_count <= 1
+        && (r.host.placed.load(std::sync::atomic::Ordering::Relaxed)
+            || matches!(&r.backing, Backing::Address(_))))
+        .then_some(levels)
+}
+
 /// Whether the title fills texture `this` itself ([`fills`]).
 #[cfg(windows)]
 pub(crate) fn title_fills(this: This) -> bool {
@@ -1571,7 +1585,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
-        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
+        if let Some(levels) = streamed_mip_levels(r)
+            && crate::tiles::wanted()
+        {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
             // What the upload can read: a console layout, no XOR mode
@@ -1586,7 +1602,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
-                .and_then(|(t, host)| crate::tiles::Tiled::make(&host.device, t, u32::from(r.desc.mip_levels)));
+                .and_then(|(t, host)| crate::tiles::Tiled::make(&host.device, t, levels));
             // (Both or neither: a reserved texture the card will not cut
             // into tiles is dropped here, and the old kind is made below.)
             if cut.is_some() {
@@ -2501,7 +2517,11 @@ fn host_texture_as(
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
     // in no texel).
-    if fills(desc)
+    // A request for a reserved mip chain must reach CreateReservedResource;
+    // a pooled committed texture would allocate every level and make the
+    // sparse path fall back before it can map any tiles.
+    if !reserved
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
@@ -2993,7 +3013,7 @@ pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
 
 /// Texture `this`'s console layout (one plane), where it lies in title
 /// memory and the bytes that layout takes, for `crate::texback`; `None` for
-/// a buffer or a texture with planes.
+/// buffers, multi-plane textures, and layouts we cannot address.
 #[cfg(windows)]
 pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Layout, usize, usize)> {
     if this.is_null() {
@@ -3004,10 +3024,27 @@ pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Lay
         return None;
     }
     let t = texture_layout(&r.desc)?;
-    let [plane] = &t.planes[..] else {
+    let [mut plane]: [_; 1] = t.planes.try_into().ok()?;
+    let at = r.data() as usize;
+    const R32_FLOAT: u32 = 41;
+    if r.desc.format == R32_FLOAT && at.is_multiple_of(65536) {
+        use victory_formats::texture::RenderPipeConfig;
+        let pipes = match crate::console::current() {
+            crate::console::Console::SeriesS => RenderPipeConfig::Pipes8Packers4,
+            crate::console::Console::SeriesX => RenderPipeConfig::Pipes32Packers8,
+        };
+        plane.layout.configure_render_xor(pipes);
+    }
+    if !plane.layout.addressable() {
+        // Recording and waiting for a GPU copy cannot produce a CPU-visible
+        // plane if the console's address equation is unavailable.
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(width = r.desc.width, height = r.desc.height,
+            format = r.desc.format, swizzle = plane.layout.desc.swizzle.0,
+            "water readback skipped before GPU copy: unsupported console layout"));
         return None;
-    };
-    Some((plane.layout.clone(), r.data() as usize, t.size as usize))
+    }
+    Some((plane.layout, at, t.size as usize))
 }
 
 /// The bytes of title memory a texture with the resource description
@@ -3375,6 +3412,78 @@ mod tests {
             mip_levels: mips,
             layout: 0,
             ..buffer(0)
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "real GPU integration; run with VICTORY_LEVELS_ON_DEMAND=1"]
+    fn address_backed_readonly_texture_keeps_unmapped_mips_unallocated() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RESERVE, MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE};
+        assert!(crate::tiles::wanted(), "requires sparse texture support and VICTORY_LEVELS_ON_DEMAND=1");
+        for (levels, all_mapped, flags) in [(12, false, 0), (0, false, 0), (12, true, 0), (12, false, 4)] {
+            let mut desc = texture(2048, 2048, 28, levels);
+            desc.flags = flags;
+            let size = footprint(&desc).unwrap().size as usize;
+            // Only the tail is mapped, as with a streamed console texture.
+            let address = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE) };
+            assert!(!address.is_null());
+            struct Pages(*mut std::ffi::c_void);
+            impl Drop for Pages { fn drop(&mut self) { unsafe { VirtualFree(self.0, 0, MEM_RELEASE); } } }
+            let _pages = Pages(address);
+            let mapped = if all_mapped { size } else { 65536 };
+            assert!(!unsafe { VirtualAlloc(address, mapped, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+            unsafe { std::ptr::write_bytes(address.cast::<u8>(), 0x5a, mapped); }
+            let mut title = std::ptr::null();
+            assert_eq!(create_at_address(std::ptr::null(), address as u64, &desc, 0, std::ptr::null(), &RESOURCE_IIDS[0], &mut title), S_OK);
+            struct Object(This);
+            impl Drop for Object { fn drop(&mut self) { crate::object::release(self.0); } }
+            let _title = Object(title);
+            let r = resource(title);
+            assert!(!r.host.placed.load(std::sync::atomic::Ordering::Relaxed), "ordinary title resource object");
+            assert_eq!(streamed_mip_levels(r), if flags == 0 { Some(12) } else { None });
+            let host = host_resource(title).unwrap();
+            let of = unsafe { host.GetDesc() };
+            assert_eq!(of.MipLevels, 12);
+            assert_eq!((of.Width, of.Height), (2048, 2048));
+            let made = r.host.made.lock().unwrap();
+            if all_mapped || flags != 0 {
+                assert_eq!(of.Layout, D3D12_TEXTURE_LAYOUT_UNKNOWN);
+                assert!(made.as_ref().unwrap().0.tiled.is_none(), "fully mapped and GPU-written textures retain their original allocation path");
+                continue;
+            }
+            assert_eq!(of.Layout, D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE);
+            let held = made.as_ref().unwrap().0.clone();
+            drop(made);
+            let tiled = held.tiled.as_ref().expect("reserved mip chain");
+            assert_eq!(tiled.given_bytes(), 0, "unmapped mip levels consume no physical tiles");
+            let gpu = crate::host::host().unwrap();
+            let list = gpu.new_list().unwrap();
+            crate::texture::upload(&list, title, host);
+            list.close();
+            gpu.execute_sync_internal(&list);
+            assert!(tiled.given_bytes() > 0, "mapped tail is uploaded and given physical tiles: mips={levels}");
+            assert!(tiled.given_bytes() < size as u64, "unmapped large levels still consume no tiles after upload");
+            unsafe { assert!(gpu.device.GetDeviceRemovedReason().is_ok()); }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn water_readback_requires_an_addressable_console_plane() {
+        for (swizzle, bias, supported) in [(0x105, 0, true), (0x11b, 0, true),
+            (0x11b, 256, false), (0x119, 0, false)] {
+            let desc = ResourceDesc { layout: swizzle, flags: 4, ..texture(256, 256, 41, 1) };
+            let bytes = footprint(&desc).unwrap().size as usize;
+            let memory = vec![0u8; bytes + 65536 + bias];
+            let at = (memory.as_ptr() as usize).next_multiple_of(65536) + bias;
+            let mut r = std::ptr::null();
+            assert_eq!(create_at_address(std::ptr::null(), at as u64, &desc, 0,
+                std::ptr::null(), &PAGEABLE_IIDS[0], &mut r), object::S_OK);
+            let destination = title_texture(r).map(|(_, base, extent)| (base, extent));
+            assert_eq!(destination, supported.then_some((at, bytes)));
+            assert_eq!(resource_release(r), 0);
         }
     }
 

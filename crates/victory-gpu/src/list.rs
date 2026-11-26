@@ -229,16 +229,75 @@ unsafe impl Send for Idle {}
 /// four in ten a budget and an argument buffer (run 61: "104 host lists
 /// made 21.2 ms" a frame, and the graphics kernel's time to free them).
 #[cfg(windows)]
-static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
+static IDLE: std::sync::Mutex<Pool> = std::sync::Mutex::new(Pool {
+    lists: Vec::new(),
+    bytes: 0,
+    low: 0,
+    since_ms: 0,
+});
+
+/// The idle host lists, the upload memory they keep between them, and the
+/// fewest there were since `since_ms`: as many as none took in that time,
+/// which [`recycle`] may let go.
+#[cfg(windows)]
+struct Pool {
+    lists: Vec<Idle>,
+    bytes: u64,
+    low: usize,
+    since_ms: u64,
+}
 
 /// The most host lists kept idle (128 were too few: flights land several at
 /// a time, so lists were thrown away and others made in the same frame, with
 /// their preludes and buffers, 12 % of the submitting thread in the opening,
-/// profile cpu-1), and the most upload memory they may keep
-/// between them (a list keeps scratch chunks over a reset only while lists
-/// do not share them, `VICTORY_SCRATCH_POOL=0`).
+/// profile cpu-1). `VICTORY_LIST_IDLE_MOST=N`: N instead of 512, from 16 to
+/// 4096.
 #[cfg(windows)]
-const IDLE_MOST: (usize, u64) = (512, 256 << 20);
+fn idle_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let set = std::env::var("VICTORY_LIST_IDLE_MOST")
+            .ok()
+            .and_then(|v| v.trim().parse().ok());
+        set.map_or(512, |n: usize| n.clamp(16, 4096))
+    })
+}
+
+/// The most upload memory idle host lists may keep between them (a list
+/// keeps scratch chunks over a reset only while lists do not share them,
+/// `VICTORY_SCRATCH_POOL=0`).
+#[cfg(windows)]
+const IDLE_BYTES: u64 = 256 << 20;
+
+/// How long idle host lists none took may stay before some are let go, in
+/// milliseconds (0, by default: they stay, as before;
+/// `VICTORY_LIST_IDLE_TRIM_S=N`, N seconds, 10 to try). A D3D12 allocator
+/// keeps its memory over a reset, so an idle list keeps the most its
+/// commands ever took.
+#[cfg(windows)]
+fn trim_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        let set = std::env::var("VICTORY_LIST_IDLE_TRIM_S")
+            .ok()
+            .and_then(|v| v.trim().parse().ok());
+        set.map_or(0, |s: u64| s.saturating_mul(1000))
+    })
+}
+
+/// Idle host lists a trim always leaves.
+#[cfg(any(windows, test))]
+const TRIM_FLOOR: usize = 16;
+/// The most idle host lists one trim lets go.
+#[cfg(any(windows, test))]
+const TRIM_PER_TICK: usize = 32;
+
+/// How many idle host lists a trim lets go when `low` of them were never
+/// taken in its window: those above `floor`, `per_tick` at most.
+#[cfg(any(windows, test))]
+fn trim_count(low: usize, floor: usize, per_tick: usize) -> usize {
+    low.saturating_sub(floor).min(per_tick)
+}
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -254,10 +313,11 @@ fn pools() -> bool {
 fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        let taken = idle.0.pop();
+        let taken = idle.lists.pop();
         if let Some(Idle(_, bytes)) = &taken {
-            idle.1 -= bytes;
+            idle.bytes -= bytes;
         }
+        idle.low = idle.low.min(idle.lists.len());
         taken
     };
     match idle {
@@ -279,7 +339,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).lists.len() >= idle_most() {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -287,11 +347,31 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
-            idle.1 += bytes;
+        if idle.lists.len() < idle_most() && idle.bytes + bytes <= IDLE_BYTES {
+            idle.lists.push(Idle(host, bytes));
+            idle.bytes += bytes;
         }
     }
+    let window = trim_ms();
+    if window == 0 {
+        return;
+    }
+    // What none took in the window goes, the longest idle first (the bottom
+    // of the stack), dropped out of the lock as a full pool drops a list.
+    let gone: Vec<Idle> = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let now = crate::host::now_ms();
+        if now.saturating_sub(idle.since_ms) < window {
+            return;
+        }
+        let n = trim_count(idle.low, TRIM_FLOOR, TRIM_PER_TICK);
+        let gone: Vec<Idle> = idle.lists.drain(..n).collect();
+        idle.bytes -= gone.iter().map(|Idle(_, b)| b).sum::<u64>();
+        idle.low = idle.lists.len();
+        idle.since_ms = now;
+        gone
+    };
+    drop(gone);
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut
@@ -2382,6 +2462,41 @@ static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn trim_count_keeps_the_floor_and_the_step() {
+        assert_eq!(trim_count(0, TRIM_FLOOR, TRIM_PER_TICK), 0);
+        assert_eq!(trim_count(TRIM_FLOOR, TRIM_FLOOR, TRIM_PER_TICK), 0);
+        assert_eq!(trim_count(TRIM_FLOOR + 5, TRIM_FLOOR, TRIM_PER_TICK), 5);
+        assert_eq!(trim_count(4096, TRIM_FLOOR, TRIM_PER_TICK), TRIM_PER_TICK);
+    }
+
+    /// The low-water mark as `fresh_list` and `recycle` keep it, on plain
+    /// numbers: the bytes of each idle list, their total, and the fewest
+    /// there were since the last trim.
+    #[test]
+    fn a_trim_lets_go_what_none_took() {
+        let mut lists: Vec<u64> = (0..100).collect();
+        let mut bytes: u64 = lists.iter().sum();
+        let mut low = lists.len();
+        // A push never raises it.
+        lists.push(7);
+        bytes += 7;
+        assert_eq!(low, 100);
+        // A window with no pops: all but the floor were idle, a step at most.
+        let n = trim_count(low, TRIM_FLOOR, TRIM_PER_TICK);
+        assert_eq!(n, (100 - TRIM_FLOOR).min(TRIM_PER_TICK));
+        let gone: Vec<u64> = lists.drain(..n).collect();
+        bytes -= gone.iter().sum::<u64>();
+        low = lists.len();
+        // The longest idle went, and the total is what is left.
+        assert_eq!(gone[0], 0);
+        assert_eq!(bytes, lists.iter().sum::<u64>());
+        // A pop lowers it.
+        lists.pop();
+        low = low.min(lists.len());
+        assert_eq!(low, lists.len());
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

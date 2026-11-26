@@ -29,6 +29,9 @@ pub const SLOT_STRIDES: u8 = 255;
 /// Kept distinct from [`SLOT_STRIDES`] so the host binds the table without
 /// running the full bindless heap buffer sweep.
 pub const SLOT_TABLE_STRIDES: u8 = 252;
+/// The root SRV `t<SLOT_VIEW_ADDRESSES>` in [`ROOT_CBV_SPACE`]: the low and
+/// high dwords of each view heap slot's title address.
+pub const SLOT_VIEW_ADDRESSES: u8 = 251;
 /// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 /// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format

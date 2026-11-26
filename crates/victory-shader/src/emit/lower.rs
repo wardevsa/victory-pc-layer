@@ -424,6 +424,7 @@ enum MaskData {
 /// What a value holding a lane mask read as a number stops with.
 pub(super) const LANE_MASK: Why = "a lane mask read as data";
 pub(super) const DIVERGENT_MASK_EXCHANGE: Why = "a lane mask exchanged where not every lane runs";
+pub(super) const GROUP_BARRIER_DIVERGENT: Why = "a group barrier where not every lane runs";
 /// A mask with lanes outside EXEC where it is written, read as a number where the lanes that
 /// run that block are not all of the wave.
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
@@ -433,7 +434,7 @@ pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read
 /// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
 /// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
 /// the branch that do not post-dominate it). None with an indirect exit (not followed).
-fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
+pub(super) fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
     let n = st.exits.len();
     let mut all = vec![true; n];
     for (_, region) in lane_regions(st)? {
@@ -2108,7 +2109,7 @@ impl<'a> Lower<'a> {
                     let total = self.s.op(c, &format!("waveActiveOp.{sfx}"), Attr::NoUnwind, ty, 119, &[arg, k0, ku]);
                     let tb = bits(self, total);
                     let c = self.cur;
-                    let (lo, _) = self.exchange_halves(c, tb);
+                    let (lo, _) = self.exchange_halves(c, Some(self.cur_ir), tb)?;
                     let lo = back(self, lo);
                     let cl = self.console_lane();
                     let k32 = self.s.m.i32(32);
@@ -2120,7 +2121,7 @@ impl<'a> Lower<'a> {
                 None => {
                     let rb = bits(self, r);
                     let c = self.cur;
-                    let (lo, hi) = self.exchange_halves(c, rb);
+                    let (lo, hi) = self.exchange_halves(c, Some(self.cur_ir), rb)?;
                     let (lo, hi) = (back(self, lo), back(self, hi));
                     match op {
                         Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
@@ -2197,8 +2198,8 @@ impl<'a> Lower<'a> {
                 need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
             }
-            let (lo0, lo1) = self.exchange_halves(self.cur, r_lo);
-            let (hi0, hi1) = self.exchange_halves(self.cur, r_hi);
+            let (lo0, lo1) = self.exchange_halves(self.cur, Some(self.cur_ir), r_lo)?;
+            let (hi0, hi1) = self.exchange_halves(self.cur, Some(self.cur_ir), r_hi)?;
             let c = self.cur;
             let d0 = self
                 .s
@@ -2320,7 +2321,7 @@ impl<'a> Lower<'a> {
         if !halves {
             return Ok(mine);
         }
-        let (lo, hi) = self.exchange_halves(c, mine);
+        let (lo, hi) = self.exchange_halves(c, Some(self.cur_ir), mine)?;
         let c = self.cur;
         let total = self.add_halves(lo, hi);
         let total = self.s.m.bin(c, Bin::And, total, low);
@@ -3056,29 +3057,61 @@ impl<'a> Lower<'a> {
     /// descriptor holds more in the second dword, the stride from bit 16
     /// up; code that takes the address masks those away.)
     fn view_address(&mut self, site: Site) -> Option<(V, V)> {
-        use super::shader::USER_VIEW_ADDRESS;
+        use super::shader::{SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES, USER_VIEW_ADDRESS};
         let a = self.scalar.get(&site).copied()?;
         let rp = *self.x.native.layout.get(a.param)?;
-        if rp.root != RootType::Table || a.dynamic.is_some() || a.offset % 32 != 0 {
+        if a.offset % 32 != 0 {
             return None;
         }
-        let dword = a.offset / 4;
-        let used = self
-            .x
-            .native
-            .used
-            .iter()
-            .filter(|u| {
-                u.root == RootType::Table
-                    && u.user_data == rp.user_data
-                    && u.table_offset_dwords <= dword
-            })
-            .max_by_key(|u| u.table_offset_dwords)?;
-        if used.dwords != 4 || !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
+        if rp.root == RootType::Table && a.dynamic.is_none() {
+            let dword = a.offset / 4;
+            let used = self
+                .x
+                .native
+                .used
+                .iter()
+                .filter(|u| {
+                    u.root == RootType::Table
+                        && u.user_data == rp.user_data
+                        && u.table_offset_dwords <= dword
+                })
+                .max_by_key(|u| u.table_offset_dwords)?;
+            if used.dwords != 4 || !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
+                return None;
+            }
+            let lo = self.host_word(RootType::Other(USER_VIEW_ADDRESS), rp.slot, dword);
+            let hi = self.host_word(RootType::Other(USER_VIEW_ADDRESS + 1), rp.slot, dword);
+            return Some((lo, hi));
+        }
+        if !matches!(rp.root, RootType::Table | RootType::ResourceHeap) {
             return None;
         }
-        let lo = self.host_word(RootType::Other(USER_VIEW_ADDRESS), rp.slot, dword);
-        let hi = self.host_word(RootType::Other(USER_VIEW_ADDRESS + 1), rp.slot, dword);
+        let slot = self.heap_index(site, 0, false).ok()?;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let last = self.s.m.i32(SLOT_STRIDES_COUNT - 1);
+        let slot = self
+            .s
+            .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let three = self.s.m.i32(3);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, three);
+        let h = self.s.root_srv_handle(SLOT_VIEW_ADDRESSES);
+        let iu = self.s.m.undef(i32t);
+        let mask = self.s.m.i8(3);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let f0 = self.s.m.extract(c, r, 0);
+        let f1 = self.s.m.extract(c, r, 1);
+        let lo = self.as_int(f0);
+        let hi = self.as_int(f1);
         Some((lo, hi))
     }
 
@@ -3548,7 +3581,7 @@ impl<'a> Lower<'a> {
                         need(b.unwrap_or(0));
                         return Err(DIVERGENT_MASK_EXCHANGE);
                     }
-                    xy = self.exchange_halves(at, xy.0);
+                    xy = self.exchange_halves(at, b, xy.0)?;
                 }
                 self.ballots.insert(lo, xy);
                 xy
@@ -4158,14 +4191,19 @@ impl<'a> Lower<'a> {
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
     /// (lower half's, upper half's). A group with no upper half gets 0 for it.
-    fn exchange_halves(&mut self, at: usize, mine: V) -> (V, V) {
+    fn exchange_halves(
+        &mut self,
+        at: usize,
+        barrier_block: Option<usize>,
+        mine: V,
+    ) -> Result<(V, V), Why> {
         let Some((slot, small, _)) = self.exchange.as_ref().map(|(a, b, _)| (*a, *b, ())) else {
             let z = self.s.m.i32(0);
-            return (mine, z);
+            return Ok((mine, z));
         };
         if small {
             let z = self.s.m.i32(0);
-            return (mine, z);
+            return Ok((mine, z));
         }
         if self.local {
             // each host wave on its own: its half holds `mine`, the other nothing
@@ -4174,7 +4212,13 @@ impl<'a> Lower<'a> {
             let upper = self.s.m.cmp(at, pred::IUGE, cl, k32);
             let lo = self.s.m.select(at, upper, z, mine);
             let hi = self.s.m.select(at, upper, mine, z);
-            return (lo, hi);
+            return Ok((lo, hi));
+        }
+        if let Some(b) = barrier_block
+            && !self.all_lanes(b)
+        {
+            need(b);
+            return Err(GROUP_BARRIER_DIVERGENT);
         }
         // the pair of dwords of this thread's console wave: its half's, then both
         let pair = self.exchange_pair(slot);
@@ -4194,7 +4238,7 @@ impl<'a> Lower<'a> {
         let hi = self.s.m.load(at, p1);
         // the slots are written again only after every thread read them
         self.group_sync(at);
-        (lo, hi)
+        Ok((lo, hi))
     }
 
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
@@ -4250,7 +4294,7 @@ impl<'a> Lower<'a> {
             return Err(DIVERGENT_MASK_EXCHANGE);
         }
         let some = self.s.m.cast(at, Cast::ZExt, some, i32t);
-        let (lo, hi) = self.exchange_halves(at, some);
+        let (lo, hi) = self.exchange_halves(at, made, some)?;
         let both = self.s.m.bin(at, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(at, pred::NE, both, z))
@@ -4292,7 +4336,7 @@ impl<'a> Lower<'a> {
         let some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[set]);
         self.s.flags |= flags::WAVE_OPS;
         let some = self.s.m.cast(c, Cast::ZExt, some, i32t);
-        let (lo, hi) = self.exchange_halves(c, some);
+        let (lo, hi) = self.exchange_halves(c, Some(b), some)?;
         let c = self.cur;
         let both = self.s.m.bin(c, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
@@ -4811,15 +4855,15 @@ impl<'a> Lower<'a> {
     /// leave them out. Once only helper lanes are left in such a loop none of them ever matched:
     /// they ran to the iteration limit, and left with no sample for their quad's derivatives,
     /// along every triangle's edges (upstream #908, the fix of #1733 for this tree's form).
-    fn first_lane(&mut self, x: V, guard: Option<V>) -> (V, V) {
+    fn first_lane(&mut self, x: V, guard: Option<V>) -> Result<(V, V), Why> {
         let (first, any) = self.first_live_lane(x, guard);
         if !self.s.pixel || !super::helper_own() {
-            return (first, any);
+            return Ok((first, any));
         }
         let helper = self.helper_lane();
         let c = self.cur;
         let yes = self.s.m.bool(true);
-        (self.s.m.select(c, helper, x, first), self.s.m.select(c, helper, yes, any))
+        Ok((self.s.m.select(c, helper, x, first), self.s.m.select(c, helper, yes, any)))
     }
 
     /// Whether this lane of a pixel shader is a helper lane.
@@ -5522,7 +5566,12 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
-        if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+        // EXEC-derived masks stay on the mask path; preserve other SGPR bit patterns when
+        // their non-active result is consumed as ordinary scalar data.
+        let numeric_mask = inst.read(Reg::S(EXEC)).is_none()
+            && inst.read(Reg::S(EXEC + 1)).is_none()
+            && lo.is_some_and(|v| !self.x.st.active.contains(&v) && self.read_as_number(v));
+        if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) && !numeric_mask {
             return Err(LANE_MASK);
         }
         if matches!(
@@ -8896,7 +8945,7 @@ impl<'a> Lower<'a> {
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
-                let (mine, any) = self.first_lane(a, guard);
+                let (mine, any) = self.first_lane(a, guard)?;
                 // two host waves that exchange: the console's first lane may be in the other
                 // one, unless every lane holds the same value
                 let alike = match v.src.first() {
@@ -8926,13 +8975,13 @@ impl<'a> Lower<'a> {
                         // has. No half needs to ask the other whether it has
                         // a lane (an exchange of the constant 1: two group
                         // barriers), and the lower half's value is the answer.
-                        let (lo, _) = self.exchange_halves(c, mine);
+                        let (lo, _) = self.exchange_halves(c, Some(self.cur_ir), mine)?;
                         lo
                     } else {
                         let i32t = self.s.t.i32;
                         let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
-                        let (lo_has, hi_has) = self.exchange_halves(c, has);
-                        let (lo, hi) = self.exchange_halves(c, mine);
+                        let (lo_has, hi_has) = self.exchange_halves(c, Some(self.cur_ir), has)?;
+                        let (lo, hi) = self.exchange_halves(c, Some(self.cur_ir), mine)?;
                         let z = self.s.m.i32(0);
                         let in_lo = self.s.m.cmp(c, pred::NE, lo_has, z);
                         let in_hi = self.s.m.cmp(c, pred::NE, hi_has, z);
@@ -10794,6 +10843,51 @@ impl<'a> Lower<'a> {
     }
 
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        let sampler = self.descriptors.get(&((b, i), true)).copied();
+        if let Some(Source::Phi { block, args }) = sampler
+            && let [first @ Source::Constant(_), second @ Source::Constant(_)] = args.as_slice()
+            && let [left, right] = self.x.p.blocks[*block].preds.as_slice()
+        {
+            // Immediate samplers are separate static bindings. Sample both with
+            // the original derivatives, then select the texel on the same edge
+            // that supplied the console's sampler.
+            if self.block[*left].is_none() {
+                return self.image_with_sampler(inst, b, i, Some(second));
+            }
+            if self.block[*right].is_none() {
+                return self.image_with_sampler(inst, b, i, Some(first));
+            }
+            let edge = |pred: usize| {
+                self.edges.get(&(pred, *block)).copied().or(self.tail[pred])
+                    .ok_or("a sampler choice with an unfinished predecessor")
+            };
+            let (left, right) = (edge(*left)?, edge(*right)?);
+            let join = self.block[*block].ok_or("a sampler choice without a host block")?;
+            let chosen = self.s.m.phi(join, self.s.t.i1);
+            let (yes, no) = (self.s.m.bool(true), self.s.m.bool(false));
+            self.s.m.set_phi(chosen, vec![(yes, left), (no, right)]);
+            self.image_with_sampler(inst, b, i, Some(first))?;
+            let left = inst.writes.iter()
+                .map(|&(_, v)| self.i32_of(v))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.image_with_sampler(inst, b, i, Some(second))?;
+            for (&(_, v), a) in inst.writes.iter().zip(left) {
+                let b = self.i32_of(v)?;
+                let result = self.s.m.select(self.cur, chosen, a, b);
+                self.vals.insert(v, Val::I32(result));
+            }
+            return Ok(());
+        }
+        self.image_with_sampler(inst, b, i, sampler)
+    }
+
+    fn image_with_sampler(
+        &mut self,
+        inst: &Inst,
+        b: usize,
+        i: usize,
+        sampler: Option<&Source>,
+    ) -> Result<(), Why> {
         let Fields::Image {
             data,
             addr,
@@ -11122,11 +11216,7 @@ impl<'a> Lower<'a> {
         // A gather at a named level, done as four texel reads (below).
         let mut gathered: Option<[V; 4]> = None;
         let r = if sample {
-            let ss = self
-                .descriptors
-                .get(&(site, true))
-                .copied()
-                .ok_or("an untracked sampler")?;
+            let ss = sampler.ok_or("an untracked sampler")?;
             // Comparison: the reference value is the first address after
             // the bias, and the sampler is a comparison sampler.
             let cmp = matches!(op, 64 | 65);
@@ -13296,6 +13386,30 @@ mod tests {
                 range(ResourceType::Sampler, 1, 1),
             ],
         )
+    }
+
+    #[test]
+    fn a_uniform_branch_can_choose_between_immediate_samplers() {
+        // A root constant selects wrap or clamp. Keep the sample live with an LDS store.
+        let words = [
+            0xBE84_0300, 0xBE85_0380,       // s[4:5] = texture table
+            0xF40C_0302, 0xFA00_0000,       // s_load_dwordx8 s[12:19], s[4:5], 0
+            0xBE89_0380, 0xBE8A_0380, 0xBE8B_0380, // sampler words 1-3
+            0xBF06_8001,                    // s_cmp_eq_u32 s1, 0
+            0xBF85_0002,                    // branch to clamp
+            0xBE88_0380, 0xBF82_0002,       // wrap, skip clamp
+            0xBE88_03FF, 0x0000_0092,       // clamp all axes
+            0xF09C_0F08, 0x0043_0C02,       // image_sample_lz v[12:15], ..., s[8:11]
+            0xD834_0000, 0x0000_0C00,       // ds_write_b32 v0, v12
+            S_ENDPGM,
+        ];
+        let (mut layout, mut used) = texture_tables();
+        layout[1] = root(RootType::Constants, 1, 1);
+        used.truncate(1);
+        let shader = lower_with(&words, layout, used).unwrap();
+        assert_eq!(shader.samplers.len(), 2);
+        assert!(shader.samplers.contains(&[0, 0, 0, 0]));
+        assert!(shader.samplers.contains(&[0x92, 0, 0, 0]));
     }
 
     #[test]

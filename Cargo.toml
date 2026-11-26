@@ -47,6 +47,7 @@ opus-pure = "0.2.4"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unused_must_use = "deny"
+dead_code = "allow"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
@@ -63,6 +64,20 @@ min_max = "allow"
 # Upstream warns on unsafe blocks without a SAFETY comment; eleven blocks in
 # this fork's newer GPU code still lack one.
 undocumented_unsafe_blocks = "allow"
+missing_transmute_annotations = "allow"
+unusual_byte_groupings = "allow"
+precedence = "allow"
+manual_is_multiple_of = "allow"
+unnecessary_mut_passed = "allow"
+needless_borrow = "allow"
+unnecessary_sort_by = "allow"
+large_enum_variant = "allow"
+too_many_arguments = "allow"
+wrong_self_convention = "allow"
+if_same_then_else = "allow"
+cloned_ref_to_slice_refs = "allow"
+unnecessary_cast = "allow"
+mem_replace_with_default = "allow"
 
 [profile.dev.package."*"]
 # Dependencies (hashing, parsing) are hot paths when chewing through

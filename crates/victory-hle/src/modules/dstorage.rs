@@ -154,7 +154,10 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
-    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
+    // Only the walls trace reads the list, so it isn't kept without it.
+    if walls_trace() > 0 {
+        WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
+    }
     put(out, file)
 }
 
@@ -675,7 +678,8 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
     } else {
         let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
         let source = request.source as usize;
-        files.iter().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
+        // From the back: an address used again names the file opened last.
+        files.iter().rev().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
     };
     let hr = match result {
         Ok(()) => 0,
@@ -1413,6 +1417,8 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         let mut packed = vec![0; request.intermediate_size as usize];
         let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
         packed.truncate(n);
+        // The compressed bytes aren't needed past here: not held while BCPack unpacks.
+        drop(source);
         Cow::Owned(packed)
     } else {
         source

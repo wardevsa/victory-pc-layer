@@ -64,6 +64,7 @@ fn build() -> [u8; 32] {
         // executable had cached with the switch unset.
         for name in [
             "VICTORY_WAVE_WIDE",
+            "VICTORY_WAVE_WIDE_ONLY",
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
@@ -121,7 +122,12 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| {
+        let hash = blake3::hash(c).to_hex();
+        let wide = victory_shader::emit::wave_wide_only(&hash[..16]);
+        victory_shader::emit::with_wave_wide(wide, || victory_shader::emit::translate(c))
+            .map_err(|e| e.to_string())
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
