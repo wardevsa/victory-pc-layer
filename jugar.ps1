@@ -114,6 +114,15 @@ if (-not $Fabrica -and -not $Rapido) {
     # prepares: the driver lowers its clocks. One small compute group on a
     # queue of its own keeps them up (host/awake.rs).
     $env:VICTORY_CARD_AWAKE = "1"
+    # With those (0abc767, 5.5-6 fps), the submitting thread waited 93-104 ms
+    # a frame for the card, in about 5 settles a frame, all for "title
+    # memory read: a fill of upload memory". The title's 174 MB heap counts
+    # as written by shaders as a whole, and the small fills of its ring of
+    # constants waited for every flight. A small fill of bytes the title
+    # wrote itself since, or of a page no shader wrote in 600 frames, goes on
+    # without the wait (host.rs fill_is_titles; cool_fox measured two thirds
+    # of that wait gone).
+    $env:VICTORY_FILL_TITLE = "1"
     if ([Environment]::ProcessorCount -le 12) {
         # Helper pools sized for a 24-thread CPU share 6 cores with the title
         # here: fewer of each (Maykzera's victory-rtx3060, measured on a
