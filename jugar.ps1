@@ -191,6 +191,17 @@ $env:VICTORY_MEMORY_COPIES = "$CopiasRT"
 # no longer goes over what the builder built there (VICTORY_BVH_KEEP=1, see
 # memory.rs keep_windows). A test: whether the interiors get the light.
 if ($RTGuardar) { $env:VICTORY_BVH_KEEP = "1" } else { Remove-Item Env:VICTORY_BVH_KEEP -ErrorAction SilentlyContinue }
+# With it, windows of 256 KiB instead of 4 MiB and up to 16,383 copies: on
+# the 4 MiB grid all 2,047 copies (8.4 GB of RAM) were taken and 40 to 150
+# pages a frame that rays walked had none, read as zeros (2026-11-26). The
+# finer grid holds 16 times the pages in the same memory (16,383 copies at
+# most 4 GB); VIctory-7900XTX keeps the structures in 64 KiB pages.
+if ($RTGuardar) {
+    $env:VICTORY_WINDOW_KB = "256"
+    if (-not $PSBoundParameters.ContainsKey('CopiasRT')) { $env:VICTORY_MEMORY_COPIES = "16383" }
+} else {
+    Remove-Item Env:VICTORY_WINDOW_KB -ErrorAction SilentlyContinue
+}
 # -Luz 0.6: the least indirect light (Belobug's VIctory-Belobug-AMD, also in
 # VIctory-7900XTX): right after the title's program that resolves indirect
 # light, its output is raised to this level, tinted by the sky the title
