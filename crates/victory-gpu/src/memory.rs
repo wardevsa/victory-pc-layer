@@ -95,9 +95,36 @@ const CELL: u64 = 4 << 20;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
 
+/// Bytes of the directory brought up to its card copy at a time.
+const CHUNK: u64 = 4096;
+
+/// Whether shaders read the directory from a copy in the card's memory
+/// (`VICTORY_DIRECTORY_CARD=0`: from the PC's memory, as before).
+///
+/// The directory is the CPU's (it fills entries as pages get copies) and
+/// lived in memory the card reads over the bus: every load or store a
+/// shader makes by address looks its page up there first, so every step of
+/// every ray crossed the bus twice, once for the entry and once for the
+/// node (VIctory-7900XTX found the same: "every step of every ray waited
+/// for it"). With the structures' pages kept the card took about 310 ms a
+/// frame here and read 12.6 GB of shared memory (2026-11-26). Entries only
+/// ever go from empty to filled, and few are made once a scene is in, so
+/// the card's copy takes the 4 KiB pieces that changed, before the next
+/// shader that reads it.
+fn directory_on_card() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECTORY_CARD").is_none_or(|v| v != "0"))
+}
+
 struct Memory {
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
+    /// The directory's copy in the card's memory and its GPU address
+    /// ([`directory_on_card`]), and per [`CHUNK`] of the directory whether
+    /// it changed since it last went up (a bit each).
+    card: Option<(ID3D12Resource, u64)>,
+    dirty: Vec<u64>,
+    any_dirty: bool,
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
@@ -137,14 +164,85 @@ impl Memory {
             Some((buffer, data.cast::<u32>(), gpu))
         };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
+        let bytes = u64::from(MEMORY_PAGES) * 2 * 4;
+        // Zeroed at creation, as the CPU's directory is.
+        let card = directory_on_card()
+            .then(|| host.uav_buffer(bytes))
+            .flatten()
+            .map(|buffer| {
+                crate::host::name(&buffer, || "title memory by address: directory on the card".to_owned());
+                // SAFETY: a live buffer.
+                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                (buffer, gpu)
+            });
+        tracing::info!(
+            on_card = card.is_some(),
+            "title memory by address: the directory shaders look pages up in (VICTORY_DIRECTORY_CARD=0: the PC's memory)"
+        );
         Some(Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
+            card,
+            dirty: vec![0; (bytes / CHUNK).div_ceil(64) as usize],
+            any_dirty: false,
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
             copies: Vec::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
         })
+    }
+
+    /// The directory entry of `page` changed: its piece goes up to the
+    /// card's copy before the next shader that reads it.
+    fn touch(&mut self, page: u64) {
+        let chunk = (page * 8 / CHUNK) as usize;
+        self.dirty[chunk / 64] |= 1 << (chunk % 64);
+        self.any_dirty = true;
+    }
+
+    /// Brings the card's copy of the directory up to date in `list`, ahead
+    /// of the shader about to be recorded, and leaves it readable by
+    /// shaders. `first` is whether this is the list's first shader that
+    /// reads it: the buffer then starts the list in the common state (a
+    /// buffer goes back to it at the end of every submission). The GPU
+    /// address shaders read the directory at.
+    fn directory_for(&mut self, list: &HostList, first: bool) -> u64 {
+        let Some((card, gpu)) = self.card.clone() else {
+            return self.directory.2;
+        };
+        let readable = D3D12_RESOURCE_STATES(
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0,
+        );
+        let l = &list.list;
+        if self.any_dirty {
+            if !first {
+                // SAFETY: an open list; the buffer is readable in it so far.
+                unsafe { l.ResourceBarrier(&[crate::host::transition(&card, readable, D3D12_RESOURCE_STATE_COPY_DEST)]) };
+            }
+            let mut pieces = 0u32;
+            for (word, bits) in self.dirty.iter_mut().enumerate() {
+                let mut left = std::mem::take(bits);
+                while left != 0 {
+                    let chunk = word as u64 * 64 + u64::from(left.trailing_zeros());
+                    left &= left - 1;
+                    // SAFETY: an open list; both buffers hold the piece.
+                    unsafe { l.CopyBufferRegion(&card, chunk * CHUNK, &self.directory.0, chunk * CHUNK, CHUNK) };
+                    pieces += 1;
+                }
+            }
+            self.any_dirty = false;
+            DIRECTORY_PIECES.fetch_add(u64::from(pieces), std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: as above; the copies are recorded.
+            unsafe { l.ResourceBarrier(&[crate::host::transition(&card, D3D12_RESOURCE_STATE_COPY_DEST, readable)]) };
+            list.keep(&self.directory.0);
+        } else if first {
+            // SAFETY: an open list; the buffer starts it in the common state.
+            unsafe { l.ResourceBarrier(&[crate::host::transition(&card, D3D12_RESOURCE_STATE_COMMON, readable)]) };
+        }
+        if first {
+            list.keep(&card);
+        }
+        gpu
     }
 
     /// Gives the page of `address` its copy, if it has none and the memory
@@ -200,11 +298,17 @@ impl Memory {
                     // SAFETY: inside the directory's mapping.
                     let other = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
                     // SAFETY: as above; the offset first, as below.
-                    unsafe {
+                    let filled = unsafe {
                         if other.read() == 0 {
                             other.add(1).write_volatile((at - first) as u32);
                             other.write_volatile(n as u32 + 1);
+                            true
+                        } else {
+                            false
                         }
+                    };
+                    if filled {
+                        self.touch(at / PAGE);
                     }
                     at += PAGE;
                 }
@@ -228,6 +332,7 @@ impl Memory {
             entry.add(1).write_volatile(offset as u32);
             entry.write_volatile(n as u32 + 1);
         }
+        self.touch(page);
         Mapped::Made
     }
 
@@ -388,9 +493,19 @@ pub(crate) fn ready(
         list.keep(&m.directory.0);
         list.keep(&m.faults.0);
     }
+    let directory = m.directory_for(list, first_read);
     Some(Ready {
-        directory: m.directory.2,
+        directory,
         faults: m.faults.2,
         base,
     })
+}
+
+/// 4 KiB pieces of the directory sent up to its card copy since the start
+/// ([`directory_on_card`]).
+static DIRECTORY_PIECES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// For the frame summary: pieces of the directory sent up so far.
+pub(crate) fn directory_pieces() -> u64 {
+    DIRECTORY_PIECES.load(std::sync::atomic::Ordering::Relaxed)
 }

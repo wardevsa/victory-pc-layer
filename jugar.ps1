@@ -4,6 +4,8 @@
 #         .\jugar.ps1 -Diag      (the diagnostics build, target\diag: logs why
 #                                 draws are dropped and dumps the arguments of
 #                                 unknown pipeline methods to pipeline-dumps\)
+#         .\jugar.ps1 -Diag -Tiempos  (the card's time of every command, by
+#                                 program, in diag-<res>.log)
 #         .\jugar.ps1 -Precompiled  (makes device method 0x218's compute
 #                                 pipelines, VICTORY_PRECOMPILED=1: faster, but
 #                                 the picture can go grey; work in progress)
@@ -56,6 +58,7 @@ param(
     [switch]$Mejor,
     [string]$Luz = "",
     [int]$VentanasMB = 0,
+    [switch]$Tiempos,
     [int]$CopiasRT = 2047,
     [int]$CardMB = 1024,
     [ValidateSet("alta", "media", "baja")]
@@ -237,5 +240,9 @@ if ($Diag) {
     $exe = ".\target\diag\release\victory.exe"
     $log = "diag-$Resolution.log"
     $env:VICTORY_PIPELINE_DUMP = Join-Path $PSScriptRoot "pipeline-dumps"
+    # -Tiempos: the card's time of every command it runs, by program
+    # (VICTORY_GPU_TIMING; the run is slower: each list is sent on its own).
+    # The log's "the card's time by command (timing run)" lines.
+    if ($Tiempos) { $env:VICTORY_GPU_TIMING = "1" } else { Remove-Item Env:VICTORY_GPU_TIMING -ErrorAction SilentlyContinue }
 }
 & $exe run $Game --execute 2>&1 | Tee-Object -FilePath $log

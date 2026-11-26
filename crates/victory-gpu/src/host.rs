@@ -8768,6 +8768,10 @@ impl Meter {
                 );
             }
             tracing::info!(
+                pieces = crate::memory::directory_pieces(),
+                "title memory by address: 4 KiB pieces of the directory sent up to its card copy since the start"
+            );
+            tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
