@@ -243,6 +243,16 @@ if ($Diag) {
     # -Tiempos: the card's time of every command it runs, by program
     # (VICTORY_GPU_TIMING; the run is slower: each list is sent on its own).
     # The log's "the card's time by command (timing run)" lines.
-    if ($Tiempos) { $env:VICTORY_GPU_TIMING = "1" } else { Remove-Item Env:VICTORY_GPU_TIMING -ErrorAction SilentlyContinue }
+    # Timestamps are read only where each list is submitted and waited for
+    # on its own (`Host::submit`), not through the relay: the relay is off
+    # for it (with it on, a run of 9 minutes logged no command, 2026-11-26).
+    if ($Tiempos) {
+        $env:VICTORY_GPU_TIMING = "1"
+        # Unset, the relay is on (shadow.rs `relay`).
+        $env:VICTORY_RELAY = "0"
+        Remove-Item Env:VICTORY_LATE_WAIT -ErrorAction SilentlyContinue
+    } else {
+        Remove-Item Env:VICTORY_GPU_TIMING -ErrorAction SilentlyContinue
+    }
 }
 & $exe run $Game --execute 2>&1 | Tee-Object -FilePath $log
