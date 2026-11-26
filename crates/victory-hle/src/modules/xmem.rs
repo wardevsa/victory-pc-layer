@@ -1087,7 +1087,7 @@ fn port_on() -> bool {
 }
 
 /// The title's reservations of 64 KiB pages for 32-bit graphics memory:
-/// base and bytes (one, of 185 MB, in Grand Theft Auto VI).
+/// base and bytes (one, of 185 MB, in the title).
 static LOW_RESERVATIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 /// Pages given another place in their section so far by [`arrange`], and
@@ -1101,7 +1101,7 @@ static ARRANGED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// reservation), so that the reservation becomes one stretch of the section
 /// and the GPU side can open it as one heap.
 ///
-/// Grand Theft Auto VI takes all the pages of its 185 MB heap in one call
+/// the title takes all the pages of its 185 MB heap in one call
 /// and maps its five pieces in another order than their addresses (run
 /// port1-1: "Scattered"). Only fresh slices are exchanged: never mapped,
 /// never written (no commit bit), so every page still reads as zeros and

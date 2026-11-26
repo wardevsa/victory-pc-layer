@@ -1,3 +1,48 @@
+# victory-pc-layer
+
+The title of an Xbox Series dump the user owns, run on a Windows PC with an
+8 GB NVIDIA card. Since 2026-11-26 this repository starts again from
+**[cool_fox](https://github.com/DoubleGhosty/cool_fox)** (DoubleGhosty and
+the community behind it, "CGBJ"): on the test PC it gave the best picture of
+every tree tried, and the next work is its frame rate. The earlier tree (on
+fxceless's victory-fork, with ray-traced light at about 2 fps) is kept in the
+branch `base-victory-fork`.
+
+**This repository contains no game files, code or assets.** You need your own
+copy of the game. It is not affiliated with or endorsed by the game's
+developer or publisher.
+
+## Use
+
+```powershell
+cargo build --release -p victory
+$env:VICTORY_GAME_DIR = '<folder of your dump>'
+powershell -ExecutionPolicy Bypass -File .\jugar.ps1                 # Series S, fast switches
+powershell -ExecutionPolicy Bypass -File .\jugar.ps1 -Salida 1664x936  # less for the card
+powershell -ExecutionPolicy Bypass -File .\jugar.ps1 -Simple         # cool_fox's defaults
+```
+
+`jugar.ps1` turns on the speed switches of cool_fox's own `Play-VIctory.cmd`
+(all off by default in its code). The log goes to `run-<console>.log`.
+
+## Results on the test PC
+
+NVIDIA RTX 2060 SUPER 8 GB, AMD Ryzen 5 5600GT, 32 GB RAM, Windows 11.
+
+| Run | Frame rate | Notes |
+|-----|------------|-------|
+| cool_fox `3277b15`, Series S, every switch at its default (2026-11-26) | 3.2-4 fps in the cell, 5 at the boat, up to 8 in cutscenes | the best picture so far; the card about 150 ms a frame, preparing about 110, copying back about 70; no traced light (a constant stands in) |
+| the earlier tree (`base-victory-fork`), Series X with ray tracing | 1.6-2 fps | traced light in the cell, textures noisy |
+
+## Credits
+
+- **[cool_fox](https://github.com/DoubleGhosty/cool_fox)**: the base, and
+  through it codec_d's cool_fox, avatarmanz's VIctory-7900XTX, DexNom,
+  Belobug and their contributors (see below).
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
+  contributors, the base of all of them.
+
+---
 # cool_fox (CGBJ Runtime Continuation)
 
 [![CI](https://github.com/DoubleGhosty/cool_fox/actions/workflows/ci.yml/badge.svg)](https://github.com/DoubleGhosty/cool_fox/actions/workflows/ci.yml)
