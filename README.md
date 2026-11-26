@@ -17,7 +17,8 @@ developer or publisher.
 ```powershell
 cargo build --release -p victory
 $env:VICTORY_GAME_DIR = '<folder of your dump>'
-powershell -ExecutionPolicy Bypass -File .\jugar.ps1                 # Series S, cool_fox's defaults
+powershell -ExecutionPolicy Bypass -File .\jugar.ps1                 # Series S, compares on the card
+powershell -ExecutionPolicy Bypass -File .\jugar.ps1 -Fabrica        # cool_fox's defaults alone
 powershell -ExecutionPolicy Bypass -File .\jugar.ps1 -SinPelo        # hair strands skipped (faster)
 powershell -ExecutionPolicy Bypass -File .\jugar.ps1 -Salida 1664x936  # less for the card
 powershell -ExecutionPolicy Bypass -File .\jugar.ps1 -Rapido         # Play-VIctory.cmd's switch set
@@ -48,6 +49,7 @@ NVIDIA RTX 2060 SUPER 8 GB, AMD Ryzen 5 5600GT, 32 GB RAM, Windows 11.
 |-----|------------|-------|
 | cool_fox `3277b15`, Series S, every switch at its default (2026-11-26) | 3.2-4 fps in the cell, 5 at the boat, up to 8 in cutscenes | the best picture so far; the card about 150 ms a frame, preparing about 110, copying back about 70; no traced light (a constant stands in) |
 | the same with `Play-VIctory.cmd`'s switch set (now `-Rapido`) | about 2 fps | the card 250-380 ms a frame |
+| cool_fox `64b8967`, shaders prepared ahead (`-Preparar`), defaults, at the boat | 3.2 fps median, 4-5 seen | preparing 142 ms, the card 136, copying back 51 (medians); the CPU compared 228 MB a frame; a crash in the title's script after the package lands in the water (fxceless/victory-fork issue 1209, every build) |
 | the earlier tree (`base-victory-fork`), Series X with ray tracing | 1.6-2 fps | traced light in the cell, textures noisy |
 
 ## Credits

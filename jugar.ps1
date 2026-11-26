@@ -5,7 +5,7 @@
 # ms a frame against about 150). The picture stays as 3277b15 drew it: hair
 # strands drawn, no stand-in light.
 #
-# Usage:  .\jugar.ps1                 (Series S, cool_fox's defaults, the full hair)
+# Usage:  .\jugar.ps1                 (Series S, the full hair, buffer compares on the card)
 #         .\jugar.ps1 -SinPelo        (hair strands skipped: faster, simpler hair)
 #         .\jugar.ps1 -Rapido         (the switch set of Play-VIctory.cmd)
 #         .\jugar.ps1 -Salida 1664x936  (a smaller output: less work for the
@@ -16,6 +16,8 @@
 #                                      scaled up by the title: 0.5 to 1.0)
 #         .\jugar.ps1 -Rapido -Luz 1.0  (with -Rapido: the stand-in light's
 #                                      constant level; 0.8 default)
+#         .\jugar.ps1 -Fabrica        (none of our speed switches: cool_fox's
+#                                      defaults alone, to compare)
 #         .\jugar.ps1 -Preparar       (no game: every shader translated into
 #                                      the cache, then the host pipelines of
 #                                      earlier runs made for the driver's cache;
@@ -33,6 +35,7 @@ param(
     [switch]$SinPelo,
     [string]$Luz = "0.8",
     [switch]$Preparar,
+    [switch]$Fabrica,
     [string]$Exe = "$PSScriptRoot\target\release\victory.exe",
     [string]$Game = $(
         if ($env:VICTORY_GAME_DIR -like "*.exe") { $env:VICTORY_GAME_DIR }
@@ -90,6 +93,26 @@ if ($Preparar) {
 
 # Pipelines the title makes are written down for -Preparar.
 $env:VICTORY_PIPELINE_BOOK = "1"
+
+if (-not $Fabrica -and -not $Rapido) {
+    # Work off the CPU, the picture untouched. In the boat run (2026-11-26,
+    # cool_fox 64b8967, 3.2 fps median) a frame was about 140 ms of
+    # preparing, 135 on the card, 51 of copying back, and the CPU compared
+    # 228 MB a frame of title buffers of 1-16 MiB for what shaders wrote: on
+    # an 8 GB card only copies of 16 MiB and more (512 MB in all) had the
+    # card look. VIctory-NVIDIA measured 11 -> 22 fps from this one.
+    $env:VICTORY_CARD_BUFFERS_MIN_MB = "1"
+    $env:VICTORY_CARD_BUFFERS_MB = "1024"
+    # The card's hash passes over pieces sent up (214 a frame there) joined.
+    $env:VICTORY_CARD_REHASH_RUNS = "1"
+    # A copy that continues the one before becomes one copy with it.
+    $env:VICTORY_JOIN_COPIES = "1"
+    # What shaders wrote looked for on several threads.
+    $env:VICTORY_WIDE_BACK = "1"
+    # Left out from Play-VIctory.cmd's set (-Rapido), which made the card
+    # slower here (250-380 ms a frame): the renderer ports (constants read by
+    # the card from the PC's memory), the relay and the texture switches.
+}
 
 # The picture as cool_fox 3277b15 drew it, the one liked best: hair strands
 # drawn (64b8967 skips them unless VICTORY_HAIR is set) and no stand-in
