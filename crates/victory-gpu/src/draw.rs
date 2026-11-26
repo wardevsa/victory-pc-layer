@@ -1069,6 +1069,14 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        // The sky as the title reflects it: the least indirect light
+        // follows its colour (`crate::ambient`).
+        if crate::ambient::level().is_some()
+            && p.stages.iter().any(|s| s.shader.draws_sky)
+            && let Some(&sky) = self.targets.first()
+        {
+            crate::ambient::sky_drawn(sky);
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -2342,6 +2350,54 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        // The least indirect light (`crate::ambient`): its pass sets its
+        // own pipeline, root and heap, so the next draw sets the title's.
+        if crate::ambient::level().is_some() && self.ambient(list, p) {
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+            self.host_heaps = [0; 2];
+        }
+    }
+
+    /// After a dispatch of `p`: the least indirect light, if it is the
+    /// program that resolves that (after Belobug's VIctory-Belobug-AMD).
+    fn ambient(&self, list: &HostList, p: &HostPipeline) -> bool {
+        let Some(stage) = p
+            .stages
+            .first()
+            .filter(|s| s.shader.resolves_light || s.shader.ends_reflections)
+        else {
+            return false;
+        };
+        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            let u = stage.translated().used.iter().find(|u| {
+                u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+        };
+        if !stage.shader.resolves_light {
+            // The reflections, held to the light around.
+            return match view(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                Some(View::Unordered(r, ..)) if r != 0 => crate::ambient::hold(list, r as This),
+                _ => false,
+            };
+        }
+        let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
+            Some(View::Unordered(r, ..)) => r,
+            _ => 0,
+        };
+        if light == 0 {
+            once!("no ambient light: other tables");
+            return false;
+        }
+        let depth = match view(ResourceType::Srv, crate::ambient::DEPTH) {
+            Some(View::Shader(r, _)) => Some(r as This),
+            _ => None,
+        };
+        crate::ambient::raise(list, light as This, depth)
     }
 
     /// What a draw or dispatch runs, for the device-removed report

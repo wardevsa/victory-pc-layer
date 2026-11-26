@@ -28,6 +28,8 @@
 #         .\jugar.ps1 -Mejor     (victory-fork's best set, run 279: 9-12 fps
 #                                 on an RTX 4070, water read back; with
 #                                 -SinRT it is that set as tested there)
+#         .\jugar.ps1 -Luz 0.6   (the least indirect light, tinted by the sky:
+#                                 interiors readable; 0.3 darker, 1 brighter)
 #         .\jugar.ps1 -CopiasRT 1023  (copies of memory the ray tracing
 #                                 reaches: fewer for less RAM; 2047 by default)
 #         .\jugar.ps1 -Texturas alta|media|baja  (texture quality; media by
@@ -47,6 +49,7 @@ param(
     [switch]$RTEncierro,
     [switch]$Rapido,
     [switch]$Mejor,
+    [string]$Luz = "",
     [int]$CopiasRT = 2047,
     [int]$CardMB = 1024,
     [ValidateSet("alta", "media", "baja")]
@@ -180,6 +183,12 @@ $env:VICTORY_BVH_QUARANTINE = if ($SinRT -or $RTCompleto) { "0" } elseif ($RTEnc
 # PC's RAM; the log's "touched pages that had no copy" lines say how many
 # still find no number (no_number) and how many MB the copies hold.
 $env:VICTORY_MEMORY_COPIES = "$CopiasRT"
+# -Luz 0.6: the least indirect light (Belobug's VIctory-Belobug-AMD, also in
+# VIctory-7900XTX): right after the title's program that resolves indirect
+# light, its output is raised to this level, tinted by the sky the title
+# draws, and reflections are held to it. Interiors are readable without the
+# ray-traced light; off by default (crate::ambient).
+if ($Luz) { $env:VICTORY_AMBIENT = $Luz } else { Remove-Item Env:VICTORY_AMBIENT -ErrorAction SilentlyContinue }
 # Large tiled textures detiled on 4 CPU threads (victory-fork PR #271).
 $env:VICTORY_TEXTURE_DETILE_WORKERS = "4"
 
