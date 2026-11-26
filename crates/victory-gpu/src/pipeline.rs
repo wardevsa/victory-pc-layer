@@ -598,7 +598,7 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 
 /// Whether a container's program is one of those that simulate and draw
 /// hair strands, by its name (from Belobug's VIctory-Belobug-AMD, commit
-/// 4f62c2a). They are left out unless `VICTORY_HAIR=1`: on this RTX 2060
+/// 4f62c2a). They are left out with `VICTORY_HAIR=0`: on this RTX 2060
 /// SUPER the strands' simulation alone took about 80 ms of the card's time a
 /// frame (`smh_sim_1:CS_SolvePerVertConstraint` 52.9 ms in 549 dispatches,
 /// the rest of `smh_sim` 27 ms; timing run of 2026-11-26), a quarter of the
@@ -624,7 +624,9 @@ fn hair_strands(container: &[u8]) -> bool {
         b"CS_GenerateAccessories",
         b"CSGenerateHair",
     ];
-    if *RUN.get_or_init(|| std::env::var_os("VICTORY_HAIR").is_some_and(|v| v == "1")) {
+    // Kept by default (the tester wanted the strands back, 2026-11-26);
+    // `VICTORY_HAIR=0` (`jugar.ps1 -SinPelo`) leaves them out.
+    if *RUN.get_or_init(|| std::env::var_os("VICTORY_HAIR").is_none_or(|v| v != "0")) {
         return false;
     }
     const END: &[u8] = b"_Wrapped";

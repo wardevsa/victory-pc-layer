@@ -59,6 +59,7 @@ param(
     [string]$Luz = "",
     [int]$VentanasMB = 0,
     [switch]$Tiempos,
+    [switch]$SinPelo,
     [int]$CopiasRT = 2047,
     [int]$CardMB = 1024,
     [ValidateSet("alta", "media", "baja")]
@@ -225,6 +226,9 @@ if ($keep) {
 # light, its output is raised to this level, tinted by the sky the title
 # draws, and reflections are held to it. Interiors are readable without the
 # ray-traced light; off by default (crate::ambient).
+# -SinPelo: hair strands left out (VICTORY_HAIR=0): about 80 ms of the
+# card's time a frame on this PC; characters keep their hair meshes.
+if ($SinPelo) { $env:VICTORY_HAIR = "0" } else { Remove-Item Env:VICTORY_HAIR -ErrorAction SilentlyContinue }
 if ($Luz) { $env:VICTORY_AMBIENT = $Luz } else { Remove-Item Env:VICTORY_AMBIENT -ErrorAction SilentlyContinue }
 # Large tiled textures detiled on 4 CPU threads (victory-fork PR #271).
 $env:VICTORY_TEXTURE_DETILE_WORKERS = "4"

@@ -94,7 +94,7 @@ This tree follows victory-fork's `main` (merged up to `a183ea2`,
   got their ray-traced light for the first time on this NVIDIA card
   (2026-11-26).**
 - **Speed and stability after a timing run** (2026-11-26, RTX 2060 SUPER):
-  - **Hair strands left out** (`VICTORY_HAIR=1` keeps them): their
+  - **Hair strands can be left out** (`jugar.ps1 -SinPelo`, `VICTORY_HAIR=0`; kept by default): their
     simulation took about 80 ms of the card's time a frame
     (`CS_SolvePerVertConstraint` 52.9 ms in 549 dispatches), a quarter of
     it. The programs that simulate and draw strands, by name, have no host
