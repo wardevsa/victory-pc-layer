@@ -77,6 +77,7 @@ Series S profile.
 | + the card kept awake, 6-core pools (`0abc767`) | 5.5-6.3; cutscenes start much sooner | the submitting thread waits 93-104 ms for the card in 5 settles |
 | + `VICTORY_FILL_TITLE` (`09fab1c`) | **7-10 fps, 11 in cutscenes** | 1 settle; copying back 81 |
 | + `VICTORY_RELAY_COPY` (`d516213`, taken back) | 6-8 | copying back 28, preparing 95; torn textures |
+| + cool_fox `72944b1` merged (`be542a8`) | 4.3 median, steady 6-8 at the end | the water white: two water transmission computes now lowered to wave 32, left out before, are left out again here; preparing 110, copying back 87; the package landed without the crash |
 | the earlier tree (`base-victory-fork`), Series X with ray tracing | 1.6-2 | traced light in the cell, textures noisy |
 
 What remains, from the diagnostics run: one wait a frame (13-47 ms) for a
@@ -96,6 +97,7 @@ package lands in the water in the boat mission, in every build
 | [KevinPratap/ApexIV](https://github.com/KevinPratap/ApexIV) | a background heap-buffer slot walk, 4.8 -> 6.6 fps | another lineage: its switches are not in cool_fox; a port to look at |
 | [xcl-dev/xcl](https://github.com/xcl-dev/xcl), Jackfrost-cloud/XSEmu (an XCL copy) | about 5 fps | another design |
 | [JozefDeTremmerie/CCS03](https://github.com/JozefDeTremmerie/CCS03) | 3-7.8 fps on an RTX 4060 laptop | merged into the earlier tree and taken back: slower here |
+| [rorodev6/victory-nvidia-megafork](https://github.com/rorodev6/victory-nvidia-megafork) | VIctory-NVIDIA with the Windows 10 Agility SDK and a pipeline panic fix (cool_fox has its own) | the VIctory-NVIDIA line, much worse here |
 
 ## Credits
 
