@@ -629,23 +629,28 @@ pub fn emit(
         // One logical wave per group, with a wave32 PSO on RTX. The particle
         // light-atlas shaders that reset the card are not in this list.
         // Explicit policy wins.
+        // `VICTORY_SCENE_KERNELS=old`: only the two of before cool_fox 3c1f8bd,
+        // to measure what the others cost (on the RTX 2060 SUPER the card's
+        // time a frame rose from about 55 to 75-104 ms after that merge).
+        let scene_old = std::env::var_os("VICTORY_SCENE_KERNELS").is_some_and(|v| v == "old");
         let scene_kernel = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
-            && matches!(
+            && (matches!(
                 c.digest,
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
                     // CS_Visibility
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
+            ) || !scene_old
+                && matches!(
+                    c.digest,
                     // CS_Tree_BatchCull
-                    | [0xc0, 0xf4, 0xa2, 0x3c, 0xaa, 0xa3, 0xe2, 0x34, 0xdc, 0xac, 0x7c, 0x40, 0x4c, 0x57, 0x48, 0x57]
+                    [0xc0, 0xf4, 0xa2, 0x3c, 0xaa, 0xa3, 0xe2, 0x34, 0xdc, 0xac, 0x7c, 0x40, 0x4c, 0x57, 0x48, 0x57]
                     // CS_Tree_BatchCull_ImposterOnly
                     | [0x6a, 0xc0, 0x3a, 0x0d, 0xa9, 0xb6, 0x80, 0x0d, 0xac, 0x87, 0x42, 0x32, 0x9d, 0x4f, 0x84, 0x82]
-                    // (CS_TransmissionVolumetrics_Tiled and its _LocalLights
-                    // form are left out here: in this form on an RTX 2060
-                    // SUPER the water turned white, where with them left
-                    // untranslated it drew as before.)
+                    // (the two CS_TransmissionVolumetrics_Tiled forms of
+                    // cool_fox's list are left out: the water drew white)
                     // CS_CollisionRaytraced
                     | [0xd3, 0x2c, 0xbc, 0xbf, 0xff, 0x6a, 0x0c, 0x04, 0x80, 0xb5, 0x06, 0xd8, 0xf7, 0xd6, 0x58, 0xf9]
-            );
+                ));
         let wide_on = wide_option
             .as_ref()
             .map_or_else(|| scene_kernel || WIDE_HERE.get(), |v| v == "1");
