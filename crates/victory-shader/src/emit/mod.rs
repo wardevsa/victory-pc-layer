@@ -480,6 +480,13 @@ pub fn with_wave_wide<T>(on: bool, translate: impl FnOnce() -> T) -> T {
     translate()
 }
 
+/// Runs `translate` with LDS atomics counted as writes only when `on` (see
+/// `lower::LdsAtomicsWriteOnly`).
+pub fn with_lds_atomics_write_only<T>(on: bool, translate: impl FnOnce() -> T) -> T {
+    let _rule = on.then(lower::LdsAtomicsWriteOnly::new);
+    translate()
+}
+
 /// Meet sites the face-relocation compute emitted, or 0 before it is translated.
 pub fn defrag_meet_sites() -> u32 {
     lower::meet_sites()

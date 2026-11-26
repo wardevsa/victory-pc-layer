@@ -1046,7 +1046,8 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
                 writes[r] = true;
                 // Only ordinary stores are write-only. An atomic depends on the
                 // previous LDS value even when it has no return register.
-                reads[r] |= !(name.starts_with("ds_write_b") || name.starts_with("ds_write2"));
+                reads[r] |= !LDS_ATOMICS_WRITE_ONLY.with(std::cell::Cell::get)
+                    && !(name.starts_with("ds_write_b") || name.starts_with("ds_write2"));
             }
         }
     }
@@ -1142,6 +1143,30 @@ thread_local! {
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_half_meets`].
     static HALF_MEETS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`LdsAtomicsWriteOnly`].
+    static LDS_ATOMICS_WRITE_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While alive, an LDS atomic counts as a write only in [`lds_meetings`], as
+/// before cool_fox ebf9299 counted it as a read too. For the two water
+/// transmission computes (`CS_TransmissionVolumetrics_Tiled` and its
+/// `_LocalLights` form): with the newer rule their wave-32 form (local waves)
+/// is refused, and the wave-wide form drew the water white on an RTX 2060
+/// SUPER, left untranslated whitish; with the older rule the wave-32 form
+/// drew it as before.
+pub(crate) struct LdsAtomicsWriteOnly;
+
+impl LdsAtomicsWriteOnly {
+    pub(crate) fn new() -> Self {
+        LDS_ATOMICS_WRITE_ONLY.with(|c| c.set(true));
+        LdsAtomicsWriteOnly
+    }
+}
+
+impl Drop for LdsAtomicsWriteOnly {
+    fn drop(&mut self) {
+        LDS_ATOMICS_WRITE_ONLY.with(|c| c.set(false));
+    }
 }
 
 /// The host's group-shared memory, in dwords (32 KiB).

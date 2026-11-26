@@ -125,8 +125,15 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| {
         let hash = blake3::hash(c).to_hex();
         let wide = victory_shader::emit::wave_wide_only(&hash[..16]);
-        victory_shader::emit::with_wave_wide(wide, || victory_shader::emit::translate(c))
-            .map_err(|e| e.to_string())
+        // The two water transmission computes (CS_TransmissionVolumetrics_Tiled
+        // and its _LocalLights form) translate under the LDS rule from before
+        // cool_fox ebf9299: under the newer one they were refused on an RTX
+        // 2060 SUPER and the water drew white or whitish.
+        let water = matches!(&hash[..16], "7c9a6a83826cdfac" | "21f7ad7863620328");
+        victory_shader::emit::with_lds_atomics_write_only(water, || {
+            victory_shader::emit::with_wave_wide(wide, || victory_shader::emit::translate(c))
+        })
+        .map_err(|e| e.to_string())
     };
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
