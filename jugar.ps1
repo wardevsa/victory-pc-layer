@@ -18,6 +18,9 @@
 #                                      constant level; 0.8 default)
 #         .\jugar.ps1 -Fabrica        (none of our speed switches: cool_fox's
 #                                      defaults alone, to compare)
+#         .\jugar.ps1 -Prueba         (the next step being tried: small fills
+#                                      of upload memory done on the card in
+#                                      order, not waited for; see below)
 #         .\jugar.ps1 -Diag           (the diagnostics build, target\diag: the
 #                                      same switches, and the log names what
 #                                      each wait for the card waited for;
@@ -43,6 +46,7 @@ param(
     [switch]$Preparar,
     [switch]$Fabrica,
     [switch]$Diag,
+    [switch]$Prueba,
     [string]$Exe = "$PSScriptRoot\target\release\victory.exe",
     [string]$Game = $(
         if ($env:VICTORY_GAME_DIR -like "*.exe") { $env:VICTORY_GAME_DIR }
@@ -134,6 +138,20 @@ if (-not $Fabrica -and -not $Rapido) {
     # Not VICTORY_RELAY_COPY (tried in d516213): copying back fell from 81 to
     # 28 ms a frame, but preparing rose from 66 to 95 and the frame rate
     # stayed, and textures showed torn for a moment as they appeared.
+    if ($Prueba) {
+        # The diagnostics run (6abe0ed, 5.2-6.3 fps there) named what the
+        # submitting thread still waits for: 0.2-0.8 times a frame, 13-47 ms,
+        # a fill of 16-48 bytes of upload memory in the title's 174 MB heap,
+        # which some 12 dispatches a frame declare written as a whole (the
+        # skinning passes, through one view of the bindless table: no bound
+        # of what they write is known). Stage 1 of the card steps does such a
+        # fill on the card, in the flights' order, instead of on the CPU
+        # after the wait (host/card_steps.rs); it needs the relay's second
+        # stage. Stage 2 (copies too) is left out: with it victory-rtx3060
+        # saw stretched bodies.
+        $env:VICTORY_RELAY = "2"
+        $env:VICTORY_CARD_STEPS = "1"
+    }
     if ([Environment]::ProcessorCount -le 12) {
         # Helper pools sized for a 24-thread CPU share 6 cores with the title
         # here: fewer of each (Maykzera's victory-rtx3060, measured on a
