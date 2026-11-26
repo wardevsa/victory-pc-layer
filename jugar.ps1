@@ -1,18 +1,21 @@
-# Runs the title on this tree (cool_fox, DoubleGhosty) with the switches that
-# make it faster. Every switch of cool_fox is off by default; its own
-# Play-VIctory.cmd turns this set on (5-7 fps where its author measured). With
-# all of them at their defaults it ran at 3.2-4 fps on Series S on the RTX 2060
-# SUPER test PC, 5 at the boat, up to 8 in cutscenes.
+# Runs the title on this tree (cool_fox, DoubleGhosty). By default with
+# cool_fox's own defaults: on the RTX 2060 SUPER test PC they ran at 3.2-4 fps
+# on Series S, 5 at the boat, up to 8 in cutscenes, while the switch set of
+# cool_fox's Play-VIctory.cmd (-Rapido) ran at about 2 fps (the card 250-380
+# ms a frame against about 150). Since cool_fox 64b8967 its hair-strand
+# passes are skipped unless VICTORY_HAIR is set (-Pelo).
 #
-# Usage:  .\jugar.ps1                 (Series S, the fast switches)
+# Usage:  .\jugar.ps1                 (Series S, cool_fox's defaults)
+#         .\jugar.ps1 -Pelo           (hair strands drawn: the full hair, slower)
+#         .\jugar.ps1 -Rapido         (the switch set of Play-VIctory.cmd)
 #         .\jugar.ps1 -Salida 1664x936  (a smaller output: less work for the
 #                                      card; 1280x720, 1664x936, 1920x1080)
 #         .\jugar.ps1 -SeriesX        (Series X: its author says faces render
 #                                      whole on 8 GB cards only there; slower)
 #         .\jugar.ps1 -SeriesX -Escala 0.6  (Series X rendered at 60% and
 #                                      scaled up by the title: 0.5 to 1.0)
-#         .\jugar.ps1 -Simple         (every switch at its default, to compare)
-#         .\jugar.ps1 -Luz 1.0        (the stand-in light's level; 0.8 default)
+#         .\jugar.ps1 -Rapido -Luz 1.0  (with -Rapido: the stand-in light's
+#                                      constant level; 0.8 default)
 # The title's executable is VICTORY_GAME_DIR if that names an .exe; if it
 # names a folder, the largest .exe in it. Or pass it with -Game.
 param(
@@ -20,7 +23,8 @@ param(
     [string]$Escala = "",
     [ValidateSet("", "1280x720", "1664x936", "1920x1080", "2560x1440")]
     [string]$Salida = "",
-    [switch]$Simple,
+    [switch]$Rapido,
+    [switch]$Pelo,
     [string]$Luz = "0.8",
     [string]$Exe = "$PSScriptRoot\target\release\victory.exe",
     [string]$Game = $(
@@ -47,7 +51,8 @@ $kept = @([Environment]::GetEnvironmentVariables('User').Keys) + @([Environment]
 Get-ChildItem Env: | Where-Object { $_.Name -like "VICTORY_*" -and $kept -notcontains $_.Name } |
     ForEach-Object { Remove-Item "Env:$($_.Name)" }
 
-if (-not $Simple) {
+if ($Pelo) { $env:VICTORY_HAIR = "1" }
+if ($Rapido) {
     # Copies and the copy-back: sent without waiting for each submission,
     # found on several threads, joined, over the card's copy queue.
     $env:VICTORY_RELAY = "2"
@@ -96,5 +101,12 @@ if ($Escala) {
 }
 
 $log = "run-$console.log"
-Write-Host "VIctory (cool_fox base): $console$(if ($Simple) { ', defaults' } else { ', fast switches' }); log in $log"
-& $Exe run $Game --execute --console $console 2>&1 | Tee-Object -FilePath $log
+Write-Host "VIctory (cool_fox base): $console$(if ($Rapido) { ', Play-VIctory.cmd switches' } else { ', defaults' })$(if ($Pelo) { ', hair strands' }); log in $log"
+# A writer of our own, not Tee-Object: Windows PowerShell 5.1's wraps long
+# lines at the window's width and writes UTF-16.
+$writer = [IO.StreamWriter]::new((Join-Path $PWD $log), $false, [Text.UTF8Encoding]::new($false))
+try {
+    & $Exe run $Game --execute --console $console 2>&1 | ForEach-Object { $line = "$_"; $writer.WriteLine($line); $line }
+} finally {
+    $writer.Dispose()
+}
