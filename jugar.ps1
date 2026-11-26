@@ -308,6 +308,8 @@ if ($Diag) {
         # Unset, the relay is on (shadow.rs `relay`).
         $env:VICTORY_RELAY = "0"
         Remove-Item Env:VICTORY_LATE_WAIT -ErrorAction SilentlyContinue
+        # The texture thread needs the late wait the relay brings.
+        Remove-Item Env:VICTORY_HEAP_WORKER -ErrorAction SilentlyContinue
     } else {
         Remove-Item Env:VICTORY_GPU_TIMING -ErrorAction SilentlyContinue
         # Breadcrumbs and the faulting address, cheap (`light`): where a lost
