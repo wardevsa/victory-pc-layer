@@ -266,6 +266,23 @@ NVIDIA RTX 2060 SUPER 8 GB, AMD Ryzen 5 5600GT, 32 GB RAM, Windows 11.
 | the same, `-RTCompleto` (the builder's results copied back) | about 0.1 fps | | **the first ray-traced light seen**: a lit window, warm reflections, the yard in detail; still dark overall and far too slow to play |
 | this tree with `VICTORY_BVH_QUARANTINE=2` and list upload memory below 2^40 (2026-11-26) | 1-2 fps | 480-1490 ms | every cutscene plays, no crash; the yard sunlit and detailed; interiors black; copies 550-860 ms a frame (500 MB) |
 | the same with the structures' pages left to the card and 256 KiB windows (2026-11-26) | 1.6-2.1 fps | 480-620 ms | **ray-traced light in the cell and corridors**: walls, floor, bunks, light bounced off the floor; copies about 110 ms a frame; the card about 310 ms; RAM nearly full (30.6 of 31 GB) |
+| CCS03 merged into this tree, Series X (2026-11-26; reverted) | 0.6-0.9 fps | 1100-1760 ms | the picture flat, dark and red (CCS03's stand-in light on by default over the traced light); preparing a frame 1714 ms, 658 of them in its write watch |
+| [DoubleGhosty/cool_fox](https://github.com/DoubleGhosty/cool_fox) `3277b15`, Series S, every switch at its default (2026-11-26) | 3.2-4 fps | 250-315 ms | **the best picture so far**: the cell sunlit, warm, detailed, Lucía's hair; the card about 150 ms, preparing about 110, copying back about 70; no traced light (a constant stands in) |
+
+### cool_fox with its author's switches: `jugar-cf.ps1`
+
+cool_fox's defaults leave most of its speed work off; its own
+`Play-VIctory.cmd` turns it on (5-7 fps where its author measured).
+`jugar-cf.ps1` runs a clone of it in `%USERPROFILE%\victory-coolfox` with
+those switches:
+
+```powershell
+git clone https://github.com/DoubleGhosty/cool_fox $env:USERPROFILE\victory-coolfox
+cd $env:USERPROFILE\victory-coolfox; cargo build --release -p victory
+powershell -ExecutionPolicy Bypass -File .\jugar-cf.ps1             # Series S, tuned
+powershell -ExecutionPolicy Bypass -File .\jugar-cf.ps1 -Simple     # defaults, to compare
+powershell -ExecutionPolicy Bypass -File .\jugar-cf.ps1 -SeriesX -Escala 0.6
+```
 
 What a player sees there: the opening cutscene, credits and title cards, and
 the first playable scene with the player character under control.
