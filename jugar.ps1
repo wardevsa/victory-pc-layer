@@ -21,6 +21,8 @@
 #         .\jugar.ps1 -RTCompleto  (the builder's results copied back into
 #                                 title memory, no quarantine: a test now that
 #                                 its dispatches stay inside their arrays)
+#         .\jugar.ps1 -RTGuardar  (the structures' pages are left to the card
+#                                 once taken: a test for the interiors' light)
 #         .\jugar.ps1 -RTEncierro  (none of the builder's results copied
 #                                 back: the old default, dark)
 #         .\jugar.ps1 -Rapido    (victory-fork's newer speed switches: faster
@@ -47,6 +49,7 @@ param(
     [switch]$SinRT,
     [switch]$RTCompleto,
     [switch]$RTEncierro,
+    [switch]$RTGuardar,
     [switch]$Rapido,
     [switch]$Mejor,
     [string]$Luz = "",
@@ -183,6 +186,11 @@ $env:VICTORY_BVH_QUARANTINE = if ($SinRT -or $RTCompleto) { "0" } elseif ($RTEnc
 # PC's RAM; the log's "touched pages that had no copy" lines say how many
 # still find no number (no_number) and how many MB the copies hold.
 $env:VICTORY_MEMORY_COPIES = "$CopiasRT"
+# -RTGuardar: the copies of title memory outside buffers (where the
+# structures lie) are taken once and then left to the card, so title memory
+# no longer goes over what the builder built there (VICTORY_BVH_KEEP=1, see
+# memory.rs keep_windows). A test: whether the interiors get the light.
+if ($RTGuardar) { $env:VICTORY_BVH_KEEP = "1" } else { Remove-Item Env:VICTORY_BVH_KEEP -ErrorAction SilentlyContinue }
 # -Luz 0.6: the least indirect light (Belobug's VIctory-Belobug-AMD, also in
 # VIctory-7900XTX): right after the title's program that resolves indirect
 # light, its output is raised to this level, tinted by the sky the title

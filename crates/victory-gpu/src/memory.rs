@@ -286,6 +286,23 @@ impl Memory {
     }
 }
 
+/// `VICTORY_BVH_KEEP=1` (with `VICTORY_BVH_QUARANTINE=2`): the copies of
+/// windows of title memory outside buffers are taken once and then left to
+/// the card. What the structure builder stores in them by address stays in
+/// them (quarantined), but every list that read title memory by address
+/// brought each copy's written pages up from title memory again, whole,
+/// over what the builder had built there: the interiors stayed black, and
+/// about 500 MB a frame went up (2026-11-26). VIctory-7900XTX keeps the
+/// structures' pages on the card the same way (only the dwords the title
+/// changed go up there). Title buffers' copies (the lists' upload memory
+/// with the instances among them) are brought up to date as before.
+/// shortcut: a structure streamed in later into a page already taken is
+/// not seen.
+fn keep_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_KEEP").is_some_and(|v| v == "1"))
+}
+
 /// Before a draw whose shader reads title memory by address: what its
 /// root arguments name gets its copies (`addresses`: its root views;
 /// `constants`: its root constants, see the module), every numbered copy
@@ -351,8 +368,15 @@ pub(crate) fn ready(
     const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
+    let keep = keep_windows();
     for (n, shadow) in m.copies.iter().enumerate() {
         let (start, len) = shadow.span();
+        // `VICTORY_BVH_KEEP=1`: a window of title memory outside buffers
+        // (where the structures lie) is taken once, when numbered, and not
+        // brought up to date from title memory again (see `keep_windows`).
+        if keep && shadow.is_window() && n < numbered {
+            continue;
+        }
         if first_read || n >= numbered {
             shadow.refresh(list, start, len);
         }

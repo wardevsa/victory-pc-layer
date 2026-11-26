@@ -2737,6 +2737,11 @@ impl Shadow {
         self.gpu + (address - self.start)
     }
 
+    /// Whether the copy is a window of title memory outside buffers.
+    pub(crate) fn is_window(&self) -> bool {
+        self.window
+    }
+
     /// The title memory the copy is of: its start and length.
     pub(crate) fn span(&self) -> (u64, u64) {
         (self.start, self.len)
