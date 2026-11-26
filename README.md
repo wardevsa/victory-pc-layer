@@ -1,4 +1,4 @@
-﻿# victory-pc-layer
+# victory-pc-layer
 
 A combination of the existing work on running an Xbox Series title natively
 on Windows, tuned to start on more modest PCs (tested on an NVIDIA RTX 2060
