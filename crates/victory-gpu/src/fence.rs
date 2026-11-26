@@ -30,6 +30,8 @@ struct Fence {
     flags: u32,
     /// Events to set once the value reaches theirs (handles as integers).
     waiters: Mutex<Vec<(u64, usize)>>,
+    #[cfg(windows)]
+    monitor: std::sync::OnceLock<victory_core::fence_watch::Signal>,
     /// For [`pace`]: when each wait above was asked for.
     #[cfg(all(windows, feature = "diagnostics"))]
     asked: Mutex<Vec<pace::Asked>>,
@@ -51,6 +53,8 @@ pub(crate) extern "system" fn create(
     let fence = Box::new(Fence {
         object: Object::new(&FUNCTIONS),
         value: AtomicU64::new(initial),
+        #[cfg(windows)]
+        monitor: std::sync::OnceLock::new(),
         flags,
         waiters: Mutex::new(Vec::new()),
         #[cfg(all(windows, feature = "diagnostics"))]
@@ -123,6 +127,10 @@ pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
+    #[cfg(windows)]
+    if let Some(monitor) = fence.monitor.get() {
+        monitor.notify();
+    }
     #[cfg(all(windows, feature = "diagnostics"))]
     pace::reached(this, &fence.asked, value);
     waiters.retain(|&(wanted, event)| {
@@ -146,7 +154,16 @@ extern "system" fn creation_flags(this: This) -> u32 {
 }
 /// Where the value lives (GPU addresses are CPU addresses).
 extern "system" fn gpu_address(this: This) -> u64 {
-    (&raw const fence(this).value) as u64
+    let fence = fence(this);
+    let address = (&raw const fence.value) as usize;
+    #[cfg(windows)]
+    if victory_core::fence_watch::enabled() && fence.monitor.get().is_none() {
+        // Serialize publication with signals so the registry cannot expose a
+        // ticket that the first concurrent signal would miss.
+        let _waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+        fence.monitor.get_or_init(|| victory_core::fence_watch::Signal::register(address));
+    }
+    address as u64
 }
 
 /// How the title paces itself on its fences, measured (diagnostics
@@ -351,6 +368,11 @@ mod tests {
         let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
         assert_eq!(unsafe { *(at as *const u64) }, 5);
+        if victory_core::fence_watch::enabled() {
+            let ticket = victory_core::fence_watch::Ticket::arm(at as usize).unwrap();
+            assert_eq!(signal(f, 6), S_OK);
+            assert!(ticket.wait());
+        }
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);

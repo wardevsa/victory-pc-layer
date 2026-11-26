@@ -489,7 +489,7 @@ fn bench_indirect_draw_barriers() {
                 median(&times[i], 2),
             );
         }
-        for (from, to) in [(0, 1), (2, 3), (3, 4), (2, 4), (1, 5), (4, 6)] {
+        for (from, to) in [(0, 1), (2, 3), (3, 4), (2, 4), (1, 5), (4, 6), (5, 7)] {
             let (a, b) = (median(&times[from], 0), median(&times[to], 0));
             eprintln!(
                 "  {} -> {}: GPU time {:+.1} %",

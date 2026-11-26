@@ -1160,6 +1160,7 @@ mod tests {
 
     use super::*;
 
+
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
         [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
@@ -1171,6 +1172,198 @@ mod tests {
             t[0] = uint3(0, 1, 2);
         }";
     const PS: &str = "float4 main() : SV_Target { return 1; }";
+
+    /// A multi-record mesh signature can carry distinct graphics root
+    /// constants per stage and render the same pixels as separate calls.
+    #[test]
+    fn indirect_mesh_batch_preserves_per_record_root_constants() {
+        let Some(host) = host().filter(|host| host.mesh_shaders()) else {
+            eprintln!("no host mesh shader support; skipped");
+            return;
+        };
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let ms = compile(&dxc, dir.path(), r#"
+            cbuffer Draw : register(b0) { uint side; };
+            struct V { float4 p : SV_Position; };
+            [outputtopology("triangle")] [numthreads(1, 1, 1)]
+            void main(out vertices V v[4], out indices uint3 t[2]) {
+                SetMeshOutputCounts(4, 2);
+                float x = float(side) - 1.0;
+                v[0].p = float4(x, -1, 0, 1);
+                v[1].p = float4(x + 1, -1, 0, 1);
+                v[2].p = float4(x, 1, 0, 1);
+                v[3].p = float4(x + 1, 1, 0, 1);
+                t[0] = uint3(0, 1, 2);
+                t[1] = uint3(2, 1, 3);
+            }"#, "ms_6_5");
+        let ps = compile(&dxc, dir.path(), r#"
+            cbuffer Draw : register(b0) { uint color; };
+            float4 main() : SV_Target {
+                return color == 3 ? float4(1, 0, 0, 1) : float4(0, 1, 0, 1);
+            }"#, "ps_6_5");
+        let params = [D3D12_SHADER_VISIBILITY_MESH, D3D12_SHADER_VISIBILITY_PIXEL].map(|visibility| {
+            D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Constants: D3D12_ROOT_CONSTANTS { Num32BitValues: 1, ..Default::default() },
+                },
+                ShaderVisibility: visibility,
+            }
+        });
+        let (root, root_blob) = root_signature(&host.device, &params, &[], false).unwrap();
+        let mut graphics = GraphicsState::default();
+        graphics.depth.DepthEnable = false.into();
+        graphics.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        graphics.targets.NumRenderTargets = 1;
+        graphics.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let name = super::super::library::name("mesh batching proof", &root_blob, &[&ms, &ps], &graphics.describe());
+        let pso = mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &graphics, false, &name).unwrap();
+
+        let constant = |index| D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                    RootParameterIndex: index,
+                    DestOffsetIn32BitValues: 0,
+                    Num32BitValuesToSet: 1,
+                },
+            },
+        };
+        let arguments = [constant(0), constant(1), D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH,
+            ..Default::default()
+        }];
+        let records = [[0u32, 3, 1, 1, 1], [1, 7, 1, 1, 1]];
+        let stride = size_of_val(&records[0]) as u32;
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: stride,
+            NumArgumentDescs: arguments.len() as u32,
+            pArgumentDescs: arguments.as_ptr(),
+            NodeMask: 0,
+        };
+        let (args, data) = host.upload_buffer(size_of_val(&records) as u64).unwrap();
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: the signature refers to the live descriptors and root;
+        // the mapped upload buffer holds both complete records.
+        unsafe {
+            host.device.CreateCommandSignature(&desc, &root, &mut signature).unwrap();
+            data.cast::<[[u32; 5]; 2]>().write(records);
+        }
+        let signature = signature.unwrap();
+        let single = crate::draw::host_signature(10, 16).unwrap();
+        let dispatches = [[1u32, 1, 1, 0], [0, 0, 0, 0], [1, 1, 1, 0]];
+        let (source_args, dispatch_data) = host.upload_buffer(size_of_val(&dispatches) as u64).unwrap();
+        // SAFETY: the upload allocation holds all three padded dispatch records.
+        unsafe { dispatch_data.cast::<[[u32; 4]; 3]>().write(dispatches) };
+
+        let format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let tex = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 2,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let mut color: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a two-row render target.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE, &tex, D3D12_RESOURCE_STATE_RENDER_TARGET, None, &mut color,
+            ).unwrap();
+        }
+        let color = color.unwrap();
+        let back = host.read_back_buffer(512).unwrap();
+        let render = |batched: bool| {
+            let list = host.new_list().unwrap();
+            let merged = batched.then(|| {
+                let clamped = crate::indirect::bound_ahead(&list, (&source_args, 0), (10, 16, 3)).unwrap();
+                let merged = host.uav_buffer(size_of_val(&records) as u64).unwrap();
+                // SAFETY: the clamp recorded its output transition. Each copy
+                // stays within its buffer; the clamp's tracked state is restored.
+                unsafe {
+                    let l = &list.list;
+                    l.ResourceBarrier(&[
+                        crate::host::transition(&clamped, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                        crate::host::transition(&merged, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
+                    ]);
+                    for (record, source_offset) in [0, 32].into_iter().enumerate() {
+                        let offset = record as u64 * u64::from(stride);
+                        l.CopyBufferRegion(&merged, offset, &args, offset, 8);
+                        l.CopyBufferRegion(&merged, offset + 8, &clamped, source_offset, 12);
+                    }
+                    l.ResourceBarrier(&[
+                        crate::host::transition(&clamped, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+                        crate::host::transition(&merged, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+                    ]);
+                }
+                merged
+            });
+            let rtv = host.rtv(Some(&color), None);
+            let view = D3D12_VIEWPORT { Width: 4.0, Height: 2.0, MaxDepth: 1.0, ..Default::default() };
+            let rect = windows::Win32::Foundation::RECT { left: 0, top: 0, right: 4, bottom: 2 };
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: unsafe { std::mem::transmute_copy(&back) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: format, Width: 4, Height: 2, Depth: 1, RowPitch: 256 },
+                    },
+                },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: unsafe { std::mem::transmute_copy(&color) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            // SAFETY: valid live resources, graphics state and argument ranges.
+            unsafe {
+                let l = &list.list;
+                l.ClearRenderTargetView(rtv, &[0.0; 4], None);
+                l.OMSetRenderTargets(1, Some(&rtv), false, None);
+                l.RSSetViewports(&[view]);
+                l.RSSetScissorRects(&[rect]);
+                l.SetGraphicsRootSignature(&root);
+                l.SetPipelineState(&pso);
+                if let Some(merged) = &merged {
+                    l.ExecuteIndirect(&signature, 2, merged, 0, None, 0);
+                } else {
+                    for (record, offset) in records.iter().zip([0, 32]) {
+                        l.SetGraphicsRoot32BitConstant(0, record[0], 0);
+                        l.SetGraphicsRoot32BitConstant(1, record[1], 0);
+                        l.ExecuteIndirect(&single, 1, &source_args, offset, None, 0);
+                    }
+                }
+                l.ResourceBarrier(&[crate::host::transition(&color, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                l.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                l.ResourceBarrier(&[crate::host::transition(&color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+            }
+            list.close();
+            host.execute(&[&list]);
+            let mut data = std::ptr::null_mut();
+            // SAFETY: execute waits, and the two rows occupy the 512-byte buffer.
+            unsafe {
+                back.Map(0, None, Some(&mut data)).unwrap();
+                let pixels = std::array::from_fn::<_, 8, _>(|i| {
+                    data.cast::<u8>().add((i / 4) * 256 + (i % 4) * 4).cast::<[u8; 4]>().read()
+                });
+                back.Unmap(0, None);
+                pixels
+            }
+        };
+        let separate = render(false);
+        assert_eq!(separate, [[255, 0, 0, 255], [255, 0, 0, 255], [0, 255, 0, 255], [0, 255, 0, 255]].repeat(2).as_slice());
+        assert_eq!(render(true), separate);
+    }
 
     /// The PC `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's).
     fn dxc() -> Option<PathBuf> {

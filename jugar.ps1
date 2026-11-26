@@ -36,6 +36,8 @@
 #                                 interiors readable; 0.3 darker, 1 brighter)
 #         .\jugar.ps1 -Texturas baja -VentanasMB 1536  (ray-tracing copies in
 #                                 the card's memory instead of over the bus)
+#         .\jugar.ps1 -CCS03     (CCS03's own profile for 8 GB cards: Series S,
+#                                 no ray tracing, its stand-in light)
 #         .\jugar.ps1 -SeriesS   (the Series S profile: lower resolution and
 #                                 settings, less memory; its own upscaler)
 #         .\jugar.ps1 -Escala 0.7  (the title renders at 70% of the output
@@ -69,6 +71,7 @@ param(
     [switch]$ConNan,
     [switch]$SeriesS,
     [switch]$SinNuevos,
+    [switch]$CCS03,
     [int]$CopiasRT = 2047,
     [int]$CardMB = 1024,
     [ValidateSet("alta", "media", "baja")]
@@ -324,6 +327,40 @@ if ($Diag) {
 # title is patched to use its own upscaler (VICTORY_OWN_UPSCALER, hooks.rs,
 # as victory-fork pull request #798 does it). Its interface is a second
 # present plane, blended over the picture (pull request #1081, merged here).
+# -CCS03: the profile of JozefDeTremmerie's CCS03 (its ccs03\play.ps1, merged
+# here on 2026-11-26), measured there at 3 to 7.8 fps in the prison and on
+# the water on an RTX 4060 laptop with 8 GB, the prologue played through:
+# the Series S profile, no ray tracing (its stand-in light at 0.9 instead),
+# smaller texture uploads and victory-fork's measured switches. Its notes:
+# the Series X profile needs more than 8 GB.
+if ($CCS03) {
+    $SeriesS = $true
+    $env:VICTORY_RELAY = "2"
+    $env:VICTORY_ASYNC_SUBMIT = "1"
+    $env:VICTORY_QUEUE2 = "1"
+    $env:VICTORY_INDIRECT_WINDOW = "1"
+    $env:VICTORY_COPY_PLAIN = "1"
+    $env:VICTORY_TEXTURE_NO_WAIT = "1"
+    $env:VICTORY_WIDE_TEXTURES = "1"
+    $env:VICTORY_TEXTURE_DROP_MIPS = "1"
+    $env:VICTORY_TEXTURE_ROOM_PERCENT = "86"
+    $env:VICTORY_CARD_ROOM_FOR_TARGETS_MB = "1024"
+    $env:VICTORY_CARD_BUFFERS_MB = "768"
+    $env:VICTORY_AMBIENT = "0.9"
+    $env:VICTORY_JOIN_PARTS = "1"
+    $env:VICTORY_BACK_OWN_VIEW = "1"
+    $env:VICTORY_INDIRECT_GATHER = "1"
+    $env:VICTORY_CARD_REHASH_RUNS = "1"
+    $env:VICTORY_TEXTURE_BACK = "1"
+    $env:VICTORY_CARD_HASH_LEN = "1"
+    $env:VICTORY_TEXTURE_STAGE_MS = "25"
+    $env:VICTORY_TEXTURE_STAGE_MB = "48"
+    $env:VICTORY_TEXTURE_CATCHUP = "0"
+    # Without ray tracing: none of ours for it either.
+    $env:VICTORY_BVH_BUILDER = "0"
+    $env:VICTORY_BVH_QUARANTINE = "0"
+    Remove-Item Env:VICTORY_BVH_KEEP, Env:VICTORY_WINDOW_KB, Env:VICTORY_CARD_BUFFERS_MIN_MB -ErrorAction SilentlyContinue
+}
 $console = if ($SeriesS) { "series-s" } else { "series-x" }
 if ($SeriesS) { $env:VICTORY_OWN_UPSCALER = "1" } else { Remove-Item Env:VICTORY_OWN_UPSCALER -ErrorAction SilentlyContinue }
 & $exe run $Game --execute --console $console 2>&1 | Tee-Object -FilePath $log

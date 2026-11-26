@@ -8,11 +8,19 @@ use std::path::PathBuf;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-/// The folder frames go to, if capturing.
+/// The folder frames go to, if capturing; made (with its parents) the first
+/// time it is asked for. A folder that did not exist yet left every frame
+/// of a run unsaved, one warning each (1,093 of them in one run).
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     FOLDER
-        .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from))
+        .get_or_init(|| {
+            let folder = std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from)?;
+            if let Err(e) = std::fs::create_dir_all(&folder) {
+                tracing::warn!(error = %e, path = %folder.display(), "capture folder not made");
+            }
+            Some(folder)
+        })
         .as_ref()
 }
 

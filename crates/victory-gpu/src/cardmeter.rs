@@ -19,8 +19,9 @@
 //! log's card columns are of the frames of a moment ago: right for the
 //! usual frame, not for placing one long frame.
 //!
-//! On by default in diagnostics builds; `VICTORY_CARD_METER=0` or `1` says
-//! otherwise. Two queries and a resolve a list.
+//! Requires the frame log. When it is on, the meter defaults to on in
+//! diagnostics builds; `VICTORY_CARD_METER=0` or `1` overrides that default.
+//! Two queries and a resolve a list.
 
 use std::sync::Mutex;
 
@@ -108,9 +109,12 @@ static METER: Mutex<Option<Option<Meter>>> = Mutex::new(None);
 /// Whether lists are timed.
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var_os("VICTORY_CARD_METER") {
-        Some(v) => v != "0",
-        None => cfg!(feature = "diagnostics"),
+    *ON.get_or_init(|| {
+        crate::framelog::on()
+            && match std::env::var_os("VICTORY_CARD_METER") {
+                Some(v) => v != "0",
+                None => cfg!(feature = "diagnostics"),
+            }
     })
 }
 

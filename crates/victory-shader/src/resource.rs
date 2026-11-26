@@ -411,7 +411,7 @@ struct Tracer<'a> {
     meets: std::cell::RefCell<Meets>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
-    /// The instruction site of the access being traced ([`Self::live`]).
+    /// The instruction of the access being traced ([`Self::live`]).
     at: std::cell::Cell<Option<Site>>,
 }
 
@@ -1122,9 +1122,9 @@ impl<'a> Tracer<'a> {
             .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
-        // Only the lanes that reach and run the access read the descriptor
-        // (the access's own guard too: after cool_fox, f4b48ad, a lane that
-        // skipped to a join with its EXEC bit clear never reads it).
+        // Only the lanes that reach and run the access read the descriptor:
+        // the lanes a guard leaves out at a join may come by a way that never
+        // set it up.
         let mut known = Vec::new();
         if let Some(l) = self.lanes {
             known.push((l.reach[at.0], true));
@@ -4034,9 +4034,6 @@ pub(crate) mod tests {
         assert_eq!(r.waterfall.reads.len(), 4);
     }
 
-    /// From cool_fox (f4b48ad), which recovered
-    /// `alphaResolve:CS_AlphTransmissionPrefilterMip` with it on a 32-lane
-    /// card (without it transmissive eyes and alpha drew black squares).
     #[test]
     fn a_guarded_access_excludes_dead_lane_edges_at_a_join() {
         // Lanes failing `v_cmp_gt_u32` clear EXEC and take `s_cbranch_execz`
@@ -4047,19 +4044,19 @@ pub(crate) mod tests {
             0xBE84_0300u32, // s_mov_b32 s4, s0
             0xBE85_0380,    // s_mov_b32 s5, 0
             0xF40C_0302,
-            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
-            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
-            0x7E06_0302, // v_mov_b32 v3, v2
-            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
-            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-            0x877E_6A7E, // s_and_b32 exec_lo, exec_lo, vcc_lo
-            0xBF88_0004, // s_cbranch_execz -> join (skips 4 dwords)
-            0xBE88_0380, // s_mov_b32 s8, 0
-            0xBE89_0380, // s_mov_b32 s9, 0
-            0xBE8A_0380, // s_mov_b32 s10, 0
-            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xFA00_0000,    // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00,    // v_cvt_f32_u32 v2, v0
+            0x7E06_0302,    // v_mov_b32 v3, v2
+            0x7D88_0090,    // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBF8C_C07F,    // s_waitcnt lgkmcnt(0)
+            0x877E_6A7E,    // s_and_b32 exec_lo, exec_lo, vcc_lo
+            0xBF88_0004,    // s_cbranch_execz -> join (skips 4 dwords)
+            0xBE88_0380,    // s_mov_b32 s8, 0
+            0xBE89_0380,    // s_mov_b32 s9, 0
+            0xBE8A_0380,    // s_mov_b32 s10, 0
+            0xBE8B_0380,    // s_mov_b32 s11, 0
             0xF09C_0F08,
-            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            0x0043_0C02,    // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
             S_ENDPGM,
         ]
         .iter()

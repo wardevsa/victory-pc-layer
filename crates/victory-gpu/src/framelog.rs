@@ -706,8 +706,8 @@ pub fn frame() {
     let here = HERE.with(|c| c.replace([0; HN]));
     // SAFETY: a plain query.
     let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
-    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    let state = state.get_or_insert_with(|| State {
+    let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let state = guard.get_or_insert_with(|| State {
         first: now,
         last: None,
         number: 0,
@@ -747,6 +747,7 @@ pub fn frame() {
         state.recent.push_back(f.us);
     }
     let usual = median(state.recent.iter().copied());
+    drop(guard);
     for line in lines(&frames, usual, elapsed.as_secs_f64()) {
         tracing::info!("{line}");
     }

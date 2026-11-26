@@ -1,5 +1,10 @@
 # Diagnostic logs
 
+In CCS03 the logs themselves are not kept: they are larger than the
+repository's file limit (`docs/asset-policy.md`). They are in
+[victory-fork's `diagnostics/`](https://github.com/fxceless/victory-fork/tree/main/diagnostics);
+this page describes them.
+
 Logs of short diagnostics runs on the test machine (Windows 11, Intel i7-14700KF, NVIDIA RTX 4070
 12 GB, 32 GB RAM), for people who want to suggest changes from real numbers.
 

@@ -22,12 +22,60 @@ pub struct PreparedImage {
     pub bytes: Vec<u8>,
     /// BLAKE3 of the original bytes: identifies the exact build.
     pub original_hash: blake3::Hash,
+    /// BLAKE3 of the title-code patches applied ([`PreparedImage::patch`]),
+    /// if any: part of the copy's file name, so a patched copy and the
+    /// plain one never stand in for each other.
+    pub patched: Option<blake3::Hash>,
 }
 
 impl PreparedImage {
-    /// File name for the patched copy, unique per original build.
+    /// File name for the patched copy, unique per original build (and per
+    /// set of title-code patches).
     pub fn file_name(&self) -> String {
-        format!("victory-image-{}.dll", &self.original_hash.to_hex()[..16])
+        match &self.patched {
+            None => format!("victory-image-{}.dll", &self.original_hash.to_hex()[..16]),
+            Some(p) => format!(
+                "victory-image-{}-p{}.dll",
+                &self.original_hash.to_hex()[..16],
+                &p.to_hex()[..8]
+            ),
+        }
+    }
+
+    /// Changes title code: each patch is (RVA, the bytes expected there,
+    /// the bytes to write). Every expected run is checked before anything
+    /// is written, so a patch made for another build of the title changes
+    /// nothing and is an error.
+    pub fn patch(&mut self, patches: &[(u32, Vec<u8>, Vec<u8>)]) -> Result<(), PrepareError> {
+        let mut at = Vec::with_capacity(patches.len());
+        for (rva, old, new) in patches {
+            if old.len() != new.len() || new.is_empty() {
+                return Err(PrepareError::Patch(
+                    "a title patch's old and new bytes differ in length",
+                ));
+            }
+            let offset = self
+                .info
+                .rva_to_file_offset(*rva)
+                .ok_or(PrepareError::Patch(
+                    "a title patch's RVA is not file-backed",
+                ))? as usize;
+            if self.bytes.get(offset..offset + old.len()) != Some(old.as_slice()) {
+                return Err(PrepareError::Patch(
+                    "a title patch's expected bytes are not there (another build?)",
+                ));
+            }
+            at.push(offset);
+        }
+        let mut id = blake3::Hasher::new();
+        for ((rva, old, new), offset) in patches.iter().zip(at) {
+            self.bytes[offset..offset + new.len()].copy_from_slice(new);
+            id.update(&rva.to_le_bytes());
+            id.update(old);
+            id.update(new);
+        }
+        self.patched = Some(id.finalize());
+        Ok(())
     }
 }
 
@@ -110,6 +158,7 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         info,
         bytes,
         original_hash: blake3::hash(original),
+        patched: None,
     })
 }
 
@@ -279,5 +328,35 @@ mod tests {
         let a = prepare(&original).unwrap();
         let b = prepare(&original).unwrap();
         assert_eq!(a.file_name(), b.file_name());
+    }
+
+    #[test]
+    fn title_patches_check_before_they_write() {
+        let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let mut prepared = prepare(&original).unwrap();
+        let plain = prepared.file_name();
+        let section = prepared.info.sections[0].clone();
+        let rva = section.rva + 16;
+        let at = prepared.info.rva_to_file_offset(rva).unwrap() as usize;
+        let old = prepared.bytes[at..at + 4].to_vec();
+        let new: Vec<u8> = old.iter().map(|b| !b).collect();
+
+        // Wrong expected bytes (another build): an error, nothing written.
+        let before = prepared.bytes.clone();
+        let wrong = (rva, new.clone(), old.clone());
+        assert!(
+            prepared
+                .patch(&[(rva, old.clone(), new.clone()), wrong])
+                .is_err()
+        );
+        assert_eq!(prepared.bytes, before);
+        assert_eq!(prepared.file_name(), plain);
+        assert!(prepared.patch(&[(rva, old.clone(), vec![0])]).is_err());
+
+        prepared.patch(&[(rva, old.clone(), new.clone())]).unwrap();
+        assert_eq!(&prepared.bytes[at..at + 4], new.as_slice());
+        let patched = prepared.file_name();
+        assert_ne!(patched, plain, "a patched copy has a file name of its own");
+        assert!(patched.starts_with(plain.trim_end_matches(".dll")));
     }
 }

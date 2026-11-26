@@ -1,5 +1,6 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
+//! (host slots 0-3), a PlayStation 4 or 5 pad in the first slot while XInput has
+//! none there ([`dualsense`]); while none is connected, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
@@ -20,6 +21,9 @@ use std::time::{Duration, Instant};
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
+
+#[cfg_attr(not(windows), allow(dead_code))]
+mod dualsense;
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -1130,10 +1134,42 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// A PlayStation 5 pad, looked for once XInput's first slot was
+        /// found empty.
+        sony: Option<super::dualsense::reader::Reader>,
     }
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
+            let pad = self.xinput_pad(slot);
+            if pad.is_some() || slot != 0 {
+                return pad;
+            }
+            self.sony.get_or_insert_with(super::dualsense::reader::Reader::start).pad()
+        }
+
+        fn keys(&mut self) -> Vec<KeyState> {
+            self.host_keys()
+        }
+
+        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+            let speeds = XINPUT_VIBRATION {
+                wLeftMotorSpeed: low,
+                wRightMotorSpeed: high,
+            };
+            // SAFETY: a valid vibration; an empty slot just fails.
+            let failed = unsafe { XInputSetState(slot as u32, &speeds) } != 0;
+            if failed
+                && slot == 0
+                && let Some(sony) = &self.sony
+            {
+                sony.rumble(low, high);
+            }
+        }
+    }
+
+    impl Host {
+        fn xinput_pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1161,7 +1197,7 @@ mod host {
             Some(pad)
         }
 
-        fn keys(&mut self) -> Vec<KeyState> {
+        fn host_keys(&mut self) -> Vec<KeyState> {
             #[cfg(feature = "diagnostics")]
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
@@ -1171,8 +1207,13 @@ mod host {
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
                     .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
+                    // Down now, or pressed since the last look (the low bit): a title that
+                    // asks once a frame at a frame a second still sees a tap between two asks.
                     // SAFETY: plain queries.
-                    .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
+                    .filter(|&vk| {
+                        let state = unsafe { GetAsyncKeyState(i32::from(vk)) };
+                        state < 0 || state & 1 != 0
+                    })
                     .collect();
                 down.extend(held);
             }
@@ -1187,19 +1228,11 @@ mod host {
                 })
                 .collect()
         }
-
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            let speeds = XINPUT_VIBRATION {
-                wLeftMotorSpeed: low,
-                wRightMotorSpeed: high,
-            };
-            // SAFETY: a valid vibration; an empty slot just fails.
-            unsafe { XInputSetState(slot as u32, &speeds) };
-        }
     }
 
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
+    /// 0.2 s (`VICTORY_KEYS_HOLD_MS`: that long instead, for runs at a frame a
+    /// second) that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
@@ -1229,10 +1262,14 @@ mod host {
             });
             (Instant::now(), keys.collect())
         });
+        static HOLD: LazyLock<Duration> = LazyLock::new(|| {
+            let ms = std::env::var("VICTORY_KEYS_HOLD_MS").ok().and_then(|v| v.parse().ok());
+            Duration::from_millis(ms.unwrap_or(200))
+        });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
         keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
+            .filter(|&&(at, _)| (at..at + *HOLD).contains(&now))
             .map(|&(_, vk)| vk)
             .collect()
     }

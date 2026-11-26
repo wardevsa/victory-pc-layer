@@ -11,7 +11,10 @@
 #[cfg(windows)]
 pub mod apu;
 pub mod audio;
+#[cfg(windows)]
+pub mod clock;
 pub mod d3d12x;
+pub mod ffx;
 pub mod display;
 pub mod dsp;
 #[cfg(windows)]
@@ -56,6 +59,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     ];
     #[cfg(windows)]
     all.push(apu::module());
+    #[cfg(windows)]
+    all.push(clock::module());
     #[cfg(windows)]
     all.push(media::module());
     #[cfg(windows)]

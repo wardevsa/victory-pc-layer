@@ -1,7 +1,7 @@
 //! Fingerprint of the translator's own source, for the shader cache key
 //! (`victory-gpu`'s `shader_cache`): a rebuilt executable whose translator did
-//! not change keeps its cached translations. Also lists every `VICTORY_*`
-//! switch the translator reads, whose values join the key at run time.
+//! not change keeps its cached translations. Also lists `VICTORY_*`
+//! settings from the shader sources whose values join the key at run time.
 //! Reads only this crate's `src` folder; writes nothing but cargo directives.
 
 use std::path::{Path, PathBuf};
@@ -53,8 +53,10 @@ fn main() {
             let end = tail
                 .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
                 .unwrap_or(tail.len());
-            if tail[end..].starts_with('"') {
-                switches.insert(tail[..end].to_string());
+            let name = &tail[..end];
+            // The dump destination only controls where the tools write output.
+            if tail[end..].starts_with('"') && name != "VICTORY_EMIT_DUMP" {
+                switches.insert(name.to_string());
             }
             rest = &tail[end..];
         }

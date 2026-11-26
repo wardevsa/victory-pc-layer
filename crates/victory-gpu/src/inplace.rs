@@ -480,8 +480,9 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
         return None;
     }
     // No mapping changes until the bytes are in: the view found below
-    // shows these pages for as long as this is held.
-    let _still = crate::watch::title_memory_reading_now()?;
+    // shows these pages for as long as this is held (the one 64 KiB page
+    // the bytes lie in: CCS03's reads of title memory hold ranges).
+    let _still = crate::watch::title_memory_reading_now(at - at % K64, K64)?;
     let (section, offset, shown, section_bytes) = {
         let v = views();
         let (&base, &(len, section, offset)) = v.views.range(..=at).next_back()?;
@@ -1382,9 +1383,23 @@ mod tests {
             assert!(same(start as *const u8, &got), "the GPU reads the title buffer's bytes");
             rig.store(&placed.buffer, placed.bias + 16, &[0xa5; 64]).unwrap();
             assert!(same((start + 16) as *const u8, &[0xa5; 64]), "the GPU's write is at the title's address");
+            // The rig's lists still name the placed buffer, and the runtime
+            // keeps the memory it was opened from locked until they are let
+            // go: the decommit below failed now and then (on an RTX 4060
+            // Laptop GPU's host, three times in a row on 25 November).
+            drop(rig);
             drop(placed);
             // Half of it decommitted: turned down, the host not asked.
-            assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
+            // (The runtime may let go of the opened memory a moment after
+            // the last reference: asked again for up to a second.)
+            let decommitted = (0..100).any(|_| {
+                let done = mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT) != 0;
+                if !done {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                done
+            });
+            assert!(decommitted, "the middle page could be decommitted");
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }

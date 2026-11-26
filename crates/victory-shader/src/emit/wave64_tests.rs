@@ -132,6 +132,7 @@ fn lowered_on(
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        half_views: lowered.half_views,
     })
 }
 
@@ -648,4 +649,70 @@ fn without_skips_keeps_execz_guard_over_vcc_loop() {
             assert_eq!(got, expected, "{label}: s0 = {below}, lane {lane}");
         }
     }
+}
+
+/// A group-wide prefix over 4 console waves (`coherent::tests::group_prefix`): on a host of
+/// 32-lane waves the loop's `v_readfirstlane` reads the console wave's running sum in each
+/// host wave on its own ([`super::coherent`]). Validated, and run on a GPU that takes waves
+/// of 32: every thread gets the sum of the totals of the console waves before its own.
+#[test]
+fn a_group_prefix_reads_each_console_waves_sum_in_both_halves() {
+    let native = super::coherent::tests::group_prefix(6, 256);
+    lower::take_needs();
+    let lowered = super::coherent::tests::lower32(&native).expect("lower");
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let res = resource::track(&p, &native.layout, native.stage, None).expect("resource::track");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+        half_views: lowered.half_views,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
+            return;
+        }
+    };
+    let base = 1000u32;
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+            ud[u.index as usize] = base;
+        }
+    }
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(256)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    for t in 0..256u32 {
+        let w = t >> 6;
+        let want: u32 = (0..w).map(|j| base + 16 * j).sum();
+        assert_eq!(out[0][t as usize], want, "thread {t} (console wave {w})");
+    }
+    eprintln!("ran on the hardware device: every thread has the sum of the console waves before its own");
 }

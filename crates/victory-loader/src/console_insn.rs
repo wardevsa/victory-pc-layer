@@ -11,6 +11,7 @@ mod decode;
 use decode::ConsoleOnly;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use victory_core::fence_watch::{self, Ticket};
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 
 const CONTINUE_EXECUTION: i32 = -1;
@@ -173,6 +174,10 @@ fn line() {
         w[6] / seconds,
         w[7] / seconds / 1e3,
     );
+}
+
+thread_local! {
+    static FENCE_TICKET: Cell<Option<Ticket>> = const { Cell::new(None) };
 }
 
 fn readable(va: usize, bytes: usize) -> bool {
@@ -368,11 +373,18 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         ConsoleOnly::Monitorx => {
             KINDS[K_MONITORX].fetch_add(1, Relaxed);
             MONITOR.with(|m| m.set((ctx.Rax as usize, ctx.Rsi)));
+            if fence_watch::enabled() {
+                FENCE_TICKET.with(|slot| slot.set(Ticket::arm(ctx.Rax as usize)));
+            }
         }
         ConsoleOnly::Mwaitx => {
             KINDS[K_MWAITX].fetch_add(1, Relaxed);
             wait_step();
-            std::hint::spin_loop()
+            if let Some(ticket) = FENCE_TICKET.with(Cell::take) {
+                ticket.wait();
+            } else {
+                std::hint::spin_loop();
+            }
         }
         ConsoleOnly::Clzero | ConsoleOnly::ClzeroStep { .. } => {
             // The loop `mov rax, ptr; add ptr, 0x40; clzero; cmp ptr, end; jb` (the title's
@@ -499,6 +511,64 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "measures the emulation loop with a synthetic fence producer"]
+    fn bench_emulated_fence_wait() {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        use std::time::{Duration, Instant};
+
+        const SIGNALS: u64 = 64;
+        let completed = AtomicU64::new(0);
+        let address = completed.as_ptr() as usize;
+        let signal = fence_watch::Signal::register(address);
+        let mut code = [0x90_u8; 24];
+        code[..6].copy_from_slice(&[0x0f, 0x01, 0xfa, 0x0f, 0x01, 0xfb]);
+        let base = code.as_ptr() as u64;
+        // SAFETY: a plain context. The handler only reads the code above.
+        let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+        ctx.Rax = address as u64;
+        let (ready, start) = std::sync::mpsc::sync_channel(0);
+        let began = Instant::now();
+        let mut pairs = 0;
+        std::thread::scope(|scope| {
+            let completed = &completed;
+            let signal = &signal;
+            scope.spawn(move || {
+                start.recv().unwrap();
+                for value in 1..=SIGNALS {
+                    std::thread::sleep(Duration::from_millis(3));
+                    completed.store(value, Release);
+                    signal.notify();
+                }
+            });
+            ready.send(()).unwrap();
+            for next in 1..=SIGNALS {
+                ctx.Rsi = next;
+                while completed.load(Acquire) < next {
+                    ctx.Rip = base;
+                    // SAFETY: the context points at the synthetic instructions.
+                    assert_eq!(unsafe { emulate(&mut ctx) }, CONTINUE_EXECUTION);
+                    assert_eq!(ctx.Rip, base + 3);
+                    if completed.load(Acquire) >= next {
+                        break;
+                    }
+                    // SAFETY: the context points at the second instruction.
+                    assert_eq!(unsafe { emulate(&mut ctx) }, CONTINUE_EXECUTION);
+                    assert_eq!(ctx.Rip, base + 6);
+                    pairs += 1;
+                }
+            }
+        });
+        // A final monitor can be armed as the producer signals, then skipped.
+        FENCE_TICKET.with(Cell::take);
+        eprintln!(
+            "fence wait enabled={}: {pairs} emulated pairs for {SIGNALS} signals in {:.1} ms",
+            fence_watch::enabled(),
+            began.elapsed().as_secs_f64() * 1_000.0
+        );
+        assert_eq!(completed.load(Acquire), SIGNALS);
+    }
 
     /// What the title's loop leaves, run line by line as the processor would: the lines it
     /// zeroed and the registers (rax, ptr) at the end, from the state at its first `clzero`.

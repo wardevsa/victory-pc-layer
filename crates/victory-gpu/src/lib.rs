@@ -31,6 +31,12 @@ mod copystat;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
+mod reflect;
+#[cfg(windows)]
+mod watchprog;
+#[cfg(windows)]
 mod drvwatch;
 #[cfg(windows)]
 mod fpsbox;
@@ -48,19 +54,17 @@ mod heap_pass;
 #[cfg(windows)]
 pub mod framelog;
 #[cfg(windows)]
-mod compose;
-#[cfg(windows)]
 mod heap_worker;
 #[cfg(windows)]
 mod host;
-#[cfg(windows)]
-mod ambient;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
 mod upload;
 #[cfg(windows)]
 mod pixels;
+#[cfg(windows)]
+mod over;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
@@ -91,6 +95,8 @@ mod shadow;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
+#[cfg(windows)]
+mod texheap;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]

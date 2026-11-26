@@ -302,6 +302,70 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     out
 }
 
+/// One element in a `PSV0` signature table (`inputs`, `outputs`, or `prims`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PsvSigElem {
+    pub row: Option<u32>,
+    pub col: u8,
+    pub cols: u8,
+    pub kind: u8,
+    pub interp: u8,
+}
+
+/// Parses input, output, and per-primitive signature elements from a `PSV0` part.
+pub(crate) fn psv_signature(
+    part: &[u8],
+) -> Option<(Vec<PsvSigElem>, Vec<PsvSigElem>, Vec<PsvSigElem>)> {
+    use crate::dxbc::u32_at;
+    let info_sz = u32_at(part, 0).ok()? as usize;
+    if info_sz < 36 {
+        return None;
+    }
+    let info = part.get(4..4 + info_sz)?;
+    let (in_n, out_n, prim_n) = (
+        usize::from(info[28]),
+        usize::from(info[29]),
+        usize::from(info[30]),
+    );
+    let mut pos = 4 + info_sz;
+    let res_n = u32_at(part, pos).ok()? as usize;
+    pos += 4;
+    if res_n > 0 {
+        let res_sz = u32_at(part, pos).ok()? as usize;
+        pos = pos.checked_add(4 + res_n.checked_mul(res_sz)?)?;
+    }
+    let str_sz = u32_at(part, pos).ok()? as usize;
+    pos = pos.checked_add(4 + str_sz)?;
+    let idx_n = u32_at(part, pos).ok()? as usize;
+    pos = pos.checked_add(4 + idx_n.checked_mul(4)?)?;
+    let total = in_n + out_n + prim_n;
+    if total == 0 {
+        return Some((Vec::new(), Vec::new(), Vec::new()));
+    }
+    let elem_sz = u32_at(part, pos).ok()? as usize;
+    if elem_sz < 16 {
+        return None;
+    }
+    pos += 4;
+    let mut read_list = |n: usize| -> Option<Vec<PsvSigElem>> {
+        let mut list = Vec::with_capacity(n);
+        for _ in 0..n {
+            let e = part.get(pos..pos + elem_sz)?;
+            pos += elem_sz;
+            let allocated = e[10] & 0x40 != 0;
+            list.push(PsvSigElem {
+                row: allocated.then_some(u32::from(e[9])),
+                col: (e[10] >> 4) & 3,
+                cols: e[10] & 0xF,
+                kind: e[11],
+                interp: e[13],
+            });
+        }
+        Some(list)
+    };
+    Some((read_list(in_n)?, read_list(out_n)?, read_list(prim_n)?))
+}
+
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
@@ -415,5 +479,90 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn psv_signature_round_trips_allocation_and_interp() {
+        let inputs = [SigElement {
+            name: "SV_VertexID".into(),
+            index: 0,
+            kind: 1,
+            comp: 5,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 1,
+            usage: 1,
+            half: false,
+        }];
+        let outputs = [
+            SigElement {
+                name: "SV_Position".into(),
+                index: 0,
+                kind: 3,
+                comp: 9,
+                interp: 4,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            },
+            SigElement {
+                name: "TEXCOORD".into(),
+                index: 2,
+                kind: 0,
+                comp: 9,
+                interp: 1,
+                row: Some(1),
+                col: 1,
+                cols: 2,
+                usage: 3,
+                half: false,
+            },
+        ];
+        let bytes = psv(&Psv {
+            stage: 1,
+            flag: true,
+            inputs: &inputs,
+            outputs: &outputs,
+            prims: &[],
+            mesh: None,
+            geometry: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+        });
+        let (ins, outs, prims) = psv_signature(&bytes).unwrap();
+        assert_eq!(
+            ins,
+            vec![PsvSigElem {
+                row: Some(0),
+                col: 0,
+                cols: 1,
+                kind: 1,
+                interp: 0,
+            }]
+        );
+        assert_eq!(
+            outs,
+            vec![
+                PsvSigElem {
+                    row: Some(0),
+                    col: 0,
+                    cols: 4,
+                    kind: 3,
+                    interp: 4,
+                },
+                PsvSigElem {
+                    row: Some(1),
+                    col: 1,
+                    cols: 2,
+                    kind: 0,
+                    interp: 1,
+                },
+            ]
+        );
+        assert!(prims.is_empty());
     }
 }
