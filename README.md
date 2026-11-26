@@ -51,6 +51,7 @@ NVIDIA RTX 2060 SUPER 8 GB, AMD Ryzen 5 5600GT, 32 GB RAM, Windows 11.
 | the same with `Play-VIctory.cmd`'s switch set (now `-Rapido`) | about 2 fps | the card 250-380 ms a frame |
 | cool_fox `64b8967`, shaders prepared ahead (`-Preparar`), defaults, at the boat | 3.2 fps median, 4-5 seen | preparing 142 ms, the card 136, copying back 51 (medians); the CPU compared 228 MB a frame; a crash in the title's script after the package lands in the water (fxceless/victory-fork issue 1209, every build) |
 | the same with title buffers from 1 MiB compared on the card, hash passes and copies joined (`88cbf04`) | 6.3 fps median, 5-8 seen | preparing 98 ms, the card 58, copying back 60 (medians); the CPU compares 37 MB a frame instead of 265 |
+| the same with the card kept awake and 6-core pools (`0abc767`) | 5.5-6.3 fps | the submitting thread waits 93-104 ms a frame for the card in about 5 settles, all for small fills of upload memory: next, `VICTORY_FILL_TITLE=1` |
 | the earlier tree (`base-victory-fork`), Series X with ray tracing | 1.6-2 fps | traced light in the cell, textures noisy |
 
 ## Credits
