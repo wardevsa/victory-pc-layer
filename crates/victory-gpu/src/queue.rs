@@ -139,6 +139,10 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     if this.is_null() || planes == 0 || PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
         return false;
     }
+    // Two planes are blended (`crate::compose`) by the present in line.
+    if planes > 1 && crate::compose::on() {
+        return false;
+    }
     let frame = FRAMES.load(Ordering::Relaxed) + 1;
     // A frame that is saved or listed is read back at once.
     #[cfg(feature = "diagnostics")]
@@ -894,7 +898,7 @@ fn release_held_now(all: bool) {
                     Held::Present(texture, state, frame) => {
                         let show = || {
                             if let Some(host) = crate::host::host() {
-                                let _ = host.present(&texture, state, frame);
+                                let _ = host.present(&texture, state, None, frame);
                             }
                         };
                         if all {
@@ -1115,12 +1119,17 @@ fn execute_now(this: This, count: u32, lists: *const This) {
 }
 
 /// The start of a present plane: frame token, then the plane's resources.
+/// The title passes an array of them, `PLANE_STRIDE` bytes apart (then the
+/// source and placement rectangles, color space, flags and more).
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
 }
+/// Bytes from one present plane's description to the next (as the Series
+/// S profile's two planes lie).
+const PLANE_STRIDE: usize = 72;
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -1402,10 +1411,34 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
+        const PIXEL_SHADER_RESOURCE: u32 = 0x80;
+        // The second plane (the interface, with the Series S profile),
+        // blended over the first (`crate::compose`).
+        let interface = (planes > 1 && crate::compose::on())
+            // SAFETY: the title passes `planes` descriptions of PLANE_STRIDE bytes.
+            .then(|| unsafe { plane_parameters.cast::<u8>().add(PLANE_STRIDE).cast::<Plane>().as_ref() })
+            .flatten()
+            .filter(|p| p.count > 0 && !p.resources.is_null())
+            // SAFETY: the plane lists `count` resources.
+            .map(|p| unsafe { *p.resources })
+            .filter(|&r| r != resource)
+            .and_then(|r| crate::resource::host_resource(r).map(|t| (r, t)));
+        let interface_state = interface.map(|(r, _)| {
+            crate::resource::host_transition(r, PIXEL_SHADER_RESOURCE)
+                .map_or(PIXEL_SHADER_RESOURCE, |(_, before)| before)
+        });
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        let shown = host.present(
+            texture,
+            state,
+            interface.zip(interface_state).map(|((_, t), s)| (t, s)),
+            frame,
+        );
         crate::resource::host_transition(resource, state);
+        if let Some(((r, _), s)) = interface.zip(interface_state) {
+            crate::resource::host_transition(r, s);
+        }
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
