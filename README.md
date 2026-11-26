@@ -80,6 +80,19 @@ This tree follows victory-fork's `main` (merged up to `a183ea2`,
     and buffer copies sized as soldsawn's
     [victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb) sizes
     them for an 8 GB card.
+- **The structures' pages left to the card** (`VICTORY_BVH_KEEP=1`, on in
+  `jugar.ps1`; `-RTRefrescar` turns it off): a copy of a window of title
+  memory outside buffers, where the ray-tracing structures lie, is taken
+  once and not brought up from title memory again. Every list that read
+  memory by address used to bring each copy's written pages up again,
+  whole, over what the builder had just built there, so rays found nothing
+  and interiors stayed black (and about 500 MB a frame went up). With it,
+  windows of 256 KiB (`VICTORY_WINDOW_KB`) and up to 16,383 copies: on the
+  4 MiB grid all 2,047 copies were taken and 40 to 150 pages a frame that
+  rays walked had none. After VIctory-7900XTX, whose arenas keep the
+  structures' pages on the card. **With these the cell and the corridors
+  got their ray-traced light for the first time on this NVIDIA card
+  (2026-11-26).**
 - **List upload memory where shaders reach it by address** (`upload.rs`,
   from avatarmanz's VIctory-7900XTX, commit `b558934`; upstream VIctory
   places it likewise in `0f63757`): the memory the title's lists hand out
@@ -189,7 +202,8 @@ NVIDIA RTX 2060 SUPER 8 GB, AMD Ryzen 5 5600GT, 32 GB RAM, Windows 11.
 | `jugar.ps1` with wave-wide, the structure builder (quarantined) and the DirectStorage fix (2026-11-24, evening) | 2-3 fps | 310-420 ms | every cutscene loads; no crash through the cell and window scenes; 2-5 draws a frame dropped; interiors and shaded sides still dark: the ray-traced light does not arrive yet |
 | this tree, with victory-fork `9c184b3` and the `DispatchX` fix (2026-11-25) | | | `jugar.ps1`: no crash, but the picture poor and dark |
 | the same, `-RTCompleto` (the builder's results copied back) | about 0.1 fps | | **the first ray-traced light seen**: a lit window, warm reflections, the yard in detail; still dark overall and far too slow to play |
-| this tree, with victory-fork `32b31f7`, Thin LTO, the overlay and `VICTORY_BVH_QUARANTINE=2` | not measured yet | | to be tested: `jugar.ps1`, then `-Mejor` |
+| this tree with `VICTORY_BVH_QUARANTINE=2` and list upload memory below 2^40 (2026-11-26) | 1-2 fps | 480-1490 ms | every cutscene plays, no crash; the yard sunlit and detailed; interiors black; copies 550-860 ms a frame (500 MB) |
+| the same with the structures' pages left to the card and 256 KiB windows (2026-11-26) | 1.6-2.1 fps | 480-620 ms | **ray-traced light in the cell and corridors**: walls, floor, bunks, light bounced off the floor; copies about 110 ms a frame; the card about 310 ms; RAM nearly full (30.6 of 31 GB) |
 
 What a player sees there: the opening cutscene, credits and title cards, and
 the first playable scene with the player character under control.

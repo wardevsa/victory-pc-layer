@@ -21,8 +21,8 @@
 #         .\jugar.ps1 -RTCompleto  (the builder's results copied back into
 #                                 title memory, no quarantine: a test now that
 #                                 its dispatches stay inside their arrays)
-#         .\jugar.ps1 -RTGuardar  (the structures' pages are left to the card
-#                                 once taken: a test for the interiors' light)
+#         .\jugar.ps1 -RTRefrescar  (the structures' pages brought up from
+#                                 title memory again every list: interiors black)
 #         .\jugar.ps1 -RTEncierro  (none of the builder's results copied
 #                                 back: the old default, dark)
 #         .\jugar.ps1 -Rapido    (victory-fork's newer speed switches: faster
@@ -49,7 +49,7 @@ param(
     [switch]$SinRT,
     [switch]$RTCompleto,
     [switch]$RTEncierro,
-    [switch]$RTGuardar,
+    [switch]$RTRefrescar,
     [switch]$Rapido,
     [switch]$Mejor,
     [string]$Luz = "",
@@ -186,17 +186,19 @@ $env:VICTORY_BVH_QUARANTINE = if ($SinRT -or $RTCompleto) { "0" } elseif ($RTEnc
 # PC's RAM; the log's "touched pages that had no copy" lines say how many
 # still find no number (no_number) and how many MB the copies hold.
 $env:VICTORY_MEMORY_COPIES = "$CopiasRT"
-# -RTGuardar: the copies of title memory outside buffers (where the
+# By default (-RTRefrescar turns it off): the copies of title memory outside buffers (where the
 # structures lie) are taken once and then left to the card, so title memory
 # no longer goes over what the builder built there (VICTORY_BVH_KEEP=1, see
-# memory.rs keep_windows). A test: whether the interiors get the light.
-if ($RTGuardar) { $env:VICTORY_BVH_KEEP = "1" } else { Remove-Item Env:VICTORY_BVH_KEEP -ErrorAction SilentlyContinue }
+# memory.rs keep_windows). With it the cell and the corridors got their
+# ray-traced light for the first time (2026-11-26).
+$keep = -not ($RTRefrescar -or $SinRT)
+if ($keep) { $env:VICTORY_BVH_KEEP = "1" } else { Remove-Item Env:VICTORY_BVH_KEEP -ErrorAction SilentlyContinue }
 # With it, windows of 256 KiB instead of 4 MiB and up to 16,383 copies: on
 # the 4 MiB grid all 2,047 copies (8.4 GB of RAM) were taken and 40 to 150
 # pages a frame that rays walked had none, read as zeros (2026-11-26). The
 # finer grid holds 16 times the pages in the same memory (16,383 copies at
 # most 4 GB); VIctory-7900XTX keeps the structures in 64 KiB pages.
-if ($RTGuardar) {
+if ($keep) {
     $env:VICTORY_WINDOW_KB = "256"
     if (-not $PSBoundParameters.ContainsKey('CopiasRT')) { $env:VICTORY_MEMORY_COPIES = "16383" }
 } else {
