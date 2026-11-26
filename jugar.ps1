@@ -248,11 +248,19 @@ if ($Diag) {
     # for it (with it on, a run of 9 minutes logged no command, 2026-11-26).
     if ($Tiempos) {
         $env:VICTORY_GPU_TIMING = "1"
+        # Commands are noted (and timed) only with the full device-removed
+        # data, as victory-fork's timing runs have it; it also says which
+        # command the card or the driver was in if the run dies (a run with
+        # the timing alone logged no command and ended in the driver).
+        $env:VICTORY_D3D12_DRED = "1"
         # Unset, the relay is on (shadow.rs `relay`).
         $env:VICTORY_RELAY = "0"
         Remove-Item Env:VICTORY_LATE_WAIT -ErrorAction SilentlyContinue
     } else {
         Remove-Item Env:VICTORY_GPU_TIMING -ErrorAction SilentlyContinue
+        # Breadcrumbs and the faulting address, cheap (`light`): where a lost
+        # card or a driver crash stopped.
+        $env:VICTORY_D3D12_DRED = "light"
     }
 }
 & $exe run $Game --execute 2>&1 | Tee-Object -FilePath $log
