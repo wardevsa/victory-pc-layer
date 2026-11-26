@@ -21,6 +21,8 @@
 #         .\jugar.ps1 -RTCompleto  (the builder's results copied back into
 #                                 title memory, no quarantine: a test now that
 #                                 its dispatches stay inside their arrays)
+#         .\jugar.ps1 -RTEncierro  (none of the builder's results copied
+#                                 back: the old default, dark)
 #         .\jugar.ps1 -Rapido    (victory-fork's newer speed switches: faster
 #                                 on its PC, flickered on this one)
 #         .\jugar.ps1 -Mejor     (victory-fork's best set, run 279: 9-12 fps
@@ -42,6 +44,7 @@ param(
     [switch]$SinWide,
     [switch]$SinRT,
     [switch]$RTCompleto,
+    [switch]$RTEncierro,
     [switch]$Rapido,
     [switch]$Mejor,
     [int]$CopiasRT = 2047,
@@ -163,7 +166,14 @@ $env:VICTORY_WAVE_WIDE = if ($SinWide) { "0" } else { "1" }
 # quarantine), so the title also gets the sizes and counters it reads.
 # -SinRT turns the builder off (if the title crashes with it).
 $env:VICTORY_BVH_BUILDER = if ($SinRT) { "0" } else { "1" }
-$env:VICTORY_BVH_QUARANTINE = if ($SinRT -or $RTCompleto) { "0" } else { "1" }
+# By default only the stores through title memory by address (the
+# structures themselves) stay in the host's copies; what the builder writes
+# into the title buffers it was given (sizes, counters) comes back
+# (VICTORY_BVH_QUARANTINE=2, after VIctory-7900XTX, where rooms get their
+# indirect light that way at about a third less frame rate). Everything kept
+# out (=1, -RTEncierro) left the picture dark; everything back (-RTCompleto)
+# showed the light at 0.1 fps.
+$env:VICTORY_BVH_QUARANTINE = if ($SinRT -or $RTCompleto) { "0" } elseif ($RTEncierro) { "1" } else { "2" }
 # Copies of title memory the ray-tracing programs reach by address (4 MiB
 # windows mostly): 1023 ran out within a second of the builder starting and
 # left about 40 pages a frame reading zeros. 2047 hold up to 8 GB of this

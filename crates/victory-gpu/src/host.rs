@@ -8147,6 +8147,7 @@ impl Meter {
                 }
             }
         }
+        crate::overlay::set_frame(fps, ms, draws);
         if self.caption.is_none() {
             // The window's own text, read without a message.
             let mut buffer = vec![0u16; 512];
@@ -8354,6 +8355,7 @@ impl Host {
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             self.log_video_memory("right after the swap chain is made");
+            crate::overlay::start(hwnd, self.adapter.clone());
             Ok(Presenter {
                 swap_chain,
                 width,

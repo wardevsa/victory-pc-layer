@@ -53,8 +53,16 @@ This tree follows victory-fork's `main` (merged up to `32b31f7`,
   - **the ray-tracing structure builder** (`VICTORY_BVH_BUILDER=1`,
     `-SinRT`): all 52 programs of `XboxBvhBuilder.dll` translate, pass the
     DXIL validator and are made on a 32-lane card. Its stores are kept out of
-    title memory by default (`VICTORY_BVH_QUARANTINE=1`, covering every shader
-    that reads title memory by address); `-RTCompleto` copies them back.
+    title memory by default, but only those through title memory by address
+    (the structures themselves): what the builder writes into the title
+    buffers it was given as root views (sizes, counters) comes back
+    (`VICTORY_BVH_QUARANTINE=2`, after avatarmanz's
+    [VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX), whose
+    builder keeps its stores on the card and lets only the small title
+    buffers it was given come back; there rooms get their indirect light at
+    about a third less frame rate). `-RTEncierro` keeps everything out
+    (`=1`, which left the picture dark); `-RTCompleto` copies everything back
+    (the light showed, at 0.1 fps).
     `-CopiasRT` sets how many copies of title memory those programs reach
     (`VICTORY_MEMORY_COPIES`, 2047; 1023 ran out).
   - `-Rapido`: victory-fork's newer speed switches (draw windows, plain
@@ -70,8 +78,17 @@ This tree follows victory-fork's `main` (merged up to `32b31f7`,
     and buffer copies sized as soldsawn's
     [victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb) sizes
     them for an 8 GB card.
-- Thin LTO in the release build (after victory-nvidia-8gb, victory-fork pull
-  request #1117).
+- From soldsawn's [victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb):
+  - the performance overlay (`overlay.rs`, `pixels.rs`): fps, frame time,
+    30-second high, low and average, draws, CPU, GPU, RAM and video memory
+    in a corner of the window; **F10** shows and hides it,
+    `VICTORY_OVERLAY=0` turns it off. Adapted there from zm0kie's
+    [Neptune_VI](https://github.com/zm0kiemedia/Neptune_VI) overlay (by
+    Traffic and zm0kie);
+  - textures with fewer than five levels (splash screens, interface
+    pictures) keep all of them under `-Texturas media|baja`, so they stay
+    sharp (its commit `830ca05`);
+  - Thin LTO in the release build (victory-fork pull request #1117).
 - **`DispatchX` by thread counts** (after realblastex's
   [Flamingo](https://github.com/realblastex/flamingo), commit `f7ffbce`, and
   victory-fork pull request #814): the structure builder dispatches with
@@ -131,9 +148,14 @@ cards and did not render on this NVIDIA one;
 [realblastex/flamingo](https://github.com/realblastex/flamingo) ran at 2-4
 fps here (Flamingo: no shader untranslated or refused, the card about 230 ms
 a frame busy); upstream [VIctory](https://github.com/Marvisak/VIctory)'s
-latest and [soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb)
+latest is untried here;
+[soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb)
 (victory-fork plus about 40 community pull requests, 8-10 fps on an RTX 4060
-Laptop 8 GB) are being tried. `docs/other-projects.md` has more.
+Laptop 8 GB) drew its picture in a quarter of the window with its own
+resolution cap, and at 1-3 fps with flicker on the loading screen with ours
+on its first run. [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)
+(13-22 fps and ray-traced indirect light on an RX 7900 XTX) asks for 64 GB of
+RAM. `docs/other-projects.md` has more.
 
 ## Results on the test PC
 
@@ -148,7 +170,7 @@ NVIDIA RTX 2060 SUPER 8 GB, AMD Ryzen 5 5600GT, 32 GB RAM, Windows 11.
 | `jugar.ps1` with wave-wide, the structure builder (quarantined) and the DirectStorage fix (2026-11-24, evening) | 2-3 fps | 310-420 ms | every cutscene loads; no crash through the cell and window scenes; 2-5 draws a frame dropped; interiors and shaded sides still dark: the ray-traced light does not arrive yet |
 | this tree, with victory-fork `9c184b3` and the `DispatchX` fix (2026-11-25) | | | `jugar.ps1`: no crash, but the picture poor and dark |
 | the same, `-RTCompleto` (the builder's results copied back) | about 0.1 fps | | **the first ray-traced light seen**: a lit window, warm reflections, the yard in detail; still dark overall and far too slow to play |
-| this tree, with victory-fork `32b31f7` and Thin LTO, `-Mejor` | not measured yet | | to be tested |
+| this tree, with victory-fork `32b31f7`, Thin LTO, the overlay and `VICTORY_BVH_QUARANTINE=2` | not measured yet | | to be tested: `jugar.ps1`, then `-Mejor` |
 
 What a player sees there: the opening cutscene, credits and title cards, and
 the first playable scene with the player character under control.

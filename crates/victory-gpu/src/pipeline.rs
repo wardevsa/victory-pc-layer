@@ -269,9 +269,17 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 /// shortcut: not a way to run: the title also reads results back (sizes,
 /// counters) and gets none, and a copy's pages are overwritten from title
 /// memory when the title writes them.
+///
+/// `VICTORY_BVH_QUARANTINE=2` keeps only what shaders store through title
+/// memory by address (the structures' arenas) in the host's copies; what
+/// the builder stores through the title buffers it was given as root views
+/// (sizes, counters, the title's own small buffers) is copied back. After
+/// avatarmanz's VIctory-7900XTX, where the builder's stores stay on the card
+/// and only the small title buffers it was given come back, and rooms get
+/// their indirect light for about a third of the frame rate.
 #[cfg(windows)]
 pub(crate) fn builder_quarantined(this: This) -> bool {
-    is_builder(this) && quarantine()
+    is_builder(this) && quarantine_level() == 1
 }
 
 /// `VICTORY_BVH_QUARANTINE=1` also keeps in the host's copies what any
@@ -283,13 +291,26 @@ pub(crate) fn builder_quarantined(this: This) -> bool {
 /// `0x7f800000_7f800000`, in its pointers).
 #[cfg(windows)]
 pub(crate) fn memory_quarantined() -> bool {
-    quarantine()
+    quarantine_level() >= 1
 }
 
+/// Whether a quarantined shader's stores through root views stay in the
+/// host's copies too (`VICTORY_BVH_QUARANTINE=1`; with `=2` they come back).
 #[cfg(windows)]
-fn quarantine() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+pub(crate) fn root_views_quarantined() -> bool {
+    quarantine_level() == 1
+}
+
+/// `VICTORY_BVH_QUARANTINE`: 0 off, 1 everything, 2 title memory by
+/// address only.
+#[cfg(windows)]
+fn quarantine_level() -> u8 {
+    static LEVEL: OnceLock<u8> = OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("VICTORY_BVH_QUARANTINE").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
 }
 
 #[cfg(windows)]

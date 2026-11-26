@@ -1214,12 +1214,15 @@ impl State {
             // Quarantined, nothing a shader that walks title memory by
             // address stores (through it or its root views) is copied back
             // either (`pipeline::memory_quarantined`).
-            let writes = (t.stores || !write_skip())
-                && !crate::pipeline::builder_quarantined(self.pipeline as This)
-                && !(by_address && crate::pipeline::memory_quarantined());
+            // With `VICTORY_BVH_QUARANTINE=2` only the stores through title
+            // memory by address stay; those through root views come back.
+            let stored = (t.stores || !write_skip())
+                && !crate::pipeline::builder_quarantined(self.pipeline as This);
+            let memory_writes = stored && !(by_address && crate::pipeline::memory_quarantined());
+            let writes = if crate::pipeline::root_views_quarantined() { memory_writes } else { stored };
             // Title memory by address: what the shader finds it by.
             let memory = if by_address {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let Some(ready) = self.memory_ready(list, compute, memory_writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };

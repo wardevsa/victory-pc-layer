@@ -1311,6 +1311,10 @@ fn mips_to_drop(desc: &ResourceDesc) -> u16 {
         && desc.dimension == TEXTURE2D
         && desc.sample_count <= 1
         && desc.mip_levels > drop
+        // Textures with few levels (splash screens, interface pictures)
+        // keep them all: they stay sharp (after soldsawn's
+        // victory-nvidia-8gb, commit 830ca05).
+        && desc.mip_levels >= 5
         && desc.width >= 256
         && desc.height >= 256
         && w.is_multiple_of(4)
