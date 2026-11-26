@@ -18,13 +18,14 @@ developer or publisher.
 cargo build --release -p victory
 $env:VICTORY_GAME_DIR = '<folder of your dump>'
 powershell -ExecutionPolicy Bypass -File .\jugar.ps1                 # Series S, cool_fox's defaults
-powershell -ExecutionPolicy Bypass -File .\jugar.ps1 -Pelo           # hair strands drawn (slower)
+powershell -ExecutionPolicy Bypass -File .\jugar.ps1 -SinPelo        # hair strands skipped (faster)
 powershell -ExecutionPolicy Bypass -File .\jugar.ps1 -Salida 1664x936  # less for the card
 powershell -ExecutionPolicy Bypass -File .\jugar.ps1 -Rapido         # Play-VIctory.cmd's switch set
 ```
 
 `jugar.ps1` runs cool_fox with its own defaults, which were the fastest on
-the test PC. The log goes to `run-<console>.log`.
+the test PC, and keeps the picture as `3277b15` drew it (hair strands
+drawn, no stand-in light): the work here is frame rate, not the picture. The log goes to `run-<console>.log`.
 
 Through the AmericasLauncher (isaac-btw), turn its **Pipeline** button off
 for this runner: with it on, every launch first runs `victory translate

@@ -2,11 +2,11 @@
 # cool_fox's own defaults: on the RTX 2060 SUPER test PC they ran at 3.2-4 fps
 # on Series S, 5 at the boat, up to 8 in cutscenes, while the switch set of
 # cool_fox's Play-VIctory.cmd (-Rapido) ran at about 2 fps (the card 250-380
-# ms a frame against about 150). Since cool_fox 64b8967 its hair-strand
-# passes are skipped unless VICTORY_HAIR is set (-Pelo).
+# ms a frame against about 150). The picture stays as 3277b15 drew it: hair
+# strands drawn, no stand-in light.
 #
-# Usage:  .\jugar.ps1                 (Series S, cool_fox's defaults)
-#         .\jugar.ps1 -Pelo           (hair strands drawn: the full hair, slower)
+# Usage:  .\jugar.ps1                 (Series S, cool_fox's defaults, the full hair)
+#         .\jugar.ps1 -SinPelo        (hair strands skipped: faster, simpler hair)
 #         .\jugar.ps1 -Rapido         (the switch set of Play-VIctory.cmd)
 #         .\jugar.ps1 -Salida 1664x936  (a smaller output: less work for the
 #                                      card; 1280x720, 1664x936, 1920x1080)
@@ -24,7 +24,7 @@ param(
     [ValidateSet("", "1280x720", "1664x936", "1920x1080", "2560x1440")]
     [string]$Salida = "",
     [switch]$Rapido,
-    [switch]$Pelo,
+    [switch]$SinPelo,
     [string]$Luz = "0.8",
     [string]$Exe = "$PSScriptRoot\target\release\victory.exe",
     [string]$Game = $(
@@ -51,7 +51,11 @@ $kept = @([Environment]::GetEnvironmentVariables('User').Keys) + @([Environment]
 Get-ChildItem Env: | Where-Object { $_.Name -like "VICTORY_*" -and $kept -notcontains $_.Name } |
     ForEach-Object { Remove-Item "Env:$($_.Name)" }
 
-if ($Pelo) { $env:VICTORY_HAIR = "1" }
+# The picture as cool_fox 3277b15 drew it, the one liked best: hair strands
+# drawn (64b8967 skips them unless VICTORY_HAIR is set) and no stand-in
+# light (64b8967 turned its estimate on when VICTORY_AMBIENT is unset).
+if (-not $SinPelo) { $env:VICTORY_HAIR = "1" }
+if (-not $Rapido) { $env:VICTORY_AMBIENT = "off" }
 if ($Rapido) {
     # Copies and the copy-back: sent without waiting for each submission,
     # found on several threads, joined, over the card's copy queue.
@@ -101,7 +105,7 @@ if ($Escala) {
 }
 
 $log = "run-$console.log"
-Write-Host "VIctory (cool_fox base): $console$(if ($Rapido) { ', Play-VIctory.cmd switches' } else { ', defaults' })$(if ($Pelo) { ', hair strands' }); log in $log"
+Write-Host "VIctory (cool_fox base): $console$(if ($Rapido) { ', Play-VIctory.cmd switches' } else { ', defaults' })$(if ($SinPelo) { ', no hair strands' }); log in $log"
 # A writer of our own, not Tee-Object: Windows PowerShell 5.1's wraps long
 # lines at the window's width and writes UTF-16.
 $writer = [IO.StreamWriter]::new((Join-Path $PWD $log), $false, [Text.UTF8Encoding]::new($false))
