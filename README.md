@@ -1,4 +1,4 @@
-# victory-pc-layer
+﻿# victory-pc-layer
 
 A combination of the existing work on running an Xbox Series title natively
 on Windows, tuned to start on more modest PCs (tested on an NVIDIA RTX 2060
@@ -29,8 +29,8 @@ Licensed GPL-3.0-or-later, like VIctory and victory-fork (see `LICENSE`).
 
 ## What this repository adds
 
-This tree follows victory-fork's `main` (merged up to `32b31f7`,
-2026-11-25, late) and adds, on top of it:
+This tree follows victory-fork's `main` (merged up to `a183ea2`,
+2026-11-26) and adds, on top of it:
 
 - `jugar.ps1`: a launcher with the settings that matter on a weaker GPU. The
   emulator reports a 4K display to the game by default; the launcher reports
@@ -89,6 +89,14 @@ This tree follows victory-fork's `main` (merged up to `32b31f7`,
   its shaders missed were "not the title's memory" (2026-11-25). It now
   comes in 64 KiB blocks of arenas in [4 GiB, 2^37), registered as title
   buffers; `VICTORY_UPLOAD_LOW=0` goes back to the heap.
+- **The least indirect light** (`-Luz 0.6`, `VICTORY_AMBIENT`; off by
+  default), from Belobug's
+  [VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)
+  (`crate::ambient`, commit `4f62c2a`; VIctory-7900XTX carries the same
+  idea): right after the title's program that resolves indirect diffuse
+  light, its output is raised to that level, tinted by the sky the title
+  draws, and its last reflections are held to the light around. Interiors
+  the ray-traced light does not reach yet become readable.
 - From soldsawn's [victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb):
   - the performance overlay (`overlay.rs`, `pixels.rs`): fps, frame time,
     30-second high, low and average, draws, CPU, GPU, RAM and video memory
@@ -906,9 +914,9 @@ What each part does today and what it still needs:
 
 | Subsystem | Today | Needs |
 |-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | â€“ |
+| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | Ã¢â‚¬â€œ |
 | Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | â€“ |
+| Network | Offline by design: the title cannot reach the network | Ã¢â‚¬â€œ |
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
 | Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
@@ -925,7 +933,7 @@ shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
 The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager â†’ Performance â†’ Memory**. If
+Check **Committed** under **Task Manager Ã¢â€ â€™ Performance Ã¢â€ â€™ Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
 
