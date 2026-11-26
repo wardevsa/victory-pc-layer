@@ -32,6 +32,8 @@
 #                                 -SinRT it is that set as tested there)
 #         .\jugar.ps1 -Luz 0.6   (the least indirect light, tinted by the sky:
 #                                 interiors readable; 0.3 darker, 1 brighter)
+#         .\jugar.ps1 -Texturas baja -VentanasMB 1536  (ray-tracing copies in
+#                                 the card's memory instead of over the bus)
 #         .\jugar.ps1 -CopiasRT 1023  (copies of memory the ray tracing
 #                                 reaches: fewer for less RAM; 2047 by default)
 #         .\jugar.ps1 -Texturas alta|media|baja  (texture quality; media by
@@ -53,6 +55,7 @@ param(
     [switch]$Rapido,
     [switch]$Mejor,
     [string]$Luz = "",
+    [int]$VentanasMB = 0,
     [int]$CopiasRT = 2047,
     [int]$CardMB = 1024,
     [ValidateSet("alta", "media", "baja")]
@@ -146,7 +149,17 @@ if ($Rapido) {
     $env:VICTORY_INDIRECT_GATHER = "1"
     $env:VICTORY_CARD_REHASH_RUNS = "1"
     $env:VICTORY_TEXTURE_NO_WAIT = "1"
+    # Copies in a list that continue the one before become one (the frame
+    # summary names it; 26-31 a frame here, 2026-11-26).
+    $env:VICTORY_JOIN_COPIES = "1"
 }
+# -VentanasMB 1536: copies of windows of title memory outside buffers (the
+# ray-tracing structures among them) in the card's memory, up to that many
+# MB (VICTORY_CARD_WINDOWS_MB), instead of the PC's memory the card reads
+# over the bus: with the structures' pages kept, the card read 12.6 GB of
+# shared memory and took about 310 ms a frame (2026-11-26). The card needs
+# the room: -Texturas baja leaves it.
+if ($VentanasMB -gt 0) { $env:VICTORY_CARD_WINDOWS_MB = "$VentanasMB" } else { Remove-Item Env:VICTORY_CARD_WINDOWS_MB -ErrorAction SilentlyContinue }
 # Console wave64 compute programs that share memory inside per-lane branches
 # run as two 32-lane halves with their branches taken wave-wide
 # (VICTORY_WAVE_WIDE=1): on a 32-lane card they were otherwise emitted for
