@@ -64,7 +64,7 @@ param(
     [switch]$SinPelo,
     [string]$Escala = "",
     [switch]$ConWatchdog,
-    [switch]$SinNan,
+    [switch]$ConNan,
     [int]$CopiasRT = 2047,
     [int]$CardMB = 1024,
     [ValidateSet("alta", "media", "baja")]
@@ -247,9 +247,13 @@ if ($Escala) { $env:VICTORY_RENDER_SCALE = $Escala } else { Remove-Item Env:VICT
 # NaN and infinite colours and float image stores become 0
 # (VICTORY_NAN_SCRUB, from VIctory-NVIDIA through cool_fox-dlss): on NVIDIA
 # one bad value spreads through bloom, exposure and the temporal passes into
-# black patches (a black sun, banded sky, dark outdoor light). -SinNan:
-# as the console computes them.
-if ($SinNan) { Remove-Item Env:VICTORY_NAN_SCRUB -ErrorAction SilentlyContinue } else { $env:VICTORY_NAN_SCRUB = "1" }
+# black patches (a black sun, banded sky, dark outdoor light). Off by
+# default, -ConNan turns it on: on by default it turned the cell's
+# ray-traced light off again and the yard's orange uniforms black and
+# purple (2026-11-26): the title packs data that is not colour (bits of
+# materials, normals, light) into float targets and image stores, and
+# patterns of those bits read as NaN were made 0.
+if ($ConNan) { $env:VICTORY_NAN_SCRUB = "1" } else { Remove-Item Env:VICTORY_NAN_SCRUB -ErrorAction SilentlyContinue }
 # -SinPelo: hair strands left out (VICTORY_HAIR=0): about 80 ms of the
 # card's time a frame on this PC; characters keep their hair meshes.
 if ($SinPelo) { $env:VICTORY_HAIR = "0" } else { Remove-Item Env:VICTORY_HAIR -ErrorAction SilentlyContinue }

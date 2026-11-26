@@ -107,9 +107,11 @@ This tree follows victory-fork's `main` (merged up to `a20809de`,
     title's upscaler after; its own upscaler on every profile
     (`VICTORY_OWN_UPSCALER`);
   - **NaN and infinite colours and float image stores made 0**
-    (`VICTORY_NAN_SCRUB`, on in `jugar.ps1`; `-SinNan` turns it off): on
-    NVIDIA one bad value spreads through bloom, exposure and the temporal
-    passes into black patches.
+    (`VICTORY_NAN_SCRUB`, `jugar.ps1 -ConNan`; off by default): on NVIDIA one
+    bad value spreads through bloom, exposure and the temporal passes into
+    black patches. On by default it turned the ray-traced light off and the
+    yard's orange uniforms black and purple here: the title packs data that
+    is not colour into float targets, and bit patterns of it read as NaN.
 - **From codec_d's cool_fox** (VIctory-7900XTX adapted to NVIDIA cards and
   32 GB of RAM; the original repository is gone, read from the mirror
   [DoubleGhosty/cool_fox](https://github.com/DoubleGhosty/cool_fox) at
