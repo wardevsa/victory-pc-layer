@@ -247,7 +247,7 @@ impl Memory {
 
     /// Gives the page of `address` its copy, if it has none and the memory
     /// is the title's.
-    fn map(&mut self, address: u64) -> Mapped {
+    fn map(&mut self, address: u64, named: bool) -> Mapped {
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
         if page >= u64::from(MEMORY_PAGES) - 1 {
@@ -274,13 +274,29 @@ impl Memory {
         if crate::shadow::find_existing(start).is_none() && shared_full() {
             return Mapped::Full;
         }
-        // The copy a root view at that address would get; a buffer that
-        // ends inside the page is passed over for what holds all of it.
+        // A page a dispatch names (`named`, its root views): the copy a root
+        // view at that address gets, so what the builder stores through the
+        // view and what is read by address are one copy. A page only a
+        // shader's pointer found (a fault): a copy there is already, or a
+        // window of its own on the window grid (`VICTORY_WINDOW_KB`, 256
+        // KiB in jugar.ps1) and not the 4 MiB an ask without a length makes.
+        // Every fault made 4 MiB: 2,400 copies held 9.9 GB, the PC's memory
+        // shared with the card passed nine tenths of its budget 30 s after
+        // the builder started, and new pages read zeros from then on, the
+        // interiors dark again (2026-11-26). A buffer that ends inside the
+        // page is passed over for what holds all of it.
         let whole = |s: &Arc<Shadow>| s.offset_in(start).is_some_and(|_| s.left(start) >= PAGE);
-        let Some(shadow) = crate::shadow::find(start, 1)
-            .filter(whole)
-            .or_else(|| crate::shadow::find(start, PAGE).filter(whole))
-        else {
+        let found = if named {
+            crate::shadow::find(start, 1)
+                .filter(whole)
+                .or_else(|| crate::shadow::find(start, PAGE).filter(whole))
+        } else {
+            crate::shadow::find_existing(start)
+                .filter(whole)
+                .or_else(|| crate::shadow::find(start, PAGE).filter(whole))
+                .or_else(|| crate::shadow::find(start, 1).filter(whole))
+        };
+        let Some(shadow) = found else {
             return Mapped::NoCopy;
         };
         // SAFETY: a live buffer.
@@ -365,7 +381,7 @@ impl Memory {
         // cannot write, no number left].
         let mut seen = [0u32; 7];
         for &page in &pages {
-            seen[self.map(u64::from(page) * PAGE) as usize] += 1;
+            seen[self.map(u64::from(page) * PAGE, false) as usize] += 1;
         }
         // Each is an access that read 0 or was dropped.
         static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -391,8 +407,8 @@ impl Memory {
     /// What a dispatch names: the copy around `address` and the 4 MiB
     /// after it.
     fn name(&mut self, address: u64) {
-        let _ = self.map(address);
-        let _ = self.map((address & !(CELL - 1)) + CELL);
+        let _ = self.map(address, true);
+        let _ = self.map((address & !(CELL - 1)) + CELL, true);
     }
 }
 
