@@ -68,6 +68,7 @@ param(
     [switch]$ConWatchdog,
     [switch]$ConNan,
     [switch]$SeriesS,
+    [switch]$SinNuevos,
     [int]$CopiasRT = 2047,
     [int]$CardMB = 1024,
     [ValidateSet("alta", "media", "baja")]
@@ -118,6 +119,22 @@ $env:VICTORY_TEXTURE_DROP_MIPS = switch ($Texturas) { "alta" { "0" } "media" { "
 # and triples it on its own while a backlog of 1,024 or more drains).
 $env:VICTORY_TEXTURE_STAGE_MB = "384"
 $env:VICTORY_TEXTURE_STAGE_MS = "400"
+# victory-fork's switches measured on 2026-11-26 (all off by default there;
+# -SinNuevos leaves them off): the texture pass on a thread of its own
+# (VICTORY_HEAP_WORKER, pull request #1007: +40 % world frames at the boat;
+# it needs the late wait, which the relay brings), flights given more room
+# before they are settled (VICTORY_SETTLE_ROOM: 11-20 ms less of the
+# preparing thread's work a frame), a thread's memory of the host copies it
+# asked for (VICTORY_LOOKUP_CACHE, pull request #1237: about 14 ms a frame)
+# and texture checks side by side (VICTORY_PARALLEL_REFRESH: about 9 ms).
+if ($SinNuevos) {
+    Remove-Item Env:VICTORY_HEAP_WORKER, Env:VICTORY_SETTLE_ROOM, Env:VICTORY_LOOKUP_CACHE, Env:VICTORY_PARALLEL_REFRESH -ErrorAction SilentlyContinue
+} else {
+    $env:VICTORY_HEAP_WORKER = "1"
+    $env:VICTORY_SETTLE_ROOM = "1"
+    $env:VICTORY_LOOKUP_CACHE = "1"
+    $env:VICTORY_PARALLEL_REFRESH = "1"
+}
 if ($Mejor) {
     # victory-fork's run 279 (2026-11-25), "the set that plays best so far":
     # the switches of its diagnostics/README.md plus VICTORY_CARD_HASH_LEN=1.
