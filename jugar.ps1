@@ -16,6 +16,12 @@
 #                                      scaled up by the title: 0.5 to 1.0)
 #         .\jugar.ps1 -Rapido -Luz 1.0  (with -Rapido: the stand-in light's
 #                                      constant level; 0.8 default)
+#         .\jugar.ps1 -Preparar       (no game: every shader translated into
+#                                      the cache, then the host pipelines of
+#                                      earlier runs made for the driver's cache;
+#                                      after each update, before playing)
+# Every run writes down the pipelines the title makes (VICTORY_PIPELINE_BOOK),
+# which -Preparar makes ahead the next time.
 # The title's executable is VICTORY_GAME_DIR if that names an .exe; if it
 # names a folder, the largest .exe in it. Or pass it with -Game.
 param(
@@ -26,6 +32,7 @@ param(
     [switch]$Rapido,
     [switch]$SinPelo,
     [string]$Luz = "0.8",
+    [switch]$Preparar,
     [string]$Exe = "$PSScriptRoot\target\release\victory.exe",
     [string]$Game = $(
         if ($env:VICTORY_GAME_DIR -like "*.exe") { $env:VICTORY_GAME_DIR }
@@ -50,6 +57,39 @@ if (-not (Test-Path $Exe)) {
 $kept = @([Environment]::GetEnvironmentVariables('User').Keys) + @([Environment]::GetEnvironmentVariables('Machine').Keys)
 Get-ChildItem Env: | Where-Object { $_.Name -like "VICTORY_*" -and $kept -notcontains $_.Name } |
     ForEach-Object { Remove-Item "Env:$($_.Name)" }
+
+if ($Preparar) {
+    # After an update of the translator every shader is translated again, in
+    # the running game: in the first run after 64b8967 some 700 pipelines
+    # waited at once, their draws were left out and the frame took 500-800
+    # ms. Done here instead, with the game closed.
+    $dir = Split-Path $Game
+    # The shader cache's key holds the host's wave size and view heap: the
+    # values the last run's log gives (NVIDIA: 32 lanes, 1,000,000 views).
+    $wave = "32"; $views = "1000000"
+    $last = Get-ChildItem (Join-Path $PSScriptRoot "run-*.log") -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($last) {
+        $text = [IO.File]::ReadAllText($last.FullName)
+        if ($text -match 'host wave lanes min=\d+ max=(\d+)') { $wave = $Matches[1] }
+        if ($text -match 'host view heaps hold (\d+) views') { $views = $Matches[1] }
+    }
+    $env:VICTORY_HOST_WAVE = $wave
+    $env:VICTORY_VIEW_LIMIT = "$([int]$views - 1)"
+    $jobs = [Math]::Max(1, [Environment]::ProcessorCount - 2)
+    $inputs = @("$dir\shaders.rpf", $Game, "$dir\XboxBvhBuilder.dll", "$dir\amd_fidelityfx_upscaler_xbox.dll") |
+        Where-Object { Test-Path $_ }
+    Write-Host "1/2: shaders into the cache ($wave-lane waves, $views views, $jobs threads)..."
+    & $Exe translate --warm all --jobs $jobs @inputs
+    Remove-Item Env:VICTORY_HOST_WAVE, Env:VICTORY_VIEW_LIMIT
+    Write-Host "2/2: host pipelines of earlier runs, for the driver's cache..."
+    & $Exe warm --used
+    Write-Host "Ready: play with .\jugar.ps1"
+    exit 0
+}
+
+# Pipelines the title makes are written down for -Preparar.
+$env:VICTORY_PIPELINE_BOOK = "1"
 
 # The picture as cool_fox 3277b15 drew it, the one liked best: hair strands
 # drawn (64b8967 skips them unless VICTORY_HAIR is set) and no stand-in

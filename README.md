@@ -21,7 +21,15 @@ powershell -ExecutionPolicy Bypass -File .\jugar.ps1                 # Series S,
 powershell -ExecutionPolicy Bypass -File .\jugar.ps1 -SinPelo        # hair strands skipped (faster)
 powershell -ExecutionPolicy Bypass -File .\jugar.ps1 -Salida 1664x936  # less for the card
 powershell -ExecutionPolicy Bypass -File .\jugar.ps1 -Rapido         # Play-VIctory.cmd's switch set
+powershell -ExecutionPolicy Bypass -File .\jugar.ps1 -Preparar       # after each update, game closed
 ```
+
+`-Preparar` translates every shader into the cache (`victory translate
+--warm all`, with the host's wave size and view heap from the last run's
+log) and makes the host pipelines earlier runs wrote down (`victory warm
+--used`), so that the first run after a change of the translator does not
+translate them while playing: after the merge of cool_fox `64b8967` some
+700 pipelines waited at once and frames took 500-800 ms.
 
 `jugar.ps1` runs cool_fox with its own defaults, which were the fastest on
 the test PC, and keeps the picture as `3277b15` drew it (hair strands
