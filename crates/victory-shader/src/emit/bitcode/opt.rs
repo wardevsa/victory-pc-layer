@@ -175,7 +175,7 @@ fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
             *a = f(*a);
             *b = f(*b);
         }
-        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => *v = f(*v),
+        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) | Op::VolatileLoad(v) => *v = f(*v),
         Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
             *a = f(*a);
             *b = f(*b);
@@ -703,6 +703,7 @@ impl Module {
             | Op::Select(..)
             | Op::Extract(..)
             | Op::Gep(..) => Effect::Pure,
+            Op::VolatileLoad(_) => Effect::Reads,
             Op::Load(p) => {
                 // A constant table reads the same whatever is stored.
                 let base = match *p {

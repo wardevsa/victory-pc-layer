@@ -609,6 +609,14 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                     match emit::emit(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
+                            let line = label();
+                            if line.contains("02384a60fda6f2d0") {
+                                let (lds_reads, lds_writes) = emit::defrag_lds_sites();
+                                eprintln!(
+                                    "meet sites={} lds_reads={lds_reads} lds_writes={lds_writes}",
+                                    emit::defrag_meet_sites()
+                                );
+                            }
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
                         }

@@ -154,7 +154,7 @@ impl Module {
                     Op::Extract(..) => k("extract"),
                     Op::Phi(_) => k("phi"),
                     Op::Gep(..) => k("gep"),
-                    Op::Load(_) => k("lds_load"),
+                    Op::Load(_) | Op::VolatileLoad(_) => k("lds_load"),
                     Op::Store(..) => k("lds_store"),
                     Op::AtomicRmw(..) | Op::CmpXchg(..) => k("atomic"),
                     Op::Call(f, _) => call_kind[*f as usize],

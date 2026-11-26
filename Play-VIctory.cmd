@@ -41,8 +41,12 @@ rem skin of people in play is not drawn (eyes and teeth are), and JOIN_PARTS
 rem repeats frames of the opening video. Set them to 1 to try instead.
 if not defined VICTORY_THIN set "VICTORY_THIN=0"
 if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=0"
-if not defined VICTORY_PORT_CONSTANTS set "VICTORY_PORT_CONSTANTS=1"
-if not defined VICTORY_PORT_CBV set "VICTORY_PORT_CBV=1"
+rem Renderer ports 1 & 5 stay opt-in: on 8 GB NVIDIA cards PORT_CBV=1 can drop
+rem road surfaces and PORT_CONSTANTS+PORT_CBV can raise a C++ exception (#15).
+if not defined VICTORY_PORT_CONSTANTS set "VICTORY_PORT_CONSTANTS=0"
+if not defined VICTORY_PORT_CBV set "VICTORY_PORT_CBV=0"
+if not defined VICTORY_LIBRARY_STORE_LATER set "VICTORY_LIBRARY_STORE_LATER=1"
+if not defined VICTORY_PIPELINE_WAIT_MS set "VICTORY_PIPELINE_WAIT_MS=0"
 if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"
 if not defined VICTORY_LEVELS_ON_DEMAND set "VICTORY_LEVELS_ON_DEMAND=1"
 if not defined VICTORY_CARD_BUFFERS_MIN_KB set "VICTORY_CARD_BUFFERS_MIN_KB=64"

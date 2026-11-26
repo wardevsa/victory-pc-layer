@@ -157,6 +157,8 @@ enum Op {
     /// `getelementptr` over the pointee type, from a pointer.
     Gep(Ty, V, Vec<V>),
     Load(V),
+    /// A group-shared load the wait loop must repeat. Not folded with an earlier load.
+    VolatileLoad(V),
     /// Pointer, value.
     Store(V, V),
     AtomicRmw(Rmw, V, V),
@@ -226,6 +228,8 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// A block that was closed by a meet: later instructions aimed at it belong in the continuation.
+    redirect: HashMap<usize, usize>,
 }
 
 impl Module {
@@ -408,7 +412,23 @@ impl Module {
         }
     }
 
+    fn follow(&self, mut block: usize) -> usize {
+        for _ in 0..64 {
+            match self.redirect.get(&block) {
+                Some(&next) if next != block => block = next,
+                _ => break,
+            }
+        }
+        block
+    }
+
+    /// Instructions aimed at `from` after this belong in `to` (a meet closed `from`).
+    pub fn continues(&mut self, from: usize, to: usize) {
+        self.redirect.insert(from, to);
+    }
+
     fn push(&mut self, block: usize, ty: Ty, op: Op) -> V {
+        let block = self.follow(block);
         let i = self.insts.len() as u32;
         self.insts.push(Inst { ty, op });
         // Terminators are kept apart, so a block can still grow at its end.
@@ -475,6 +495,13 @@ impl Module {
             panic!("load from a non-pointer")
         };
         self.push(block, ty, Op::Load(ptr))
+    }
+    /// A load the optimiser and the driver must not lift out of a wait loop.
+    pub fn load_volatile(&mut self, block: usize, ptr: V) -> V {
+        let TypeDef::Ptr(ty, _) = self.types[self.type_of(ptr).0 as usize] else {
+            panic!("load from a non-pointer")
+        };
+        self.push(block, ty, Op::VolatileLoad(ptr))
     }
     pub fn store(&mut self, block: usize, ptr: V, value: V) {
         let void = self.void();
@@ -947,6 +974,8 @@ impl Module {
                     }
                     // Alignment 4 (log2 + 1), not volatile.
                     Op::Load(p) => w.record(20, &[rel(*p), u64::from(inst.ty.0), 3, 0]),
+                    // The last field is the volatile bit: the wait must read again.
+                    Op::VolatileLoad(p) => w.record(20, &[rel(*p), u64::from(inst.ty.0), 3, 1]),
                     Op::Store(p, v) => w.record(44, &[rel(*p), rel(*v), 3, 0]),
                     // Sequentially consistent, across threads.
                     Op::AtomicRmw(op, p, v) => {
@@ -992,7 +1021,7 @@ fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
             f(*a);
             f(*b);
         }
-        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => f(*v),
+        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) | Op::VolatileLoad(v) => f(*v),
         Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
             f(*a);
             f(*b);

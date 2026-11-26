@@ -286,6 +286,7 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
         routines = suspend.len(),
         "{why}: suspending the title"
     );
+    victory_gpu::log_defrag_counters();
     // Whoever comes first (the routines or the deadline) runs `then`; the
     // other waits for it, so the process never ends halfway through.
     let then = std::sync::Arc::new(Mutex::new(Some(then)));
