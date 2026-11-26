@@ -36,6 +36,8 @@
 #                                 interiors readable; 0.3 darker, 1 brighter)
 #         .\jugar.ps1 -Texturas baja -VentanasMB 1536  (ray-tracing copies in
 #                                 the card's memory instead of over the bus)
+#         .\jugar.ps1 -Escala 0.7  (the title renders at 70% of the output
+#                                 size and scales up: faster, softer)
 #         .\jugar.ps1 -CopiasRT 1023  (copies of memory the ray tracing
 #                                 reaches: fewer for less RAM; 2047 by default)
 #         .\jugar.ps1 -Texturas alta|media|baja  (texture quality; media by
@@ -60,6 +62,9 @@ param(
     [int]$VentanasMB = 0,
     [switch]$Tiempos,
     [switch]$SinPelo,
+    [string]$Escala = "",
+    [switch]$ConWatchdog,
+    [switch]$SinNan,
     [int]$CopiasRT = 2047,
     [int]$CardMB = 1024,
     [ValidateSet("alta", "media", "baja")]
@@ -226,6 +231,25 @@ if ($keep) {
 # light, its output is raised to this level, tinted by the sky the title
 # draws, and reflections are held to it. Interiors are readable without the
 # ray-traced light; off by default (crate::ambient).
+# Title patches for the 1.0.2.1 executable, each checked against its hash
+# and the bytes it replaces (crates/victory-loader/src/hooks.rs, from
+# ZigZagBoi1/ScarlettPort through victory-perf, VIctory-NVIDIA and
+# cool_fox-dlss):
+# - the title's watchdog off (VICTORY_NO_WATCHDOG): it ends the process on
+#   purpose when its main thread has not advanced for about 30 s, which a
+#   slow frame can do (cool_fox ended here that way at +0x23cf683, the
+#   watchdog's own fault); -ConWatchdog keeps it;
+# - -Escala 0.7: the title renders at that share of the output size and
+#   scales up with its own upscaler (VICTORY_RENDER_SCALE, 0.2-1.0): fewer
+#   pixels for every pass, the ray-traced ones too.
+if ($ConWatchdog) { Remove-Item Env:VICTORY_NO_WATCHDOG -ErrorAction SilentlyContinue } else { $env:VICTORY_NO_WATCHDOG = "1" }
+if ($Escala) { $env:VICTORY_RENDER_SCALE = $Escala } else { Remove-Item Env:VICTORY_RENDER_SCALE -ErrorAction SilentlyContinue }
+# NaN and infinite colours and float image stores become 0
+# (VICTORY_NAN_SCRUB, from VIctory-NVIDIA through cool_fox-dlss): on NVIDIA
+# one bad value spreads through bloom, exposure and the temporal passes into
+# black patches (a black sun, banded sky, dark outdoor light). -SinNan:
+# as the console computes them.
+if ($SinNan) { Remove-Item Env:VICTORY_NAN_SCRUB -ErrorAction SilentlyContinue } else { $env:VICTORY_NAN_SCRUB = "1" }
 # -SinPelo: hair strands left out (VICTORY_HAIR=0): about 80 ms of the
 # card's time a frame on this PC; characters keep their hair meshes.
 if ($SinPelo) { $env:VICTORY_HAIR = "0" } else { Remove-Item Env:VICTORY_HAIR -ErrorAction SilentlyContinue }

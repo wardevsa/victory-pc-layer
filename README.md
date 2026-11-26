@@ -29,7 +29,7 @@ Licensed GPL-3.0-or-later, like VIctory and victory-fork (see `LICENSE`).
 
 ## What this repository adds
 
-This tree follows victory-fork's `main` (merged up to `a183ea2`,
+This tree follows victory-fork's `main` (merged up to `a20809de`,
 2026-11-26) and adds, on top of it:
 
 - `jugar.ps1`: a launcher with the settings that matter on a weaker GPU. The
@@ -93,6 +93,23 @@ This tree follows victory-fork's `main` (merged up to `a183ea2`,
   structures' pages on the card. **With these the cell and the corridors
   got their ray-traced light for the first time on this NVIDIA card
   (2026-11-26).**
+- **From Ranxanat0r's [cool_fox-dlss](https://github.com/Ranxanat0r/cool_fox-dlss-ranxanat0r)**
+  (commits `5fd03772` and `a51ae6df` by Humb8l, carried there from
+  [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA),
+  vitutu1's victory-perf and ZigZagBoi1's ScarlettPort):
+  - **title patches for the 1.0.2.1 executable** (`victory-loader`
+    `hooks.rs`), each checked against its hash and the bytes it replaces:
+    the title's watchdog off (`VICTORY_NO_WATCHDOG`, on in `jugar.ps1`;
+    `-ConWatchdog` keeps it), which ends the process on purpose when its
+    main thread has not advanced for about 30 s (cool_fox ended that way
+    here); the internal render scale (`-Escala 0.7`,
+    `VICTORY_RENDER_SCALE`, 0.2-1.0), every pass on fewer pixels and the
+    title's upscaler after; its own upscaler on every profile
+    (`VICTORY_OWN_UPSCALER`);
+  - **NaN and infinite colours and float image stores made 0**
+    (`VICTORY_NAN_SCRUB`, on in `jugar.ps1`; `-SinNan` turns it off): on
+    NVIDIA one bad value spreads through bloom, exposure and the temporal
+    passes into black patches.
 - **From codec_d's cool_fox** (VIctory-7900XTX adapted to NVIDIA cards and
   32 GB of RAM; the original repository is gone, read from the mirror
   [DoubleGhosty/cool_fox](https://github.com/DoubleGhosty/cool_fox) at
@@ -1034,9 +1051,9 @@ What each part does today and what it still needs:
 
 | Subsystem | Today | Needs |
 |-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | Ã¢â‚¬â€œ |
+| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ |
 | Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | Ã¢â‚¬â€œ |
+| Network | Offline by design: the title cannot reach the network | ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ |
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
 | Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
@@ -1053,7 +1070,7 @@ shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
 The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager Ã¢â€ â€™ Performance Ã¢â€ â€™ Memory**. If
+Check **Committed** under **Task Manager ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Performance ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
 
