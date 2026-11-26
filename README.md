@@ -93,6 +93,24 @@ This tree follows victory-fork's `main` (merged up to `a183ea2`,
   structures' pages on the card. **With these the cell and the corridors
   got their ray-traced light for the first time on this NVIDIA card
   (2026-11-26).**
+- **From codec_d's cool_fox** (VIctory-7900XTX adapted to NVIDIA cards and
+  32 GB of RAM; the original repository is gone, read from the mirror
+  [DoubleGhosty/cool_fox](https://github.com/DoubleGhosty/cool_fox) at
+  `f4b48ad`). As a whole it ran here at 1 fps with a washed-out picture
+  (Series S upscaling) and the PC's memory nearly full; three of its fixes
+  carried over:
+  - the shader translator traces a descriptor only over the lanes that run
+    the access (its EXEC guard too), so an immediate sampler built in one arm
+    of a branch is found at the join (`resource.rs`; its test with it). It
+    recovered `alphaResolve:CS_AlphTransmissionPrefilterMip` on a 32-lane
+    card there, whose absence drew transmissive eyes and alpha as black
+    squares;
+  - XMA audio: a voice the title refills after its input ran out plays
+    again, and a voice whose frames give no samples no longer stalls the
+    others (`audio.rs`);
+  - no new copies of memory by address while Windows has under 1.5 GB left
+    to commit (`VICTORY_COMMIT_LEAST_MB`), its critical mark: out of commit
+    the title's own allocations fail and it writes through null.
 - **Speed and stability after a timing run** (2026-11-26, RTX 2060 SUPER):
   - **Hair strands can be left out** (`jugar.ps1 -SinPelo`, `VICTORY_HAIR=0`; kept by default): their
     simulation took about 80 ms of the card's time a frame

@@ -420,21 +420,40 @@ fn shared_full() -> bool {
         .map_or(0, |d| d.as_millis() as u64);
     let last = LAST.load(Ordering::Relaxed);
     if now >= last + 100 && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-        let full = host()
+        let shared = host()
             .and_then(|h| h.video_memory())
             .is_some_and(|[_, _, budget, used]| budget > 0 && used > budget / 100 * most);
+        let full = shared || commit_low();
         if full && !FULL.load(Ordering::Relaxed) {
             static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if SAID.fetch_add(1, Ordering::Relaxed) < 20 {
                 tracing::warn!(
                     most,
-                    "title memory by address: the PC's memory shared with the card is past that share of its budget: no new copies (VICTORY_SHARED_MOST)"
+                    "title memory by address: the PC's memory shared with the card is past that share of its budget, or Windows has little left to commit: no new copies (VICTORY_SHARED_MOST, VICTORY_COMMIT_LEAST_MB)"
                 );
             }
         }
         FULL.store(full, Ordering::Relaxed);
     }
     FULL.load(Ordering::Relaxed)
+}
+
+/// Whether what Windows can still commit (RAM and page file) is under
+/// `VICTORY_COMMIT_LEAST_MB` (1536), cool_fox's critical mark (codec_d,
+/// `residency.rs` `critical_commit`, f4b48ad): out of commit the title's own
+/// allocations fail and it writes through null (a run of cool_fox here ended
+/// that way with 581 MB left, 2026-11-26).
+fn commit_low() -> bool {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    static LEAST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let least = *LEAST.get_or_init(|| {
+        std::env::var("VICTORY_COMMIT_LEAST_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1536) << 20
+    });
+    // SAFETY: a correctly sized structure the call fills.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: as above.
+    (unsafe { GlobalMemoryStatusEx(&mut status) } != 0) && status.ullAvailPageFile < least
 }
 
 /// `VICTORY_BVH_KEEP=1` (with `VICTORY_BVH_QUARANTINE=2`): the copies of
