@@ -296,7 +296,7 @@ fn valid(seen: &Seen) -> Option<(u32, u32)> {
 fn trim(shown: &[usize], from: usize, to: usize) -> bool {
     use windows_sys::Win32::System::Memory::VirtualUnlock;
     // No mapping changes until the addresses have been used.
-    let Some(_still) = crate::watch::title_memory_reading_now(0, usize::MAX) else {
+    let Some(_still) = crate::watch::title_memory_reading_now() else {
         return false;
     };
     for &base in shown {
@@ -318,7 +318,7 @@ fn judge(seen: &Seen) -> Judged {
         && seen.clean
         && (!crate::watch::clean(seen.page) || crate::watch::stamp(seen.page) > seen.stamp);
     let looked = if seen.trimmed {
-        match crate::watch::title_memory_reading_now(0, usize::MAX) {
+        match crate::watch::title_memory_reading_now() {
             Some(_still) => valid(seen),
             None => None,
         }

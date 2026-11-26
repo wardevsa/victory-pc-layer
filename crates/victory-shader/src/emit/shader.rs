@@ -97,7 +97,6 @@ pub(crate) mod flags {
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
-    pub const ROVS: u64 = 1 << 18;
 }
 
 pub(crate) struct Types {
@@ -170,8 +169,6 @@ pub(crate) struct Shader {
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
-    /// Every UAV the shader opens is rasterizer ordered ([`Self::annotate`]).
-    pub rov: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
@@ -229,7 +226,6 @@ impl Shader {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             flags: 0,
-            rov: false,
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
@@ -397,15 +393,7 @@ impl Shader {
         self.annotate(block, h, 14 | cmp, 0)
     }
 
-    /// Annotates a handle with its resource properties. Bit 12 of `props0` is
-    /// "UAV"; with `rov` set a UAV also gets bit 13, rasterizer ordered.
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
-        let props0 = if self.rov && props0 & 0x1000 != 0 {
-            self.flags |= flags::ROVS;
-            props0 | 0x2000
-        } else {
-            props0
-        };
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
         self.op(
@@ -482,7 +470,6 @@ impl Shader {
             let used = self.m.usage();
             for (flag, used) in [
                 (flags::WAVE_OPS, used.wave_ops),
-                (flags::ROVS, used.rov),
                 (flags::INT64, used.int64),
                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
                 (flags::RESOURCE_HEAP, used.heap_views),
@@ -602,8 +589,6 @@ impl Shader {
                     // Id, variable, name, space, lower bound, range size,
                     // shape (11: raw buffer), globally coherent, counter,
                     // rasterizer ordered, no extra properties.
-                    let ordered = self.m.bool(self.rov);
-                    let ordered = self.m.md_value(ordered);
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
@@ -614,7 +599,7 @@ impl Shader {
                         Some(i32c(&mut self, 11)),
                         Some(no),
                         Some(no),
-                        Some(ordered),
+                        Some(no),
                         None,
                     ];
                     list.push(Some(self.m.md_node(ops)));
@@ -815,9 +800,6 @@ impl Shader {
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
-        }
-        if self.flags & flags::ROVS != 0 {
-            features |= 0x1000;
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;

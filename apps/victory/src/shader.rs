@@ -19,15 +19,10 @@ pub(crate) enum Source<'a> {
 }
 
 impl Source<'_> {
-    /// The container bytes; `None` if a packed record is corrupt. A container
-    /// stored as is ends where its header's total size says (the rest of the
-    /// file is not its), so its hash is the one a run's log gives it.
+    /// The container bytes; `None` if a packed record is corrupt.
     pub(crate) fn bytes(&self) -> Option<Cow<'_, [u8]>> {
         match self {
-            Source::Raw { data, .. } => {
-                let total = data.get(0x18..0x1C).map_or(data.len(), |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
-                Some(Cow::Borrowed(data.get(..total).unwrap_or(data)))
-            }
+            Source::Raw { data, .. } => Some(Cow::Borrowed(data)),
             Source::Packed(r) => r.unpack().map(Cow::Owned),
         }
     }

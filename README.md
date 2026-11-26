@@ -93,22 +93,6 @@ This tree follows victory-fork's `main` (merged up to `a20809de`,
   structures' pages on the card. **With these the cell and the corridors
   got their ray-traced light for the first time on this NVIDIA card
   (2026-11-26).**
-- **[CCS03](https://github.com/JozefDeTremmerie/CCS03)** by JozefDeTremmerie
-  and its team, merged on 2026-11-26 (its branch `ccs03`, 156 commits on
-  the same victory-fork base): reviewed pull requests from victory-fork,
-  VIctory, ZETTROX and Belobug's fork and its own work for 8 GB NVIDIA cards
-  and laptops (its list with authors: [CCS03.md](CCS03.md)). There it plays
-  the prologue through at 3 to 7.8 fps on an RTX 4060 laptop with 8 GB.
-  Where both trees had their own form of the same thing, CCS03's is kept:
-  the Series S interface plane (`over.rs`, in place of victory-fork pull
-  request #1081), the lower texture quality (`drop_levels`), the stand-in
-  light (`ambient.rs`). Ours is kept where the ray-traced light depends on
-  it: the wave-wide form for every wave64 program with `VICTORY_WAVE_WIDE=1`,
-  combined with CCS03's lists (`VICTORY_WAVE_WIDE_ONLY`, and
-  `VICTORY_FIRSTLANE_OWN_ONLY` for the structure builder's three scans);
-  memory by address, the structures' pages, DispatchX. `jugar.ps1 -CCS03`
-  runs its own profile (Series S, no ray tracing). Its AGENTS.md, rules for
-  contributing to its own repository, is left out here.
 - **The Series S profile** (`jugar.ps1 -SeriesS`): the title renders less
   (its own lower resolution and settings) and is given less memory (7.8 GB
   against the Series X's 13.5), what an 8 GB card and 32 GB of RAM run short

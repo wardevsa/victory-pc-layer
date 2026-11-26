@@ -11,7 +11,7 @@ use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
-    Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
+    Container, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
 };
 use victory_shader::{io, resource};
 
@@ -387,17 +387,10 @@ pub fn run(
     Ok(())
 }
 
-#[derive(PartialEq, Eq, Hash)]
-struct ShaderKey {
-    dxil: blake3::Hash,
-    /// Input, output and primitive signatures, followed by pipeline validation info.
-    interface: [Option<blake3::Hash>; 4],
-}
-
 fn translate(
     source: &Source,
     path: &Path,
-    seen: &Mutex<HashSet<ShaderKey>>,
+    seen: &Mutex<HashSet<blake3::Hash>>,
     t: &mut Tally,
     checks: &mut Checks,
 ) {
@@ -430,17 +423,11 @@ fn translate(
     let Some(dxil) = victory_shader::program_part(&container) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    // `~`: the hash of the DXIL part alone, for comparing diagnostic lines.
+    // `~`: the hash of the code alone; containers that differ only around
+    // it are translated once, the others listed as duplicates of it.
     let code = blake3::hash(dxil);
     let code8 = code.to_hex()[..8].to_owned();
-    // The title's name for the program (`CS_DefragHeap_ComputeRelocations_..._Wrapped`, in
-    // the validation info's strings), as the runtime's log names it; a packed record's label
-    // has it already.
-    let named = title_name(&bytes).filter(|name| !source.label().contains(name.as_str()));
-    let example = || match &named {
-        Some(name) => format!("{} ~{code8} {name}", example()),
-        None => format!("{} ~{code8}", example()),
-    };
+    let example = || format!("{} ~{code8}", example());
     // `VICTORY_DUMP_MATCH=<dir>;<text>|<text>...`: the containers whose
     // line holds one of the texts (a name, `#hash`), as the title has them.
     if let Ok(spec) = std::env::var("VICTORY_DUMP_MATCH")
@@ -459,13 +446,7 @@ fn translate(
             let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
         }
     }
-    // Emission also consumes the signatures and pipeline validation info.
-    let interface = [FourCC::ISG1, FourCC::OSG1, FourCC::PSG1, FourCC::PSV0]
-        .map(|kind| container.part(kind).map(|part| blake3::hash(part.data)));
-    if !lock(seen).insert(ShaderKey {
-        dxil: code,
-        interface,
-    }) {
+    if !lock(seen).insert(code) {
         t.duplicates += 1;
         if t.list {
             t.lines.push(format!("{}  duplicate", example()));
@@ -661,7 +642,7 @@ fn check(
             Ok(()) => {
                 *counter(t, shader.stage, 3) += 1;
                 if t.list {
-                    t.lines.push(format!("{}  pipeline created  [{}]", label(), emit::last_form()));
+                    t.lines.push(format!("{}  pipeline created", label()));
                 }
             }
             Err(e) => t.fail(format!("pipeline: {e}"), &label),
@@ -674,7 +655,7 @@ fn check(
         Ok(()) => {
             *counter(t, shader.stage, 2) += 1;
             if t.list {
-                t.lines.push(format!("{}  validated  [{}]", label(), emit::last_form()));
+                t.lines.push(format!("{}  validated", label()));
             }
         }
         Err(text) => {
@@ -882,58 +863,4 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// The program's name in a container, as the runtime's log finds it: the
-/// first run of name characters, eight or more, that starts as a stage's
-/// names do (`CS_`, `PS_`, ...).
-fn title_name(container: &[u8]) -> Option<String> {
-    const PREFIXES: [&str; 8] = ["CS_", "PS_", "VS_", "MS_", "AS_", "GS_", "HS_", "DS_"];
-    container
-        .split(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
-        .filter(|run| run.len() >= 8)
-        .map(String::from_utf8_lossy)
-        .find(|run| PREFIXES.iter().any(|p| run.get(..3).is_some_and(|h| h.eq_ignore_ascii_case(p))))
-        .map(std::borrow::Cow::into_owned)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shared_dxil_with_distinct_signatures_is_not_a_duplicate() {
-        let make = |signature: u32| {
-            let fourcc = u32::from_le_bytes;
-            let words = [
-                fourcc(*b"DXBC"), 0, 0, 0, 0, // Magic and digest.
-                1, 64, 2, 40, 52, // Version, size, and the two part offsets.
-                fourcc(*b"DXIL"), 4, 0,
-                fourcc(*b"OSG1"), 4, signature,
-            ];
-            words
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .collect::<Vec<_>>()
-        };
-        let first = make(1);
-        let second = make(2);
-        let seen = Mutex::new(HashSet::new());
-        let mut tally = Tally::default();
-        let mut checks = Checks {
-            keep: None,
-            validator: None,
-            host: None,
-        };
-
-        // The shared synthetic DXIL body is intentionally invalid. Deduplication
-        // happens before decoding it, so only the repeat should be skipped.
-        for data in [&first[..], &second, &first] {
-            let source = Source::Raw { offset: 0, data };
-            translate(&source, Path::new("test.dxbc"), &seen, &mut tally, &mut checks);
-        }
-
-        assert_eq!(tally.containers, 3);
-        assert_eq!(tally.duplicates, 1);
-    }
 }

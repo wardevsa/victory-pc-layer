@@ -61,13 +61,6 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
-    /// Its result gets the least indirect light ([`crate::ambient`]).
-    #[cfg(windows)]
-    pub(crate) resolves_light: bool,
-    /// Its reflections are bent down to the light around them
-    /// ([`crate::reflect`]).
-    #[cfg(windows)]
-    pub(crate) updates_reflections: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Whether its code walks the ray-tracing structures, once looked at
@@ -78,6 +71,16 @@ pub(crate) struct Shader {
     /// ([`console_threads`]; after Flamingo).
     #[cfg(windows)]
     threads: OnceLock<Option<[u32; 3]>>,
+    /// Its result gets the least indirect light ([`crate::ambient`]).
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
+    /// It draws the sky as the title reflects it ([`crate::ambient::SKY`]).
+    #[cfg(windows)]
+    pub(crate) draws_sky: bool,
+    /// It writes the title's reflections for the last time in a frame
+    /// ([`crate::ambient::REFLECTED`]).
+    #[cfg(windows)]
+    pub(crate) ends_reflections: bool,
     /// It simulates or draws hair strands, which are left out
     /// ([`hair_strands`]).
     #[cfg(windows)]
@@ -86,40 +89,7 @@ pub(crate) struct Shader {
 
 impl std::fmt::Debug for Shader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} {}", self.stage, self.hash)?;
-        if let Some(name) = self.program_name() {
-            write!(f, " {name}")?;
-        }
-        Ok(())
-    }
-}
-
-impl Shader {
-    /// The title's own name for the program, if its container holds one
-    /// (`CS_ScreenProbes_TemporalResolve_...`, `ps_sky_paraboloid_reflection`):
-    /// the first run of letters, digits and underscores that starts with a
-    /// stage's prefix and is at least 8 long. Only for logs.
-    pub(crate) fn program_name(&self) -> Option<String> {
-        const PREFIXES: [&[u8]; 16] = [
-            b"CS_", b"PS_", b"VS_", b"MS_", b"AS_", b"GS_", b"HS_", b"DS_", b"cs_", b"ps_", b"vs_",
-            b"ms_", b"as_", b"gs_", b"hs_", b"ds_",
-        ];
-        let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-        let bytes = &self.container;
-        let mut at = 0;
-        while at < bytes.len() {
-            if !word(bytes[at]) {
-                at += 1;
-                continue;
-            }
-            let end = bytes[at..].iter().position(|&b| !word(b)).map_or(bytes.len(), |n| at + n);
-            let run = &bytes[at..end];
-            if run.len() >= 8 && PREFIXES.iter().any(|p| run.starts_with(p)) {
-                return Some(String::from_utf8_lossy(run).into_owned());
-            }
-            at = end;
-        }
-        None
+        write!(f, "{} {}", self.stage, self.hash)
     }
 }
 
@@ -164,25 +134,21 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
-                resolves_light: bytes
-                    .windows(crate::ambient::PROGRAM.len())
-                    .any(|w| w == crate::ambient::PROGRAM),
-                #[cfg(windows)]
-                updates_reflections: {
-                    let found = bytes
-                        .windows(crate::reflect::PROGRAM.len())
-                        .any(|w| w == crate::reflect::PROGRAM);
-                    if found {
-                        tracing::info!(stage, hash = %&full.to_hex()[..16], "reflection knee: a history pass");
-                    }
-                    found
-                },
-                #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
                 #[cfg(windows)]
                 threads: OnceLock::new(),
+                #[cfg(windows)]
+                resolves_light: bytes
+                    .windows(crate::ambient::PROGRAM.len())
+                    .any(|w| w == crate::ambient::PROGRAM),
+                #[cfg(windows)]
+                draws_sky: bytes.windows(crate::ambient::SKY.len()).any(|w| w == crate::ambient::SKY),
+                #[cfg(windows)]
+                ends_reflections: bytes
+                    .windows(crate::ambient::REFLECTED.len())
+                    .any(|w| w == crate::ambient::REFLECTED),
                 #[cfg(windows)]
                 hair: hair_strands(bytes),
             })
@@ -234,7 +200,6 @@ impl Shader {
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,
-                        program = self.program_name().unwrap_or_default(),
                         error = %e,
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
@@ -525,8 +490,7 @@ pub(crate) fn builder_runs() -> bool {
     if b.whole {
         return true;
     }
-    let unmade: Vec<String> = b.pipelines.iter().filter(|p| !make::now(p)).map(|p| make::names(p)).collect();
-    let missing = unmade.len();
+    let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
     if missing > 0 {
         b.off = true;
         for p in b.pipelines.iter().filter(|p| !make::now(p)) {
@@ -535,7 +499,6 @@ pub(crate) fn builder_runs() -> bool {
         tracing::warn!(
             missing,
             of = b.pipelines.len(),
-            unmade = ?unmade,
             "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
         );
         return false;

@@ -115,8 +115,8 @@ impl Target {
     pub(crate) fn new(resource: This) -> Option<Self> {
         // Keep the host copy independently of the title's resource lifetime.
         let copy = crate::resource::host_copy(resource)?;
+        let _mapping = crate::watch::title_memory_reading();
         let (layout, at, size) = crate::resource::title_texture(resource)?;
-        let _mapping = crate::watch::title_memory_reading(at, size);
         let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
         let ticket = track(resource as usize, at, end);
         Some(Self { copy, layout, ticket })
@@ -205,8 +205,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
 pub(crate) fn land(back: &Back) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
-    let (at, end) = back.range();
-    let _mapping = crate::watch::title_memory_reading(at, end.saturating_sub(at));
+    let _mapping = crate::watch::title_memory_reading();
     let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
     if !back.ticket.valid.load(Ordering::Acquire) {
         let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -215,6 +214,7 @@ pub(crate) fn land(back: &Back) {
         }
         return;
     }
+    let (at, end) = back.range();
     let size = end - at;
     let mut tiled = vec![0u8; size];
     // Keep title bytes the subresources do not cover.

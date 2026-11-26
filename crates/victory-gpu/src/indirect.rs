@@ -72,29 +72,21 @@ static const uint GROUPS = 1u << 20;
 // round for each record of a window, and in memory the CPU maps (where the
 // budget was, and is with VICTORY_INDIRECT_CARD_BUDGET=0) every atomic
 // crosses the bus on a card of its own.
-#ifndef SINGLE_RECORD
 groupshared uint costs[64];
 groupshared uint fits[64];
 groupshared uint largest_asked;
 groupshared uint all_asked;
-#endif
 [RootSignature(RS)]
-#ifdef SINGLE_RECORD
-[numthreads(1, 1, 1)]
-#else
 [numthreads(64, 1, 1)]
-#endif
 void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
-    // Only the multi-record kernel needs inactive lanes at its barriers.
+    // Threads past the records take part in the group's charge (cost 0)
+    // and store nothing.
     bool active = id.x < eff_count;
-#ifdef SINGLE_RECORD
-    if (!active) return;
-#endif
     uint src_at = args_offset + id.x * stride;
     // (A branch, not a select: without the bit the view behind `count_buf`
     // is a count of four bytes, or the source itself, and is not read here.)
@@ -113,12 +105,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
-#ifndef SINGLE_RECORD
     if (gi == 0) {
         largest_asked = 0;
         all_asked = 0;
     }
-#endif
     if (active && kind <= 1) {
         // Draws: vertex or index count, then instances.
         uint2 want = src_args.Load2(src_at);
@@ -187,27 +177,6 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         cost = g.x * g.y * g.z * 128u;
         groups = g;
     }
-#ifdef SINGLE_RECORD
-    bool over = false;
-    if (cost != 0) {
-        uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
-        while (before < BUDGET) {
-            uint next = min(BUDGET - before, cost) + before;
-            uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
-            if (prev == before) break;
-            before = prev;
-        }
-        over = before >= BUDGET || BUDGET - before < cost;
-    }
-    if (kind > 2) {
-        uint was;
-        budget.InterlockedMax(4, asked, was);
-        budget.InterlockedAdd(8, min(asked, 1u << 24), was);
-    }
-#else
     costs[gi] = cost;
     GroupMemoryBarrierWithGroupSync();
     if (active && kind >= 2) {
@@ -265,7 +234,6 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         return;
     }
     bool over = fits[gi] == 0;
-#endif
     if (kind <= 1) {
         if (over) {
             draw_counts = uint2(0, 0);
@@ -1909,6 +1877,11 @@ void main() {
         assert_ne!(clamped_words[21], 0xDEAD_BEEF);
     }
 
+    /// WARP D3D12 test proving `BUDGET` saturates without 32-bit unsigned
+    /// wraparound across >64 huge indexed-draw records (`count = None`), while
+    /// preserving `StartIndexLocation`, `BaseVertexLocation`,
+    /// `StartInstanceLocation`, and custom stride padding, and leaving
+    /// `src_args` untouched.
     /// A window of mesh records clamped ahead: the filled ones come out as
     /// they are and are charged, the slots of all ones come out empty and
     /// charge nothing; clamped as single records the same slots are clamped
@@ -2089,8 +2062,6 @@ void main() {
         }
     }
 
-    /// Saturates the budget across more than 64 huge indexed draws while
-    /// preserving the remaining draw arguments and custom stride padding.
     #[test]
     fn warp_budget_saturates_without_wraparound_and_preserves_draw_fields() {
         let Some(mut warp) = WarpHarness::new() else {

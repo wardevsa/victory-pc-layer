@@ -62,62 +62,8 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
-fn adapter_name(desc: &DXGI_ADAPTER_DESC1) -> String {
-    let len = desc
-        .Description
-        .iter()
-        .position(|&c| c == 0)
-        .unwrap_or(desc.Description.len());
-    String::from_utf16_lossy(&desc.Description[..len])
-}
-
-fn is_software_adapter(desc: &DXGI_ADAPTER_DESC1) -> bool {
-    desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
-        || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
-}
-
-fn match_adapter(spec: &str, names: &[String]) -> Option<usize> {
-    let spec = spec.trim();
-    if spec.is_empty() {
-        return None;
-    }
-    if let Ok(index) = spec.parse::<usize>() {
-        return (index < names.len()).then_some(index);
-    }
-    let needle = spec.to_ascii_lowercase();
-    names
-        .iter()
-        .position(|name| name.to_ascii_lowercase().contains(&needle))
-}
-
-/// Checks that `device` supports Shader Model 6.6.
-fn check_sm66(device: &ID3D12Device) -> Result<(), String> {
-    let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
-        HighestShaderModel: D3D_SHADER_MODEL_6_6,
-    };
-    // SAFETY: valid D3D12 device and output struct matching `D3D12_FEATURE_SHADER_MODEL`.
-    unsafe {
-        device
-            .CheckFeatureSupport(
-                D3D12_FEATURE_SHADER_MODEL,
-                (&raw mut sm).cast(),
-                size_of_val(&sm) as u32,
-            )
-            .map_err(err)?;
-    }
-    if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-        return Err(format!(
-            "the device supports SM {:#x} only",
-            sm.HighestShaderModel.0
-        ));
-    }
-    Ok(())
-}
-
 impl Host {
-    /// The high-performance hardware adapter (or `VICTORY_D3D12_ADAPTER` by
-    /// 0-based DXGI index or case-insensitive name substring), or WARP with
-    /// `warp` (or `VICTORY_WARP=1`).
+    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
@@ -132,120 +78,48 @@ impl Host {
                     debug.EnableDebugLayer();
                 }
             }
-            let device = if warp {
-                let mut device: Option<ID3D12Device> = None;
+            let mut device: Option<ID3D12Device> = None;
+            if warp {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-                let device = device.ok_or("no device")?;
-                check_sm66(&device)?;
-                device
             } else {
-                Self::new_hardware_device()?
-            };
-            Ok(Host { device })
-        }
-    }
-
-    fn new_hardware_device() -> Result<ID3D12Device, String> {
-        let spec = std::env::var("VICTORY_D3D12_ADAPTER")
-            .ok()
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty());
-        // SAFETY: plain DXGI adapter enumeration and D3D12CreateDevice calls.
-        unsafe {
-            if let Some(spec) = spec {
-                let factory: IDXGIFactory4 =
-                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                let mut adapters = Vec::new();
-                let mut names = Vec::new();
-                for i in 0.. {
-                    let Ok(adapter) = factory.EnumAdapters1(i) else {
-                        break;
-                    };
-                    let name = adapter
-                        .GetDesc1()
-                        .map(|d| adapter_name(&d))
-                        .unwrap_or_default();
-                    adapters.push(adapter);
-                    names.push(name);
-                }
-                let Some(chosen) = match_adapter(&spec, &names) else {
-                    return Err(format!(
-                        "VICTORY_D3D12_ADAPTER={spec:?} matched no adapter (available: {})",
-                        names.join(", ")
-                    ));
-                };
-                if adapters[chosen]
-                    .GetDesc1()
-                    .is_ok_and(|desc| is_software_adapter(&desc))
-                {
-                    return Err("the selected adapter is the software adapter".to_owned());
-                }
-                let mut device: Option<ID3D12Device> = None;
-                D3D12CreateDevice(&adapters[chosen], D3D_FEATURE_LEVEL_12_0, &mut device)
-                    .map_err(err)?;
-                let device = device.ok_or("no device")?;
-                check_sm66(&device)?;
-                return Ok(device);
-            }
-            if let Ok(factory6) = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0))
-            {
-                let mut last_err: Option<String> = None;
-                for i in 0.. {
-                    let Ok(adapter) = factory6.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
-                        i,
-                        DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-                    ) else {
-                        break;
-                    };
-                    if adapter
-                        .GetDesc1()
-                        .is_ok_and(|desc| is_software_adapter(&desc))
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                // A machine without a graphics card gives the software
+                // adapter as its default device (a hosted test runner,
+                // whose first adapter is a display stub that cannot make a
+                // device): that is no hardware device, and the tests that
+                // ask for one skip it, as they do where there is none.
+                if let Some(made) = &device {
+                    let factory: IDXGIFactory4 =
+                        CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+                    if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
+                        && let Ok(desc) = adapter.GetDesc1()
+                        && (desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
                     {
-                        continue;
+                        return Err("the default device is the software adapter".to_owned());
                     }
-                    let mut device: Option<ID3D12Device> = None;
-                    if let Err(e) =
-                        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
-                    {
-                        last_err = Some(err(e));
-                        continue;
-                    }
-                    let Some(device) = device else {
-                        continue;
-                    };
-                    match check_sm66(&device) {
-                        Ok(()) => return Ok(device),
-                        Err(e) => last_err = Some(e),
-                    }
-                }
-                if let Some(e) = last_err {
-                    return Err(e);
-                }
-            }
-            let mut device: Option<ID3D12Device> = None;
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            // A machine without a graphics card gives the software
-            // adapter as its default device (a hosted test runner,
-            // whose first adapter is a display stub that cannot make a
-            // device): that is no hardware device, and the tests that
-            // ask for one skip it, as they do where there is none.
-            if let Some(made) = &device {
-                let factory: IDXGIFactory4 =
-                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                if let Ok(adapter) =
-                    factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
-                    && let Ok(desc) = adapter.GetDesc1()
-                    && is_software_adapter(&desc)
-                {
-                    return Err("the default device is the software adapter".to_owned());
                 }
             }
             let device = device.ok_or("no device")?;
-            check_sm66(&device)?;
-            Ok(device)
+            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+                HighestShaderModel: D3D_SHADER_MODEL_6_6,
+            };
+            device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_SHADER_MODEL,
+                    (&raw mut sm).cast(),
+                    size_of_val(&sm) as u32,
+                )
+                .map_err(err)?;
+            if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+                return Err(format!(
+                    "the device supports SM {:#x} only",
+                    sm.HighestShaderModel.0
+                ));
+            }
+            Ok(Host { device })
         }
     }
 
@@ -726,7 +600,6 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
         root_indexed_views: Vec::new(),
-        half_views: Vec::new(),
     }
 }
 
@@ -1106,7 +979,6 @@ fn transition(
 
 /// A view in the heap for [`Host::dispatch`].
 #[cfg(test)]
-#[derive(Clone, Copy)]
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
@@ -1120,9 +992,6 @@ pub enum View<'a> {
     UintTextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
-    /// The same buffer viewed as R16G16B16A16_UINT: what a translated
-    /// program that moves halves is shown ([`super::HostShader::half_views`]).
-    HalfUintUav(u32),
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
@@ -1355,18 +1224,12 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) | View::HalfUintUav(_) => {
+                    View::RawUav(_) | View::HalfUav(_) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
                                 2 * e,
                                 DXGI_FORMAT_R16G16B16A16_FLOAT,
-                                e,
-                                D3D12_BUFFER_UAV_FLAG_NONE,
-                            ),
-                            View::HalfUintUav(e) => (
-                                2 * e,
-                                DXGI_FORMAT_R16G16B16A16_UINT,
                                 e,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),
@@ -1586,26 +1449,5 @@ impl Host {
             drop(keep);
             Ok(out)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::match_adapter;
-
-    #[test]
-    fn adapter_selector_matches_index_or_substring() {
-        let names = vec![
-            "Intel(R) UHD Graphics".to_owned(),
-            "NVIDIA GeForce RTX 3050 6GB Laptop GPU".to_owned(),
-            "Microsoft Basic Render Driver".to_owned(),
-        ];
-        assert_eq!(match_adapter("0", &names), Some(0));
-        assert_eq!(match_adapter("1", &names), Some(1));
-        assert_eq!(match_adapter("3", &names), None);
-        assert_eq!(match_adapter("nvidia", &names), Some(1));
-        assert_eq!(match_adapter("UHD", &names), Some(0));
-        assert_eq!(match_adapter("radeon", &names), None);
-        assert_eq!(match_adapter("", &names), None);
     }
 }

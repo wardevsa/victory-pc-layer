@@ -3,38 +3,6 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
-// The DirectX 12 Agility SDK looks for these two symbols in the executable.
-// Exporting them makes the D3D12 runtime load `D3D12Core.dll` from the `D3D12`
-// folder beside the binary instead of the in-box copy, which is what lets the
-// title's root signatures work on Windows 10 at all: they carry
-// `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED |
-// ALLOW_INPUT_ASSEMBLER` (0xC01), and the 19041 runtime refuses the whole
-// root signature over the two `*_HEAP_DIRECTLY_INDEXED` bits, so every
-// pipeline fails to create and the title faults seconds in.
-//
-/// The version the runtime reads at load time; 614 selects Agility SDK 1.614.
-#[unsafe(no_mangle)]
-pub static D3D12SDKVersion: u32 = 614;
-
-/// The folder the runtime loads `D3D12Core.dll` from, relative to the
-/// executable. Written once by the runtime at load time; never read here.
-#[unsafe(no_mangle)]
-pub static mut D3D12SDKPath: *const i8 = c".\\D3D12\\".as_ptr();
-
-#[cfg(test)]
-mod agility_tests {
-    use std::ffi::CStr;
-
-    #[test]
-    fn agility_sdk_version_and_path_match_the_runtime_package() {
-        assert_eq!(super::D3D12SDKVersion, 614);
-
-        // SAFETY: the exported pointer refers to a static NUL-terminated string.
-        let path = unsafe { CStr::from_ptr(super::D3D12SDKPath) };
-        assert_eq!(path.to_bytes(), b".\\D3D12\\");
-    }
-}
-
 mod census;
 mod inspect;
 mod run;

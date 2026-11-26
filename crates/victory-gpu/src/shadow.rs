@@ -1942,23 +1942,8 @@ fn back_piece(
     if differs == 0 {
         return None;
     }
-    mask_runs(mask, runs);
-    Some((first, n))
-}
-
-/// The runs of `mask`'s non-zero bytes, as (offset, length), into `runs`;
-/// stretches of zero words are passed over a word at a time. Where a
-/// shader wrote here and there in a piece, most of its mask is zeros: the
-/// byte-by-byte search ran at 2-4 GB/s, this at 10-27 (`mask_runs_speed`),
-/// with the same runs (`word_search_finds_the_byte_runs`).
-fn mask_runs(mask: &[u8], runs: &mut Vec<(usize, usize)>) {
-    let n = mask.len();
-    let zero_word = |i: usize| i + 8 <= n && mask[i..i + 8] == [0; 8];
     let mut i = 0;
     while i < n {
-        while zero_word(i) {
-            i += 8;
-        }
         while i < n && mask[i] == 0 {
             i += 1;
         }
@@ -1970,6 +1955,7 @@ fn mask_runs(mask: &[u8], runs: &mut Vec<(usize, usize)>) {
             runs.push((start, i - start));
         }
     }
+    Some((first, n))
 }
 
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
@@ -2841,19 +2827,6 @@ impl Shadow {
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
-    }
-
-    /// As [`Shadow::refresh`], for several spans of one list: the spans are
-    /// clamped as `refresh` clamps them, and all their steps go in under one
-    /// lock of the list (`HostList::defer_refreshes`).
-    pub(crate) fn refresh_many<'a>(
-        list: &HostList,
-        spans: impl IntoIterator<Item = (&'a Arc<Shadow>, u64, u64)>,
-    ) {
-        list.defer_refreshes(spans.into_iter().map(|(shadow, address, len)| {
-            let len = len.min(shadow.start + shadow.len - address);
-            (shadow, address as usize, len as usize)
-        }));
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
@@ -4169,24 +4142,15 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-///
-/// Read most of the time (every ask, from every recording thread, finds its
-/// copy here); written only when a buffer is registered or released, and
-/// when a copy is made on first use, so the asks share the read lock.
-static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> =
-    std::sync::RwLock::new(BTreeMap::new());
+static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
 
-fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.read().unwrap_or_else(|e| e.into_inner())
-}
-
-fn buffers_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    let mut map = buffers_write();
+    let mut map = buffers();
     map.insert(
         (start, resource),
         Entry {
@@ -4202,7 +4166,7 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    let mut map = buffers_write();
+    let mut map = buffers();
     tables_changed();
     map.remove(&(start, resource));
 }
@@ -4211,7 +4175,7 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers_read()
+    buffers()
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
@@ -4240,7 +4204,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     }
     {
         // As `lookup` finds a buffer: among the 256 that start below.
-        let mut map = buffers_write();
+        let mut map = buffers();
         let placed = |entry: &Entry| entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some());
         if map.range(..(end, 0)).rev().take(256).any(|(_, entry)| placed(entry)) {
             tables_changed();
@@ -4262,7 +4226,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// bytes, false) and the windows outside buffers that have a copy (start,
 /// bytes, true).
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
-    let mut spans: Vec<(u64, u64, bool)> = buffers_read().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
+    let mut spans: Vec<(u64, u64, bool)> = buffers().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
     let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
@@ -4273,7 +4237,7 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// lets an ask make a new copy in the PC's memory the card shares).
 pub(crate) fn find_existing(address: u64) -> Option<Arc<Shadow>> {
     {
-        let map = buffers_read();
+        let map = buffers();
         let held = map
             .range(..=(address, usize::MAX))
             .rev()
@@ -4353,7 +4317,7 @@ fn tables_changed() {
 
 #[cfg(test)]
 mod registration_tests {
-    use super::{TABLES_CHANGED, buffers_read, register, unregister};
+    use super::{TABLES_CHANGED, buffers, register, unregister};
     use std::sync::{Barrier, atomic::Ordering};
     use std::time::{Duration, Instant};
 
@@ -4366,7 +4330,7 @@ mod registration_tests {
         let slot = 0u64;
         let start = (&raw const slot) as u64;
         let resource = start as usize;
-        let table = buffers_read();
+        let table = buffers();
         let initial = TABLES_CHANGED.load(Ordering::Acquire);
         let ready = Barrier::new(2);
         let observed = std::thread::scope(|scope| {
@@ -4493,26 +4457,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
 
 fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
-    // Fast path: the buffer found has its copy already (all but the first
-    // ask for a buffer), so the ask only needs the read lock.
-    let needs_copy = {
-        let map = buffers_read();
-        match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
-            Some((_, entry)) => match &entry.shadow {
-                Some(shadow) => return Some(shadow.clone()),
-                // The entry exists but its copy is not made yet: drop the
-                // read lock and make it under the write lock.
-                None => true,
-            },
-            None => false,
-        }
-    };
-    if !needs_copy {
-        return loose(address, end, len <= 1, any);
-    }
-    // Slow path, under the write lock: the copy is made once. A second
-    // thread that raced here finds it made and only clones it.
-    let mut map = buffers_write();
+    let mut map = buffers();
     let key = map
         .range(..=(address, usize::MAX))
         .rev()
@@ -5101,7 +5046,7 @@ mod card_merge_tests {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers_read()
+    let mut all: Vec<(u64, u64, u64)> = buffers()
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
@@ -5128,91 +5073,4 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
-}
-
-#[cfg(test)]
-mod mask_runs_tests {
-    use super::mask_runs;
-
-    /// The byte-by-byte run search `mask_runs` replaces, kept as the
-    /// reference.
-    fn runs_bytes(mask: &[u8]) -> Vec<(usize, usize)> {
-        let (n, mut runs, mut i) = (mask.len(), Vec::new(), 0);
-        while i < n {
-            while i < n && mask[i] == 0 {
-                i += 1;
-            }
-            let start = i;
-            while i < n && mask[i] != 0 {
-                i += 1;
-            }
-            if i > start {
-                runs.push((start, i - start));
-            }
-        }
-        runs
-    }
-
-    /// A small deterministic generator (xorshift).
-    fn next(state: &mut u64) -> u64 {
-        *state ^= *state << 13;
-        *state ^= *state >> 7;
-        *state ^= *state << 17;
-        *state
-    }
-
-    /// Masks of every length up to 40 and some long ones, dense, sparse and
-    /// in between, runs touching word edges and the end: the same runs as
-    /// the byte-by-byte search.
-    #[test]
-    fn word_search_finds_the_byte_runs() {
-        let mut state = 0x2545_f491_4f6c_dd1d;
-        let lens: Vec<usize> = (0..=40).chain([63, 64, 65, 4095, 4096, 65536]).collect();
-        for &len in &lens {
-            for density in [1u64, 2, 7, 64, 4096] {
-                for _ in 0..50 {
-                    let mask: Vec<u8> = (0..len)
-                        .map(|_| {
-                            if next(&mut state).is_multiple_of(density) {
-                                (next(&mut state) as u8) | 1
-                            } else {
-                                0
-                            }
-                        })
-                        .collect();
-                    let mut runs = Vec::new();
-                    mask_runs(&mask, &mut runs);
-                    assert_eq!(runs, runs_bytes(&mask), "length {len}, density {density}");
-                }
-            }
-        }
-    }
-
-    /// `cargo test --release -p victory-gpu --lib mask_runs_speed -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn mask_runs_speed() {
-        const N: usize = 64 << 10;
-        for (name, every) in [
-            ("all bytes written", 1usize),
-            ("every 16th dword", 64),
-            ("1 byte per 4 KiB", 4096),
-        ] {
-            let mask: Vec<u8> = (0..N).map(|i| u8::from(i.is_multiple_of(every))).collect();
-            let time = |f: &dyn Fn(&[u8]) -> usize| {
-                let start = std::time::Instant::now();
-                for _ in 0..4000 {
-                    std::hint::black_box(f(std::hint::black_box(&mask)));
-                }
-                (4000 * N) as f64 / start.elapsed().as_secs_f64() / 1e9
-            };
-            let bytes = time(&|m| runs_bytes(m).len());
-            let words = time(&|m| {
-                let mut r = Vec::new();
-                mask_runs(m, &mut r);
-                r.len()
-            });
-            eprintln!("{name}: byte by byte {bytes:.2} GB/s, by words {words:.2} GB/s");
-        }
-    }
 }

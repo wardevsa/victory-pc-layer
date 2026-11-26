@@ -3,9 +3,8 @@
 //! dispatched) on the host GPU with the same inputs.
 //!
 //! Needs `VICTORY_CONSOLE_DXC` (the console SDK's `dxc.exe`) and a PC
-//! `dxc.exe` (`VICTORY_PC_DXC`, then the newest Windows SDK's, then the
-//! sibling of `VICTORY_DXIL` for standalone DXC). Skipped without both
-//! compilers. Set `VICTORY_WARP=1` to draw on WARP.
+//! `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's); skipped
+//! without them. Set `VICTORY_WARP=1` to draw on WARP.
 
 use std::path::{Path, PathBuf};
 
@@ -653,58 +652,12 @@ const MS_CASES: &[(&str, u32, &str)] = &[
 ];
 
 fn tools() -> Option<(PathBuf, PathBuf)> {
-    tools_in(Path::new(super::validator::SDK_BIN), |key| {
-        std::env::var_os(key).map(PathBuf::from)
-    })
-}
-
-fn tools_in(kits: &Path, env_path: impl Fn(&str) -> Option<PathBuf>) -> Option<(PathBuf, PathBuf)> {
-    let console = env_path("VICTORY_CONSOLE_DXC")?;
-    let pc = env_path("VICTORY_PC_DXC")
-        .or_else(|| super::validator::sdk_tool(kits, "dxc.exe"))
-        .or_else(|| env_path("VICTORY_DXIL").map(|dll| dll.with_file_name("dxc.exe")))?;
+    let console = PathBuf::from(std::env::var_os("VICTORY_CONSOLE_DXC")?);
+    let pc = match std::env::var_os("VICTORY_PC_DXC") {
+        Some(p) => PathBuf::from(p),
+        None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
+    };
     (console.exists() && pc.exists()).then_some((console, pc))
-}
-
-#[test]
-fn pc_compiler_prefers_sdk_and_supports_standalone_dxc() {
-    let pid = std::process::id();
-    let mut attempt = 0u32;
-    let dir = loop {
-        let path = std::env::temp_dir().join(format!("victory-pc-compiler-{pid}-{attempt}"));
-        match std::fs::create_dir(&path) {
-            Ok(()) => break path,
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => attempt += 1,
-            Err(err) => panic!("could not create {}: {err}", path.display()),
-        }
-    };
-    let kits = dir.join("bin");
-    let sdk = kits.join("10.0.26100.0").join("x64");
-    std::fs::create_dir_all(&sdk).unwrap();
-    let console = dir.join("console.exe");
-    let validator = dir.join("dxil.dll");
-    let explicit_pc = dir.join("dxc.exe");
-    let sdk_pc = sdk.join("dxc.exe");
-    for path in [&console, &validator, &explicit_pc, &sdk_pc] {
-        std::fs::write(path, []).unwrap();
-    }
-    let locate = |pc: Option<&PathBuf>| {
-        tools_in(&kits, |key| match key {
-            "VICTORY_CONSOLE_DXC" => Some(console.clone()),
-            "VICTORY_DXIL" => Some(validator.clone()),
-            "VICTORY_PC_DXC" => pc.cloned(),
-            _ => None,
-        })
-    };
-    assert_eq!(locate(None), Some((console.clone(), sdk_pc.clone())));
-    assert_eq!(locate(Some(&dir.join("missing.exe"))), None);
-    assert_eq!(
-        locate(Some(&explicit_pc)),
-        Some((console.clone(), explicit_pc.clone()))
-    );
-    std::fs::remove_file(sdk_pc).unwrap();
-    assert_eq!(locate(None), Some((console, explicit_pc)));
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 fn compile(dxc: &Path, dir: &Path, src: &str, entry: &str, profile: &str) -> Vec<u8> {
@@ -1272,24 +1225,7 @@ fn translated_compute_matches_pc() {
             };
             roots.push((1 + n as u32, Root::View { srv, data }));
         }
-        // A buffer of halves the translated program moves as unsigned
-        // integers is shown to it as its unsigned twin, as the host does
-        // (`HostShader::half_views`); the PC program keeps the float view.
-        let twins: Vec<View> = views
-            .iter()
-            .map(|&v| match v {
-                View::HalfUav(n) if !cs_c.half_views.is_empty() => View::HalfUintUav(n),
-                v => v,
-            })
-            .collect();
-        let ours = host.dispatch(
-            &root_t,
-            &pso_t,
-            &Dispatch {
-                views: &twins,
-                ..dispatch(roots)
-            },
-        );
+        let ours = host.dispatch(&root_t, &pso_t, &dispatch(roots));
         if name.starts_with("terminates") {
             match ours {
                 Ok(_) => eprintln!("{name}: finished"),

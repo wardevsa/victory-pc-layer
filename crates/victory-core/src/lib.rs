@@ -4,12 +4,8 @@
 //! * [`policy`]: the runtime half of rule #1, refusing to write
 //!   game-derived data into the source tree.
 //! * [`logging`]: one tracing setup for all binaries.
-//! * [`game_clock`]: the title's clock, held to a steady step a frame.
 
 pub mod config;
-#[cfg(windows)]
-pub mod fence_watch;
-pub mod game_clock;
 pub mod logging;
 pub mod policy;
 

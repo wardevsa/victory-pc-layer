@@ -60,68 +60,13 @@ enum Held {
     Running,
     /// With [`present_behind`]: the title's present of a frame, due after
     /// what the queue holds before it: the host texture shown, the state
-    /// the title's lists leave it in, the frame's number, and the second
-    /// plane drawn over it, if the present has one (its host texture and
-    /// the state the lists leave that in).
-    Present(
-        windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-        u32,
-        u64,
-        Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
-    ),
+    /// the title's lists leave it in, and the frame's number.
+    Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64),
 }
 
 /// Presents that are in a queue's line and have not run ([`Held::Present`]).
 #[cfg(windows)]
 static PRESENTS_HELD: AtomicU64 = AtomicU64::new(0);
-
-/// Presents that waited [`held_present_ran`]'s whole wait in vain.
-#[cfg(windows)]
-static PRESENT_WAITS_OUT: AtomicU64 = AtomicU64::new(0);
-
-/// Told when a held present has run ([`PRESENTS_HELD`] went down).
-#[cfg(windows)]
-static PRESENT_RAN: (std::sync::Mutex<()>, std::sync::Condvar) = (std::sync::Mutex::new(()), std::sync::Condvar::new());
-
-/// With [`present_behind`]: whether the present before this one has run,
-/// waiting for it up to `VICTORY_ASYNC_PRESENT_WAIT_MS` (250 by default; 0:
-/// not waited for).
-///
-/// A present that found the one before it still in the line ran the old
-/// way: the title's thread ran the queues' lines itself, holding the
-/// releaser's lock, while our thread stood waiting for that lock, and the
-/// frame after it began with an empty line. So only every other frame went
-/// behind (the frame log's pairs of a 3 ms and a 290 ms frame; the sampling
-/// profiler, 25 November: our submitting thread 46 ms a frame waiting for
-/// that lock, 27 ms with nothing to do). The title waits instead until our
-/// thread has shown the frame before, as the console's flip queue holds a
-/// title one frame ahead, and its present then goes behind too. Past the
-/// wait (a line that stands at a fence or a memory value only the title
-/// will meet) it runs the old way, which forces the line.
-#[cfg(windows)]
-fn held_present_ran() -> bool {
-    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let ms = *MS.get_or_init(|| {
-        std::env::var("VICTORY_ASYNC_PRESENT_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
-    });
-    if PRESENTS_HELD.load(Ordering::Relaxed) == 0 {
-        return true;
-    }
-    if ms == 0 {
-        return false;
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
-    let mut ran = lock(&PRESENT_RAN.0);
-    while PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            PRESENT_WAITS_OUT.fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-        ran = PRESENT_RAN.1.wait_timeout(ran, left).unwrap_or_else(|e| e.into_inner()).0;
-    }
-    true
-}
 
 /// Whether a present goes behind the queue's line and returns at once
 /// (`VICTORY_ASYNC_PRESENT=1`; needs [`behind`] and presents that do not
@@ -191,10 +136,11 @@ fn present_behind() -> bool {
 /// the queue `this` holds. False if it has to run the old way.
 #[cfg(windows)]
 fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool {
-    // A second plane (the interface, in the title's Series S mode) goes
-    // with the present and is drawn over the first when it runs
-    // (`crate::over`), as in place. More than two: run in place.
-    if this.is_null() || planes == 0 || planes > 2 || !held_present_ran() {
+    if this.is_null() || planes == 0 || PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
+        return false;
+    }
+    // Two planes are blended (`crate::compose`) by the present in line.
+    if planes > 1 && crate::compose::on() {
         return false;
     }
     let frame = FRAMES.load(Ordering::Relaxed) + 1;
@@ -221,19 +167,9 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
     crate::resource::host_transition(resource, state);
     let texture = texture.clone();
-    // The second plane, looked at the same way: the state the lists leave
-    // it in is the one the present's own list finds it in behind them.
-    const READABLE: u32 = 0x80;
-    // SAFETY: the title passes `planes` plane descriptions.
-    let over = unsafe { second_plane(planes, plane_parameters, resource) }.and_then(|r| {
-        let plane = crate::resource::host_resource(r)?.clone();
-        let was = crate::resource::host_transition(r, READABLE).map_or(READABLE, |(_, before)| before);
-        crate::resource::host_transition(r, was);
-        Some((plane, was))
-    });
     let sent = hold(this, || {
         PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
-        Held::Present(texture, state, frame, over)
+        Held::Present(texture, state, frame)
     });
     if sent {
         PRESENTS_BEHIND.fetch_add(1, Ordering::Relaxed);
@@ -959,11 +895,10 @@ fn release_held_now(all: bool) {
                             }
                         }
                     }
-                    Held::Present(texture, state, frame, over) => {
+                    Held::Present(texture, state, frame) => {
                         let show = || {
                             if let Some(host) = crate::host::host() {
-                                let over = over.as_ref().map(|(plane, was)| (plane, *was));
-                                let _ = host.present(&texture, state, frame, over);
+                                let _ = host.present(&texture, state, None, frame);
                             }
                         };
                         if all {
@@ -980,8 +915,6 @@ fn release_held_now(all: bool) {
                             }
                         }
                         PRESENTS_HELD.fetch_sub(1, Ordering::Relaxed);
-                        let _told = lock(&PRESENT_RAN.0);
-                        PRESENT_RAN.1.notify_all();
                     }
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
@@ -1194,6 +1127,9 @@ pub(crate) struct Plane {
     count: u32,
     resources: *const This,
 }
+/// Bytes from one present plane's description to the next (as the Series
+/// S profile's two planes lie).
+const PLANE_STRIDE: usize = 72;
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -1371,44 +1307,10 @@ extern "system" fn present(
     {
         crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);
         crate::framelog::frame();
-        game_clock_frame();
-        crate::watchprog::sample();
         #[cfg(feature = "diagnostics")]
         crate::fence::pace::frame();
     }
     hr
-}
-
-/// A present ends a frame of the title's clock (`VICTORY_GAME_STEP_MS`):
-/// every five seconds of the wall, what its frames counted for the title
-/// and on the wall.
-#[cfg(windows)]
-fn game_clock_frame() {
-    use std::sync::atomic::AtomicI64;
-    static SUMS: [AtomicI64; 3] = [const { AtomicI64::new(0) }; 3];
-    let Some(step) = victory_core::game_clock::frame() else {
-        return;
-    };
-    if step.wall == 0 {
-        return;
-    }
-    SUMS[0].fetch_add(1, Ordering::Relaxed);
-    SUMS[1].fetch_add(step.wall, Ordering::Relaxed);
-    let title = SUMS[2].fetch_add(step.title, Ordering::Relaxed) + step.title;
-    let wall = SUMS[1].load(Ordering::Relaxed);
-    let per_ms = victory_core::game_clock::frequency() as f64 / 1000.0;
-    if (wall as f64) < 5000.0 * per_ms {
-        return;
-    }
-    let frames = SUMS[0].swap(0, Ordering::Relaxed).max(1) as f64;
-    SUMS[1].store(0, Ordering::Relaxed);
-    SUMS[2].store(0, Ordering::Relaxed);
-    tracing::info!(
-        "game clock: {:.1} ms a frame for the title, {:.1} ms on the wall: the game runs at {:.0} % of real time (VICTORY_GAME_STEP_MS)",
-        title as f64 / per_ms / frames,
-        wall as f64 / per_ms / frames,
-        100.0 * title as f64 / wall.max(1) as f64
-    );
 }
 
 fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESULT {
@@ -1456,7 +1358,6 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         tracing::info!(
             frame,
             behind = PRESENTS_BEHIND.load(Ordering::Relaxed),
-            waited_in_vain = PRESENT_WAITS_OUT.load(Ordering::Relaxed),
             "presents sent behind their queue's line so far (VICTORY_ASYNC_PRESENT=1); the others ran the old way"
         );
     }
@@ -1510,24 +1411,34 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
+        const PIXEL_SHADER_RESOURCE: u32 = 0x80;
+        // The second plane (the interface, with the Series S profile),
+        // blended over the first (`crate::compose`).
+        let interface = (planes > 1 && crate::compose::on())
+            // SAFETY: the title passes `planes` descriptions of PLANE_STRIDE bytes.
+            .then(|| unsafe { plane_parameters.cast::<u8>().add(PLANE_STRIDE).cast::<Plane>().as_ref() })
+            .flatten()
+            .filter(|p| p.count > 0 && !p.resources.is_null())
+            // SAFETY: the plane lists `count` resources.
+            .map(|p| unsafe { *p.resources })
+            .filter(|&r| r != resource)
+            .and_then(|r| crate::resource::host_resource(r).map(|t| (r, t)));
+        let interface_state = interface.map(|(r, _)| {
+            crate::resource::host_transition(r, PIXEL_SHADER_RESOURCE)
+                .map_or(PIXEL_SHADER_RESOURCE, |(_, before)| before)
+        });
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        // A second plane (the title's interface over its game image, in
-        // its Series S mode) is drawn over the first: `crate::over`. Each
-        // plane's description is 0x48 bytes and starts as the first does.
-        const READABLE: u32 = 0x80;
-        // SAFETY: the title passes `planes` plane descriptions.
-        let second = unsafe { second_plane(planes, plane_parameters, resource) }
-            .and_then(|r| Some((r, crate::resource::host_resource(r)?)));
-        let over = second.map(|(r, t)| {
-            let was = crate::resource::host_transition(r, READABLE).map_or(READABLE, |(_, before)| before);
-            (r, t, was)
-        });
-        let shown = host.present(texture, state, frame, over.map(|(_, t, was)| (t, was)));
-        if let Some((r, _, was)) = over {
-            crate::resource::host_transition(r, was);
-        }
+        let shown = host.present(
+            texture,
+            state,
+            interface.zip(interface_state).map(|((_, t), s)| (t, s)),
+            frame,
+        );
         crate::resource::host_transition(resource, state);
+        if let Some(((r, _), s)) = interface.zip(interface_state) {
+            crate::resource::host_transition(r, s);
+        }
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
@@ -1537,74 +1448,6 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     let _ = (planes, plane_parameters);
     S_OK
 }
-/// The bytes from one plane's description to the next in a present.
-const PLANE_STRIDE: usize = 0x48;
-
-/// The first resource of a present's second plane, if it has one that is not
-/// the first plane's (`first`): what is drawn over the first.
-///
-/// # Safety
-/// `parameters` is null or points at `planes` plane descriptions,
-/// [`PLANE_STRIDE`] bytes apart, each listing `count` resources.
-unsafe fn second_plane(planes: u32, parameters: *const Plane, first: This) -> Option<This> {
-    if planes < 2 || parameters.is_null() {
-        return None;
-    }
-    // SAFETY: the caller's: a second description follows the first.
-    let plane = unsafe { &*parameters.cast::<u8>().add(PLANE_STRIDE).cast::<Plane>() };
-    if plane.count == 0 || plane.resources.is_null() {
-        return None;
-    }
-    // SAFETY: the caller's: the plane lists `count` resources.
-    let resource = unsafe { *plane.resources };
-    (!resource.is_null() && resource != first).then_some(resource)
-}
-
-#[cfg(test)]
-mod plane_tests {
-    use super::*;
-
-    /// Two plane descriptions as a title lays them out, [`PLANE_STRIDE`]
-    /// bytes apart, the second naming `count` resources at `resources`.
-    fn two(count: u32, resources: *const This) -> [u64; 2 * PLANE_STRIDE / 8] {
-        let mut words = [0u64; 2 * PLANE_STRIDE / 8];
-        let second = PLANE_STRIDE / 8;
-        words[second] = 7; // frame token
-        words[second + 1] = u64::from(count);
-        words[second + 2] = resources as u64;
-        words
-    }
-
-    #[test]
-    fn the_second_plane_is_chosen_only_when_it_names_another_resource() {
-        let (a, b) = (0x1000 as This, 0x2000 as This);
-        let other = [b];
-        let same = [a];
-        let none = [std::ptr::null::<crate::object::Object>()];
-        // SAFETY: each description is a whole local array laid out as the
-        // title's; resource lists are local arrays of one.
-        unsafe {
-            let with_other = two(1, other.as_ptr());
-            let p = with_other.as_ptr().cast::<Plane>();
-            assert_eq!(second_plane(2, p, a), Some(b));
-            // One plane, or no descriptions at all: nothing over the first.
-            assert_eq!(second_plane(1, p, a), None);
-            assert_eq!(second_plane(0, p, a), None);
-            assert_eq!(second_plane(2, std::ptr::null(), a), None);
-            // The same resource twice is not drawn over itself.
-            let with_same = two(1, same.as_ptr());
-            assert_eq!(second_plane(2, with_same.as_ptr().cast(), a), None);
-            // An empty plane, a plane without a list, a null resource.
-            let empty = two(0, other.as_ptr());
-            assert_eq!(second_plane(2, empty.as_ptr().cast(), a), None);
-            let unlisted = two(1, std::ptr::null());
-            assert_eq!(second_plane(2, unlisted.as_ptr().cast(), a), None);
-            let with_null = two(1, none.as_ptr());
-            assert_eq!(second_plane(2, with_null.as_ptr().cast(), a), None);
-        }
-    }
-}
-
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
