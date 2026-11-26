@@ -205,17 +205,26 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, wave: Option<
                                 counts[3].fetch_add(1, Ordering::Relaxed);
                                 break;
                             }
-                            if (!all && !wanted.contains(&hash)) || !lock(&done).insert(hash) {
+                            if (!all && !wanted.contains(&hash)) || !lock(&done).insert(hash.clone()) {
                                 continue;
                             }
                             let n = counts[4].fetch_add(1, Ordering::Relaxed) + 1;
                             if n.is_multiple_of(1000) {
                                 println!("warm-up      {n} shaders so far, {:.0} s", began.elapsed().as_secs_f64());
                             }
-                            let which = match victory_hle::modules::d3d12x::warm_shader(&bytes) {
-                                Ok(true) => 0,
-                                Ok(false) => 1,
-                                Err(_) => 2,
+                            // A translator panic on one shader costs that
+                            // shader alone, not the rest of the warm-up.
+                            let warmed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                victory_hle::modules::d3d12x::warm_shader(&bytes)
+                            }));
+                            let which = match warmed {
+                                Ok(Ok(true)) => 0,
+                                Ok(Ok(false)) => 1,
+                                Ok(Err(_)) => 2,
+                                Err(_) => {
+                                    println!("warm-up      {hash}: the translator panicked (left out)");
+                                    2
+                                }
                             };
                             counts[which].fetch_add(1, Ordering::Relaxed);
                         }
