@@ -36,6 +36,8 @@
 #                                 interiors readable; 0.3 darker, 1 brighter)
 #         .\jugar.ps1 -Texturas baja -VentanasMB 1536  (ray-tracing copies in
 #                                 the card's memory instead of over the bus)
+#         .\jugar.ps1 -SeriesS   (the Series S profile: lower resolution and
+#                                 settings, less memory; its own upscaler)
 #         .\jugar.ps1 -Escala 0.7  (the title renders at 70% of the output
 #                                 size and scales up: faster, softer)
 #         .\jugar.ps1 -CopiasRT 1023  (copies of memory the ray tracing
@@ -65,6 +67,7 @@ param(
     [string]$Escala = "",
     [switch]$ConWatchdog,
     [switch]$ConNan,
+    [switch]$SeriesS,
     [int]$CopiasRT = 2047,
     [int]$CardMB = 1024,
     [ValidateSet("alta", "media", "baja")]
@@ -295,4 +298,13 @@ if ($Diag) {
         $env:VICTORY_D3D12_DRED = "light"
     }
 }
-& $exe run $Game --execute 2>&1 | Tee-Object -FilePath $log
+# -SeriesS: the Series S profile. The title renders less (its own lower
+# resolution and settings) and is given less memory (7.8 GB against the
+# Series X's 13.5), what this PC runs short of. It upscales with AMD's
+# FidelityFX there, whose programs do not translate (the world black): the
+# title is patched to use its own upscaler (VICTORY_OWN_UPSCALER, hooks.rs,
+# as victory-fork pull request #798 does it). Its interface is a second
+# present plane, blended over the picture (pull request #1081, merged here).
+$console = if ($SeriesS) { "series-s" } else { "series-x" }
+if ($SeriesS) { $env:VICTORY_OWN_UPSCALER = "1" } else { Remove-Item Env:VICTORY_OWN_UPSCALER -ErrorAction SilentlyContinue }
+& $exe run $Game --execute --console $console 2>&1 | Tee-Object -FilePath $log

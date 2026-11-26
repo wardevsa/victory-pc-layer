@@ -93,6 +93,16 @@ This tree follows victory-fork's `main` (merged up to `a20809de`,
   structures' pages on the card. **With these the cell and the corridors
   got their ray-traced light for the first time on this NVIDIA card
   (2026-11-26).**
+- **The Series S profile** (`jugar.ps1 -SeriesS`): the title renders less
+  (its own lower resolution and settings) and is given less memory (7.8 GB
+  against the Series X's 13.5), what an 8 GB card and 32 GB of RAM run short
+  of. Its world upscale goes through AMD's FidelityFX, whose programs do not
+  translate (the world black): the launcher sets `VICTORY_OWN_UPSCALER`, so
+  the title uses its own (as victory-fork pull request #798 does). Its
+  interface is a second present plane, blended over the picture by
+  victory-fork pull request
+  [#1081](https://github.com/fxceless/victory-fork/pull/1081) (KyleS98,
+  open there, merged here), which fixes the black boot and missing prompts.
 - **From Ranxanat0r's [cool_fox-dlss](https://github.com/Ranxanat0r/cool_fox-dlss-ranxanat0r)**
   (commits `5fd03772` and `a51ae6df` by Humb8l, carried there from
   [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA),
