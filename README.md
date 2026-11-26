@@ -80,6 +80,15 @@ This tree follows victory-fork's `main` (merged up to `32b31f7`,
     and buffer copies sized as soldsawn's
     [victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb) sizes
     them for an 8 GB card.
+- **List upload memory where shaders reach it by address** (`upload.rs`,
+  from avatarmanz's VIctory-7900XTX, commit `b558934`; upstream VIctory
+  places it likewise in `0f63757`): the memory the title's lists hand out
+  (`allocate_upload`), where the structure builder's instance descriptions
+  lie, came from the process heap above 2^40, past the 40 bits a translated
+  shader's address has: the builder read zeros there, and 116 of 127 pages
+  its shaders missed were "not the title's memory" (2026-11-25). It now
+  comes in 64 KiB blocks of arenas in [4 GiB, 2^37), registered as title
+  buffers; `VICTORY_UPLOAD_LOW=0` goes back to the heap.
 - From soldsawn's [victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb):
   - the performance overlay (`overlay.rs`, `pixels.rs`): fps, frame time,
     30-second high, low and average, draws, CPU, GPU, RAM and video memory
