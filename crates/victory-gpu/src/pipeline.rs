@@ -301,8 +301,26 @@ pub(crate) fn root_views_quarantined() -> bool {
     quarantine_level() == 1
 }
 
+/// With `VICTORY_BVH_QUARANTINE=2`, the most bytes of a root view that a
+/// builder stage or a shader reading title memory by address has copied
+/// back into title memory (`VICTORY_BVH_BACK_KB`, 64 KiB); larger views stay
+/// in the host's copies. Every root view coming back crashed the title 17 s
+/// after the builder started (a read of an unmapped address, 2026-11-25):
+/// the structures it stores through large views came back while those
+/// through title memory by address did not. `u64::MAX` when not limited.
+#[cfg(windows)]
+pub(crate) fn root_view_back_limit(this: This, by_address: bool) -> u64 {
+    if quarantine_level() != 2 || !(by_address || is_builder(this)) {
+        return u64::MAX;
+    }
+    static KB: OnceLock<u64> = OnceLock::new();
+    *KB.get_or_init(|| {
+        std::env::var("VICTORY_BVH_BACK_KB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64)
+    }) << 10
+}
+
 /// `VICTORY_BVH_QUARANTINE`: 0 off, 1 everything, 2 title memory by
-/// address only.
+/// address and large root views kept ([`root_view_back_limit`]).
 #[cfg(windows)]
 fn quarantine_level() -> u8 {
     static LEVEL: OnceLock<u8> = OnceLock::new();

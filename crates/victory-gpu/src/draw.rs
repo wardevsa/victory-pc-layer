@@ -1220,6 +1220,7 @@ impl State {
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             let memory_writes = stored && !(by_address && crate::pipeline::memory_quarantined());
             let writes = if crate::pipeline::root_views_quarantined() { memory_writes } else { stored };
+            let back_limit = crate::pipeline::root_view_back_limit(self.pipeline as This, by_address);
             // Title memory by address: what the shader finds it by.
             let memory = if by_address {
                 let Some(ready) = self.memory_ready(list, compute, memory_writes) else {
@@ -1357,7 +1358,7 @@ impl State {
                         None
                     }
                 };
-                if !self.root_uav(list, address, param, compute, writes) {
+                if !self.root_uav(list, address, param, compute, writes, back_limit) {
                     return false;
                 }
             }
@@ -1386,6 +1387,7 @@ impl State {
         param: u32,
         compute: bool,
         writes: bool,
+        back_limit: u64,
     ) -> bool {
         const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
         static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1408,7 +1410,9 @@ impl State {
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
-            if writes {
+            // Only small views come back from a quarantined shader
+            // (`pipeline::root_view_back_limit`).
+            if writes && len <= back_limit {
                 s.gpu_writes(list, a, len);
             }
         };

@@ -55,7 +55,9 @@ This tree follows victory-fork's `main` (merged up to `32b31f7`,
     DXIL validator and are made on a 32-lane card. Its stores are kept out of
     title memory by default, but only those through title memory by address
     (the structures themselves): what the builder writes into the title
-    buffers it was given as root views (sizes, counters) comes back
+    buffers it was given as root views (sizes, counters) comes back when
+    the view is small (64 KiB or less, `VICTORY_BVH_BACK_KB`; with every
+    view coming back the title crashed 17 s after the builder started)
     (`VICTORY_BVH_QUARANTINE=2`, after avatarmanz's
     [VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX), whose
     builder keeps its stores on the card and lets only the small title
