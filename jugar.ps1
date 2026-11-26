@@ -123,6 +123,13 @@ if (-not $Fabrica -and -not $Rapido) {
     # without the wait (host.rs fill_is_titles; cool_fox measured two thirds
     # of that wait gone).
     $env:VICTORY_FILL_TITLE = "1"
+    # With that (09fab1c): 7-10 fps, settles down to 1 a frame; copying back
+    # was then the most, 81 ms a frame, 86 ms of the landing thread's time
+    # waiting for about 10 fetches of what shaders wrote (36 MB), each behind
+    # everything sent to the drawing queue meanwhile. On the card's copy
+    # queue a fetch runs as soon as its own flights are done (host.rs
+    # relay_copy; bytes the title sent later are left out of the merge).
+    $env:VICTORY_RELAY_COPY = "1"
     if ([Environment]::ProcessorCount -le 12) {
         # Helper pools sized for a 24-thread CPU share 6 cores with the title
         # here: fewer of each (Maykzera's victory-rtx3060, measured on a
