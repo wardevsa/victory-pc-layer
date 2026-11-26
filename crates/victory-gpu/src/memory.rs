@@ -269,6 +269,11 @@ impl Memory {
             self.refused.insert(page);
             return Mapped::Refused;
         }
+        // A new window's copy lives in the PC's memory the card shares: past
+        // the system's budget for it the card is lost (see `shared_full`).
+        if crate::shadow::find_existing(start).is_none() && shared_full() {
+            return Mapped::Full;
+        }
         // The copy a root view at that address would get; a buffer that
         // ends inside the page is passed over for what holds all of it.
         let whole = |s: &Arc<Shadow>| s.offset_in(start).is_some_and(|_| s.left(start) >= PAGE);
@@ -389,6 +394,47 @@ impl Memory {
         let _ = self.map(address);
         let _ = self.map((address & !(CELL - 1)) + CELL);
     }
+}
+
+/// Whether the PC's memory the card shares is used past the most new
+/// copies of title memory by address may take it to: that share of the
+/// system's budget for it (`VICTORY_SHARED_MOST`, in hundredths: 90). Asked
+/// of the system at most every 100 ms.
+///
+/// With the structures' pages kept and up to 16,383 copies, a timing run
+/// had 15,550 MB in use of a budget of 15,294 MB when the card was lost
+/// (0x887A0005, 2026-11-26), and another ended in the driver while a
+/// submission was prepared. The copies are made when a page is first asked
+/// for; past this share a new page is refused (read as zeros, its light
+/// missing) rather than the card lost.
+fn shared_full() -> bool {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static FULL: AtomicBool = AtomicBool::new(false);
+    let most = *MOST.get_or_init(|| {
+        std::env::var("VICTORY_SHARED_MOST").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&n| n > 0 && n <= 100).unwrap_or(90)
+    });
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let last = LAST.load(Ordering::Relaxed);
+    if now >= last + 100 && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        let full = host()
+            .and_then(|h| h.video_memory())
+            .is_some_and(|[_, _, budget, used]| budget > 0 && used > budget / 100 * most);
+        if full && !FULL.load(Ordering::Relaxed) {
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SAID.fetch_add(1, Ordering::Relaxed) < 20 {
+                tracing::warn!(
+                    most,
+                    "title memory by address: the PC's memory shared with the card is past that share of its budget: no new copies (VICTORY_SHARED_MOST)"
+                );
+            }
+        }
+        FULL.store(full, Ordering::Relaxed);
+    }
+    FULL.load(Ordering::Relaxed)
 }
 
 /// `VICTORY_BVH_KEEP=1` (with `VICTORY_BVH_QUARANTINE=2`): the copies of

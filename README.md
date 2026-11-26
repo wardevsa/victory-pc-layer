@@ -93,6 +93,21 @@ This tree follows victory-fork's `main` (merged up to `a183ea2`,
   structures' pages on the card. **With these the cell and the corridors
   got their ray-traced light for the first time on this NVIDIA card
   (2026-11-26).**
+- **Speed and stability after a timing run** (2026-11-26, RTX 2060 SUPER):
+  - **Hair strands left out** (`VICTORY_HAIR=1` keeps them): their
+    simulation took about 80 ms of the card's time a frame
+    (`CS_SolvePerVertConstraint` 52.9 ms in 549 dispatches), a quarter of
+    it. The programs that simulate and draw strands, by name, have no host
+    pipeline; characters keep their hair meshes. After Belobug's
+    VIctory-Belobug-AMD, which leaves them out the same way.
+  - **No new copies past 90% of the shared memory's budget**
+    (`VICTORY_SHARED_MOST`): two runs lost the card with 15,550 MB in use of
+    the 15,294 MB the system gives the card in the PC's memory. A page of
+    memory by address that would need a new copy then reads zeros instead.
+  - **The directory of memory by address on the card**
+    (`VICTORY_DIRECTORY_CARD=0` turns it off): each access by address looked
+    its page up over the bus; the card's copy takes the 4 KiB pieces that
+    changed. About 20 ms of the card's frame.
 - **List upload memory where shaders reach it by address** (`upload.rs`,
   from avatarmanz's VIctory-7900XTX, commit `b558934`; upstream VIctory
   places it likewise in `0f63757`): the memory the title's lists hand out

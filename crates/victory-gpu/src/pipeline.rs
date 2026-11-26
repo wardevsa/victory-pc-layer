@@ -81,6 +81,10 @@ pub(crate) struct Shader {
     /// ([`crate::ambient::REFLECTED`]).
     #[cfg(windows)]
     pub(crate) ends_reflections: bool,
+    /// It simulates or draws hair strands, which are left out
+    /// ([`hair_strands`]).
+    #[cfg(windows)]
+    hair: bool,
 }
 
 impl std::fmt::Debug for Shader {
@@ -145,6 +149,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 ends_reflections: bytes
                     .windows(crate::ambient::REFLECTED.len())
                     .any(|w| w == crate::ambient::REFLECTED),
+                #[cfg(windows)]
+                hair: hair_strands(bytes),
             })
         })
         .clone()
@@ -581,7 +587,59 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
     }
-    make::ready(&pipeline(this).host)
+    let p = pipeline(this);
+    // Hair strands are left out ([`hair_strands`]): no host pipeline, so
+    // every way of drawing or dispatching with it drops it.
+    if p.shaders.iter().any(|s| s.hair) {
+        return None;
+    }
+    make::ready(&p.host)
+}
+
+/// Whether a container's program is one of those that simulate and draw
+/// hair strands, by its name (from Belobug's VIctory-Belobug-AMD, commit
+/// 4f62c2a). They are left out unless `VICTORY_HAIR=1`: on this RTX 2060
+/// SUPER the strands' simulation alone took about 80 ms of the card's time a
+/// frame (`smh_sim_1:CS_SolvePerVertConstraint` 52.9 ms in 549 dispatches,
+/// the rest of `smh_sim` 27 ms; timing run of 2026-11-26), a quarter of the
+/// card's frame. The title's characters keep their hair meshes; the strands
+/// over them go. All of them together: their simulation left out alone,
+/// the programs that draw them draw lines all over the screen (Belobug).
+#[cfg(windows)]
+fn hair_strands(container: &[u8]) -> bool {
+    static RUN: OnceLock<bool> = OnceLock::new();
+    const NAMES: [&[u8]; 14] = [
+        b"InterpolateStrand",
+        b"HairStrand",
+        b"CS_VisHair",
+        b"PS_Smh",
+        b"CS_InitSimBuffer",
+        b"CS_PreSkinSim",
+        b"CS_SolvePer",
+        b"CS_WavePerSpline",
+        b"CS_EstimateStartPosition",
+        b"CS_CachePrev",
+        b"CS_RestoreSimVelocity",
+        b"CS_UpdatePosePosition",
+        b"CS_GenerateAccessories",
+        b"CSGenerateHair",
+    ];
+    if *RUN.get_or_init(|| std::env::var_os("VICTORY_HAIR").is_some_and(|v| v == "1")) {
+        return false;
+    }
+    const END: &[u8] = b"_Wrapped";
+    container
+        .windows(END.len())
+        .enumerate()
+        .filter(|(_, w)| *w == END)
+        .any(|(at, _)| {
+            let before = &container[at.saturating_sub(100)..at];
+            let name = before
+                .rsplit(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+                .next()
+                .unwrap_or_default();
+            NAMES.iter().any(|n| name.windows(n.len()).any(|w| w == *n))
+        })
 }
 
 /// Host pipelines queued and not made yet.
