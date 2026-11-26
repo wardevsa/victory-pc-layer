@@ -18,9 +18,6 @@
 #                                      constant level; 0.8 default)
 #         .\jugar.ps1 -Fabrica        (none of our speed switches: cool_fox's
 #                                      defaults alone, to compare)
-#         .\jugar.ps1 -Prueba         (the step being measured: the programs
-#                                      cool_fox 72944b1 added left out again;
-#                                      run -Prueba -Preparar first)
 #         .\jugar.ps1 -Diag           (the diagnostics build, target\diag: the
 #                                      same switches, and the log names what
 #                                      each wait for the card waited for;
@@ -46,7 +43,6 @@ param(
     [switch]$Preparar,
     [switch]$Fabrica,
     [switch]$Diag,
-    [switch]$Prueba,
     [string]$Exe = "$PSScriptRoot\target\release\victory.exe",
     [string]$Game = $(
         if ($env:VICTORY_GAME_DIR -like "*.exe") { $env:VICTORY_GAME_DIR }
@@ -72,16 +68,6 @@ if (-not (Test-Path $Exe)) {
 $kept = @([Environment]::GetEnvironmentVariables('User').Keys) + @([Environment]::GetEnvironmentVariables('Machine').Keys)
 Get-ChildItem Env: | Where-Object { $_.Name -like "VICTORY_*" -and $kept -notcontains $_.Name } |
     ForEach-Object { Remove-Item "Env:$($_.Name)" }
-
-if ($Prueba) {
-    # After the merge of cool_fox 72944b1 the card's time a frame rose from
-    # about 55 to 75-104 ms and the water drew whitish. The merge has more
-    # programs run that were left out before: three wave-32 scene kernels
-    # (tree culls, raytraced collision) and the face relocation compute.
-    # Both switches are in the shader cache's key: -Prueba -Preparar first.
-    $env:VICTORY_SCENE_KERNELS = "old"
-    $env:VICTORY_DEFRAG = "0"
-}
 
 if ($Preparar) {
     # After an update of the translator every shader is translated again, in

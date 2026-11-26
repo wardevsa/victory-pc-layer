@@ -629,10 +629,10 @@ pub fn emit(
         // One logical wave per group, with a wave32 PSO on RTX. The particle
         // light-atlas shaders that reset the card are not in this list.
         // Explicit policy wins.
-        // `VICTORY_SCENE_KERNELS=old`: only the two of before cool_fox 3c1f8bd,
-        // to measure what the others cost (on the RTX 2060 SUPER the card's
-        // time a frame rose from about 55 to 75-104 ms after that merge).
-        let scene_old = std::env::var_os("VICTORY_SCENE_KERNELS").is_some_and(|v| v == "old");
+        // Only the two of before cool_fox 3c1f8bd unless `VICTORY_SCENE_KERNELS=all`:
+        // with the others the card's time a frame rose from about 55 to 75-104 ms
+        // on the RTX 2060 SUPER, and the water drew whitish.
+        let scene_old = std::env::var_os("VICTORY_SCENE_KERNELS").is_none_or(|v| v != "all");
         let scene_kernel = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
             && (matches!(
                 c.digest,
@@ -658,9 +658,11 @@ pub fn emit(
         // divergent LDS is read and written in one region, so it only lowers
         // once that region is taken by both halves of a wave. The other wave
         // of the group does not wait (`with_half_meets`). Not the global switch.
-        // `VICTORY_DEFRAG=0` leaves this compute untranslated, so its dispatches
-        // are dropped and a run can be compared with one where it executes.
-        let defrag_off = std::env::var_os("VICTORY_DEFRAG").is_some_and(|v| v == "0");
+        // Untranslated unless `VICTORY_DEFRAG=1`, as before cool_fox c36f9f4: it
+        // moves the title's resources in the card's memory, and with it running
+        // the water drew whitish and the card took 75-104 ms a frame (55 before)
+        // on the RTX 2060 SUPER.
+        let defrag_off = std::env::var_os("VICTORY_DEFRAG").is_none_or(|v| v != "1");
         let defrag = !defrag_off
             && c.digest
                 == [

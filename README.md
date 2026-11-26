@@ -25,7 +25,6 @@ powershell -ExecutionPolicy Bypass -File .\jugar.ps1                 # play: Ser
 |---|---|
 | `-Preparar` | No game: every shader translated into the cache (`victory translate --warm all`, with the host's wave size and view heap from the last run's log), then the host pipelines earlier runs wrote down (`victory warm --used`). Run it after every update: the first run after a change of the translator otherwise translates them while playing (some 700 pipelines waiting at once, frames of 500-800 ms). |
 | `-Fabrica` | cool_fox's defaults alone, to compare |
-| `-Prueba` | The step being tried next (now: small fills of upload memory done on the card in order) |
 | `-Diag` | The diagnostics build (`cargo build --release -p victory --features diagnostics --target-dir target\diag`): the log names what each wait for the card waited for |
 | `-SinPelo` | Hair strands skipped: faster, simpler hair |
 | `-Salida 1664x936` | A smaller output, less for the card |
@@ -77,12 +76,12 @@ Series S profile.
 | + the card kept awake, 6-core pools (`0abc767`) | 5.5-6.3; cutscenes start much sooner | the submitting thread waits 93-104 ms for the card in 5 settles |
 | + `VICTORY_FILL_TITLE` (`09fab1c`) | **7-10 fps, 11 in cutscenes** | 1 settle; copying back 81 |
 | + `VICTORY_RELAY_COPY` (`d516213`, taken back) | 6-8 | copying back 28, preparing 95; torn textures |
-| + cool_fox `72944b1` merged (`be542a8`) | 4.3 median, steady 6-8 at the end | the water white: two water transmission computes now lowered to wave 32, left out before, are left out again here; preparing 110, copying back 87; the package landed without the crash |
+| + cool_fox `72944b1` merged (`be542a8`) | 4.3 median, steady 6-8 at the end | the water whitish, the card 75-104 ms; the water transmission computes (refused by its LDS rule) translate as before, and the three new scene kernels and the heap relocation compute run only on request (`VICTORY_SCENE_KERNELS=all`, `VICTORY_DEFRAG=1`), as before it; the package landed without the crash |
 | the earlier tree (`base-victory-fork`), Series X with ray tracing | 1.6-2 | traced light in the cell, textures noisy |
 
 What remains, from the diagnostics run: one wait a frame (13-47 ms) for a
 fill of 16-48 bytes in the title's heap, which the skinning passes declare
-written as a whole (`-Prueba` takes it on); preparing about 70-100 ms
+written as a whole (the card steps, tried, did no fill on the card); preparing about 70-100 ms
 (descriptor records about 24, copies about 25); medium textures still show
 coloured blocks (later). The title crashes in its own script after the
 package lands in the water in the boat mission, in every build
