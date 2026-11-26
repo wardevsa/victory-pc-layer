@@ -386,14 +386,14 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, slot count, contents) → first
+    /// Tables made afresh in this list: (table, slot count, contents) â†’ first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
-    /// address; 0 for none) → dynamic slot, and the host copy the slot
+    /// address; 0 for none) â†’ dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
@@ -2292,11 +2292,26 @@ impl State {
         self.dispatch_threads = [0; 3];
     }
 
+    /// What is about to be recorded may write arguments (`stores`: a
+    /// dispatch, or shaders that can store to buffers): the list's
+    /// gathering ends, whole, or with `crate::indirect::gather_by_copy`
+    /// only for the copies the shaders are declared to write as they are
+    /// prepared (`HostList::gather_wrote`), and whole only for a pipeline
+    /// the layer does not know.
+    fn gather_ends(&self, list: &HostList, stores: bool) {
+        if !stores {
+            return;
+        }
+        if !crate::indirect::gather_by_copy() || crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+            list.gather_close();
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
-        list.gather_close();
+        self.gather_ends(list, true);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2655,9 +2670,7 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         self.window = None;
-        if self.may_store() {
-            list.gather_close();
-        }
+        self.gather_ends(list, self.may_store());
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -3049,9 +3062,7 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
-        if self.may_store() {
-            list.gather_close();
-        }
+        self.gather_ends(list, self.may_store());
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3157,9 +3168,7 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
-        if self.may_store() {
-            list.gather_close();
-        }
+        self.gather_ends(list, self.may_store());
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3309,7 +3318,7 @@ impl State {
         if !windowed {
             // A dispatch, or shaders that store to buffers: arguments may
             // be written from here on.
-            list.gather_close();
+            self.gather_ends(list, true);
         }
         // Diagnostics: why this command gets a pass of ours, if it does.
         #[cfg(feature = "diagnostics")]

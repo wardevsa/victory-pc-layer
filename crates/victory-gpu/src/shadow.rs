@@ -2839,6 +2839,10 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        // The list's prelude takes no record of this copy from here on
+        // (`crate::indirect::gather_by_copy`); a copy in place is written
+        // by the shaders as any other.
+        list.gather_wrote(self.id);
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer
@@ -3569,6 +3573,19 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+            // The light refresh (`VICTORY_LIGHT_REFRESH`): nothing of the
+            // range was written that the copy does not hold, and the
+            // journal says so with nothing asked.
+            if crate::watch::light() && self.nothing_new(from, to) {
+                self.refresh_check(from, to);
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::Checked, (to - from) as u64);
+                    add(C::Unchanged, (to - from) as u64);
+                }
+                return 0;
+            }
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
@@ -3591,6 +3608,19 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
+    }
+
+    /// Whether [`Shadow::update_free`] of `[from, to)` would copy nothing,
+    /// known without asking the kernel or the guards
+    /// (`crate::watch::nothing_new`): the memory is watched, every page of
+    /// the range was taken, and none was noted written after it was.
+    /// `false` if the refresh would have to ask.
+    fn nothing_new(&self, from: usize, to: usize) -> bool {
+        if self.watched.load(Ordering::Relaxed) != 1 {
+            return false;
+        }
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        crate::watch::nothing_new(from, to, self.start as usize / PAGE, &copied)
     }
 
     /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): after a

@@ -261,12 +261,13 @@ developer or publisher.
   are carried here unchanged apart from one merge conflict.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
-## Status of this fork (2026-11-25, late)
+## Status of this fork (2026-11-26, 00:00 UTC)
 
-**Playable for half an hour at a time, slowly: about 9 to 12 frames per second (the console runs
+**Playable for half an hour at a time, slowly: about 7 to 12 frames per second (the console runs
 30). The tester has played from the opening through the prologue and past the first boat mission.
-Then the graphics card is lost (three times in sessions of 6, 49 and 31 minutes; cause not known
-yet). Shadowed areas are still black.**
+Then the graphics card is lost: four times, in sessions of 6, 49, 31 and 38 minutes, the last three
+on the way to the same place in the story, before the title's next save point. Cause not known
+yet. Shadowed areas are still black.**
 Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 32 GB RAM. The Series X profile is used throughout.
 
@@ -279,10 +280,56 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Water | right since `VICTORY_TEXTURE_BACK=1` (pull request #999): boats float, the surface is lit (blue, waves, the sun's path). Without it boats sink and the mission fails |
 | Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
 | Frame rate in the world | **9 to 12 fps in rooms and light outdoor views**: 110 ms a frame in the first rooms at about 4,700 draws (run 275), 86 to 102 ms on the water at about 1,300 draws (run 279). **5 to 6 fps in heavy outdoor views** (160 to 208 ms at 7,200 to 9,700 draws). A frame is about 70 ms plus 13 ms per 1,000 draws: the thread that prepares submissions is the limit, the card idles 12 to 40 ms a frame. It started at 3 to 6 seconds a frame. Measured with the switch set in `diagnostics/README.md` plus `VICTORY_CARD_HASH_LEN=1`; the defaults are slower |
-| Stability | **the card is lost after 30 to 50 minutes of play**: Windows reports the device removed (0x887A0005) with no driver event and no freeze, twice (runs 277 and 279); once a hang after 6 minutes with two driver events (run 276). Cause not known; crash tracing cheap enough to leave on (`VICTORY_D3D12_DRED=faults`) is in the tree to find it |
+| Stability | **the card is lost after 30 to 50 minutes of play**: Windows reports the device removed (0x887A0005) with no driver event and no freeze, twice (runs 277 and 279); once a hang after 6 minutes with two driver events (run 276). Cause not known. In the tree to find it: crash tracing cheap enough to leave on (`VICTORY_D3D12_DRED=faults`), the memory at the moment of a loss, and a cap on oversized constant views (an invalid call another tester's card answered with a removal) |
 | Memory | about 23 to 27 GB of the PC's 32 GB and 9.2 to 9.6 GB of the card's 10.3 GB budget while playing |
 
-### Newest (2026-11-25, night UTC)
+### Newest (2026-11-26, 00:00 UTC)
+
+**Written and unit-tested, not yet measured in a game. Every switch here is off by default; the
+numbers are estimates until a run carries them.**
+- **Constant buffer views are capped at 64 KiB** (pull request #911, always on). The title names
+  constant views far larger than the host allows (its author logged one of 1,306,368 bytes); making
+  such a view is an invalid call, and its author's NVIDIA card removed the device for it. A warning
+  is logged once when a view is capped. Whether this is behind the card losses on the test machine
+  is not known yet.
+- **`VICTORY_FILLS_PLAIN=1`** (with `VICTORY_COPY_PLAIN=1`): a list's fills of under 256 bytes are
+  copied in place. There are 8,000 to 12,000 a frame and each was a kernel call of about 400 ns; in
+  place it is about 30 ns (timed offline). Expected: about 3 ms off the submitting thread a frame.
+- **`VICTORY_STEP_INDEX=1`**: the passes over a submission's steps find a step's copy by an index
+  instead of a lock and a search per step (20,000 to 43,000 refresh steps a frame). Expected: 1.5
+  to 4 ms a frame.
+- **`VICTORY_LIGHT_REFRESH=1`** (wants `VICTORY_ABSENT_ONCE=1 VICTORY_ABSENT_MS=told`): a lock-free
+  bit per 64 KiB block that is read-only by the layer's hand and unwritten since; a refresh whose
+  blocks all have their bit is answered with no lock and no kernel call. Hand-ported from
+  avatarmanz/VIctory-7900XTX. Expected, if most askings are of unwritten ranges: the frame line's
+  "copies" 43 to about 30 ms in rooms and 80 to about 57 ms outdoors.
+- **Pull request #1185**: a commit that crosses a 64 KiB block edge now clears both blocks' notes
+  (a fix to `VICTORY_ABSENT_MS=told`).
+- **`VICTORY_D3D12_DRED=faults`** (and `light`): crash tracing cheap enough to play with. The full
+  form cost about 50 ms a frame.
+- **Instruments for the card loss**: at a removal the log now has the process's, the PC's and the
+  card's memory at that moment and the card's peak use since the last line (the memory line was
+  one look in five seconds); a line a second with the peak (`VICTORY_VIDEO_LOOK=0`: none); and
+  what Present answers, which was thrown away.
+- **The fourth loss (38 minutes in, with `VICTORY_D3D12_DRED=faults`)**: removal reason 0x887A0005
+  again, and the runtime reported no page fault address, so it was not the card reading freed or
+  unmapped memory. The three long sessions all ended on the way to the same place in the story,
+  so the trigger looks tied to what is drawn or made there, not to the time played. Nothing in the
+  last seconds of the three logs is found only there (pipelines made, textures made). The tracing
+  cost nothing measurable up to 4,000 draws a frame.
+- **Looked at for the card loss and not found to be the cause**: video memory. In four sessions
+  the card was at 84 to 92 % of its budget throughout and never over it at a sample, the session
+  with no loss as full as the others, and no out-of-memory result in any log. The cause is open.
+- **`VICTORY_BVH_NO_HIT=1`** (a translator change: the shader cache is rebuilt once after this
+  commit): the title's ray-traced passes run although nothing builds their structures, and each
+  node test read whatever bytes lay there. With the switch a node test answers "no hit" and reads
+  nothing, so every ray leaves at its first test and the answer is the same in every run. Not a
+  frame-rate change (those passes cost under 1 ms of card time a frame on the test machine).
+  Whether shadowed areas come out lit by the sky instead of black is not known until it runs.
+  Also pull request #1141 (`VICTORY_WAVE_WIDE=last`, opt-in).
+- `diagnostics/timing-run-295s-2026-11-25.txt`: a 295 s timing run with breadcrumbs.
+
+### Before that (2026-11-25, night UTC)
 
 **Small buffers into the card's memory: about 18 ms of card time a frame gone, 5 ms of frame so far.**
 Tested on the machine above, first rooms, at like draw counts (runs 274 and 275).

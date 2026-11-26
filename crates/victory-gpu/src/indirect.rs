@@ -607,6 +607,64 @@ pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), off
     list.gather_slot(src, src_id, offset, spec)
 }
 
+/// `VICTORY_GATHER_BY_COPY`: 0 off, 1 on, 2 in turn.
+fn gather_by_copy_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_GATHER_BY_COPY").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    })
+}
+
+/// Whether the copies a list's shaders were declared to write are noted
+/// (`HostList::gather_wrote`): with the switch on, and in both phases of
+/// `alt`, so that the phase that uses the notes finds them whole.
+pub(crate) fn gather_by_copy_kept() -> bool {
+    gather_by_copy_mode() != 0
+}
+
+/// Whether a list stops gathering copy by copy, not whole
+/// (`VICTORY_GATHER_BY_COPY=1`, with `VICTORY_INDIRECT_GATHER=1`; off by
+/// default; `alt`: twenty seconds with, twenty without, in turn, each
+/// change said in the log).
+///
+/// A list's prelude reads the records it gathered before the list runs.
+/// So a record must not be gathered once something recorded in the list
+/// may write it. As before: the first dispatch, and the first draw whose
+/// shaders can store to buffers, ended the list's gathering for every
+/// argument buffer, whatever those shaders write. In the world that left
+/// 1,950 to 2,300 single records a frame with a pass of the layer's own
+/// each, between two waits for every earlier shader write (run 281: "the
+/// list had stopped gathering").
+///
+/// With the switch a record of an argument buffer's host copy is refused
+/// only once the list's shaders were declared to write THAT copy: every
+/// buffer a program is given to write is declared, view by view, root
+/// view by root view and window by window, where the program is prepared
+/// (`Shadow::gpu_writes`; the copy back into title memory depends on the
+/// same declarations), and a write to another host copy of the same bytes
+/// is not seen through this one on the card either way. A pipeline the
+/// layer does not know still ends the gathering whole.
+pub(crate) fn gather_by_copy() -> bool {
+    match gather_by_copy_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a list stops gathering indirect records copy by copy from now (VICTORY_GATHER_BY_COPY=alt): {}",
+                    if on { "ON" } else { "off, whole at the first dispatch or storing draw as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
 /// Since the last line: records that got no slot because they do not fit
 /// the clamp, because their list had stopped gathering, because the list
 /// gathers from too many buffers, because their set was full, because a

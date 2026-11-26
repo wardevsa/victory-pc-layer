@@ -179,6 +179,9 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
     let buffer = host.read_back_buffer(total)?;
+    // With device-removed data on: a page fault in it, alive or freed, is
+    // reported under this name (it was "unnamed").
+    crate::host::name_frame(&buffer, || format!("texback read-back buffer of {total} bytes"));
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.

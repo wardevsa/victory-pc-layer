@@ -74,8 +74,9 @@ pub(crate) fn on() -> bool {
 /// Copies made in place, their bytes, the copies that met a page that was
 /// not there (and went to the kernel's copy), and the copies not tried in
 /// place because their source faulted lately ([`RECENT`]) or they were
-/// under [`LEAST`] bytes, since the last line.
-static COUNT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// under [`LEAST`] bytes, since the last line; and the fills of under
+/// [`LEAST`] bytes made in place ([`copy_short`]).
+static COUNT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// The fewest bytes copied in place. A read of a byte or a word is how the
 /// layer ASKS whether a page is there (a texture's first page, a record):
@@ -207,16 +208,53 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
     whole
 }
 
+/// With [`on`]: copies `len` bytes, fewer than [`LEAST`], of title memory
+/// at `from` into host memory at `to`, for a caller that is NOT asking
+/// whether the page is there but expects it to be (a list's fill of upload
+/// memory: constants the title recorded a draw with). False if it is off,
+/// if the source faulted lately, or if a source page was not there; the
+/// caller then copies through the kernel, as before.
+///
+/// Why: the floor of [`copy`] is there for the askings, which fail. The
+/// fills do not: 8,000 to 12,000 of them a frame went to the kernel's copy
+/// (run 279's lines, "of under 256 bytes"), about 400 ns each where the
+/// copy in place of 16 to 128 bytes is about 30 ns (timed on this
+/// processor, 2026-11-25, two million copies each).
+pub(crate) fn copy_short(to: *mut u8, from: *const u8, len: usize) -> bool {
+    if !on() {
+        return false;
+    }
+    if faulted_lately(from as usize, len) {
+        COUNT[3].fetch_add(1, Relaxed);
+        return false;
+    }
+    let whole = guarded(to, from, len);
+    if whole {
+        COUNT[5].fetch_add(1, Relaxed);
+    } else {
+        COUNT[2].fetch_add(1, Relaxed);
+        note_fault(from as usize, len);
+    }
+    whole
+}
+
+/// The fewest bytes [`copy`] takes: what is shorter is [`copy_short`]'s,
+/// for callers that may use it.
+pub(crate) const fn least() -> usize {
+    LEAST
+}
+
 /// With the frame line: what [`copy`] did per frame over `frames`.
 pub(crate) fn line(frames: f64) {
     if !on() {
         return;
     }
-    let [copies, bytes, gone, lately, small] = [0, 1, 2, 3, 4].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
+    let [copies, bytes, gone, lately, small, fills] = [0, 1, 2, 3, 4, 5].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
     tracing::info!(
         "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1): {copies:.0}, {:.1} MB; {gone:.1} met a page \
          that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source \
-         faulted in the last two seconds, {small:.0} of under {LEAST} bytes",
+         faulted in the last two seconds, {small:.0} of under {LEAST} bytes; fills of under {LEAST} bytes made in place \
+         (VICTORY_FILLS_PLAIN): {fills:.0}",
         bytes / 1e6
     );
 }
@@ -238,6 +276,35 @@ mod tests {
         assert_eq!(to, from);
         // Nothing to copy is a copy.
         assert!(guarded(to.as_mut_ptr(), from.as_ptr(), 0));
+    }
+
+    /// A fill's few bytes: copied whole where they are there, up to the last
+    /// byte of a page; a copy that runs into a hole by one byte ends with
+    /// false and the thread goes on.
+    #[test]
+    fn a_short_copy_is_whole_or_ends_without_a_fault() {
+        // SAFETY: memory of the test's own.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS) } as *mut u8;
+        assert!(!base.is_null());
+        // SAFETY: the first page of that reservation.
+        assert!(!unsafe { VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        // SAFETY: committed and writable.
+        let page = unsafe { std::slice::from_raw_parts_mut(base, PAGE) };
+        for (i, b) in page.iter_mut().enumerate() {
+            *b = (i * 13 + 5) as u8;
+        }
+        for len in [1usize, 16, 64, 255] {
+            let mut to = vec![0u8; len];
+            // The page's last bytes.
+            assert!(guarded(to.as_mut_ptr(), base.wrapping_add(PAGE - len), len), "{len}");
+            assert_eq!(to, page[PAGE - len..], "{len}");
+            // One byte into the hole.
+            let mut to = vec![0u8; len];
+            assert!(!guarded(to.as_mut_ptr(), base.wrapping_add(PAGE - len + 1), len), "{len}");
+            assert_eq!(to[..len - 1], page[PAGE - len + 1..], "{len}: the bytes before the hole");
+        }
+        // SAFETY: the test's reservation.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
     }
 
     /// Three pages reserved, the first committed: a copy that stays in the
