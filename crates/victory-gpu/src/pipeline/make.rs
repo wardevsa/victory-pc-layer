@@ -21,7 +21,36 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Shader;
-use super::host::{GraphicsState, HostPipeline};
+use super::host::{GraphicsState, HostPipeline, TargetFormats};
+
+/// `VICTORY_DENY_PIPELINES=<16-hex shader hash>,...` (off unless set): the
+/// hash of a shader of `shaders` that is listed there. Such a pipeline is
+/// never built (no driver compile) and counts as refused, so its draws and
+/// dispatches are dropped: a test of whether building a pipeline, rather
+/// than running it, is what loses the card (runs 281 and 318: the removal
+/// 32 and 81 ms after the 3-second build of `CS_RaytracingResolve` of the
+/// two-layer vehicle wheel material, 57a3fad03cac36af and d5b9c94a30d7cf28;
+/// gfx41). Unlike `VICTORY_SKIP_PIPELINES`, in release builds too.
+fn denied(shaders: &[Arc<Shader>]) -> Option<&str> {
+    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_DENY_PIPELINES")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    });
+    if list.is_empty() {
+        return None;
+    }
+    shaders.iter().find(|s| list.contains(&s.hash)).map(|s| s.hash.as_str())
+}
+
+/// The shaders of `p` (for logs).
+pub(crate) fn shaders(p: &Pending) -> &[Arc<Shader>] {
+    &p.shaders
+}
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -33,6 +62,16 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// Whether the made pipeline has gone to a draw or dispatch yet
+    /// (`crate::host::first_use`: for a device removal's report).
+    handed: AtomicBool,
+    /// The formats its state declares for what a draw draws into (zeros
+    /// without a graphics state).
+    pub(crate) formats: TargetFormats,
+    /// The same shaders and state for other formats, bound at a draw
+    /// ([`for_formats`]): a chain from the title's pipeline, one link per
+    /// set of formats met, never shortened.
+    variant: OnceLock<Arc<Pending>>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -50,18 +89,26 @@ impl Pending {
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
         Pending {
+            formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
+            variant: OnceLock::new(),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            handed: AtomicBool::new(false),
         }
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            if let Some(hash) = denied(&self.shaders) {
+                tracing::warn!(hash, shaders = ?self.shaders, "pipeline not built: its shader is in VICTORY_DENY_PIPELINES");
+                return None;
+            }
+            HostPipeline::new(&self.shaders, self.graphics.as_deref())
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -127,7 +174,71 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
-    p.made.get()?.as_ref()
+    let made = p.made.get()?.as_ref();
+    // The first time the made pipeline goes to a draw or dispatch: noted
+    // for a device removal's report (one load a call after that).
+    if let Some(host) = made
+        && !p.handed.load(Ordering::Relaxed)
+        && !p.handed.swap(true, Ordering::Relaxed)
+    {
+        crate::host::first_use(&host.name);
+    }
+    made
+}
+
+/// Pipelines made again for the formats bound at a draw, since the start.
+static VARIANTS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a draw into views of other formats than its pipeline declares
+/// gets a host pipeline for those formats ([`for_formats`]). On by
+/// default; `VICTORY_TARGET_VARIANTS=0` sends such a draw to the host with
+/// the title's pipeline, as before.
+fn variants_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TARGET_VARIANTS").is_none_or(|v| v != "0"))
+}
+
+/// The host pipeline for a draw with `p` into views of the formats
+/// `bound`, which `p` does not declare (`host::formats_differ`): that of
+/// the same shaders and state for those formats. It is a pipeline like the
+/// title's own: queued at its first draw, made by a worker, waited for
+/// within the frame's budget, and the draw is dropped while it is not
+/// there ([`ready`]).
+#[cold]
+pub(crate) fn for_formats<'a>(p: &'a Arc<Pending>, bound: &TargetFormats) -> Option<&'a HostPipeline> {
+    match p.graphics.as_deref() {
+        Some(g) if variants_on() => ready(variant(p, g, &super::host::formats_for(&p.formats, bound))),
+        _ => ready(p),
+    }
+}
+
+/// The pipeline of `p`'s shaders and its state `g` for the formats
+/// `bound`: found in the chain that starts at `p`, or added to it (logged
+/// then: once per pipeline and set of formats).
+fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) -> &'a Arc<Pending> {
+    let mut at = p;
+    // (`bound` is what `host::formats_for` gives, and a state made for it
+    // declares exactly it, so the walk ends at the link made for it; the
+    // count is a bound all the same: past it the title's own pipeline.)
+    for _ in 0..64 {
+        let next = at.variant.get_or_init(|| {
+            let so_far = VARIANTS.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::info!(
+                pipeline = ?p.shaders,
+                declared = ?p.formats,
+                bound = ?bound,
+                so_far,
+                "a pipeline is made again for the render target formats bound at its draw (eight render targets, then depth; VICTORY_TARGET_VARIANTS=0: the draw goes out with the title's pipeline)"
+            );
+            Arc::new(Pending::new(p.shaders.clone(), Some(Box::new(g.with_formats(bound)))))
+        });
+        // (A state made for `bound` declares exactly `bound`.)
+        if next.formats == *bound {
+            return next;
+        }
+        at = next;
+    }
+    p
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -362,6 +473,30 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// A draw into other formats than its pipeline declares finds the
+    /// pipeline for them, which exists once per set of formats and is
+    /// queued by its first draw like any other.
+    #[test]
+    fn a_pipeline_for_bound_formats_is_made_once() {
+        // The title's pipeline declares one render target, format 24.
+        let p = Arc::new(Pending::new(Vec::new(), Some(Box::new(GraphicsState::declaring(24)))));
+        assert_eq!(p.formats, [24, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let g = p.graphics.as_deref().unwrap();
+        let (a, b) = ([26, 0, 0, 0, 0, 0, 0, 0, 0], [28, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let first = variant(&p, g, &a);
+        assert_eq!(first.formats, a);
+        assert_ne!(first.key, p.key);
+        assert!(Arc::ptr_eq(first, variant(&p, g, &a)));
+        let second = variant(&p, g, &b);
+        assert_eq!(second.formats, b);
+        assert!(!Arc::ptr_eq(first, second));
+        assert_ne!(second.key, first.key);
+        assert!(Arc::ptr_eq(first, variant(&p, g, &a)));
+        assert!(Arc::ptr_eq(second, variant(&p, g, &b)));
+        assert_eq!(first.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
     }
 
     #[test]

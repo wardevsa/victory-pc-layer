@@ -180,6 +180,9 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The frame it was read in ahead of its submission
+    /// ([`Staging::refresh_ahead`]).
+    ahead: Option<u64>,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -326,7 +329,10 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    // An upload from title memory can have already used this view. Only
+    // a copy from the same GPU source can satisfy this read.
+    list.first_use(placed as usize);
+    let new_source = list.alias_source_changed(to, from);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -341,7 +347,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !first && before.is_none() {
+    if !new_source && before.is_none() {
         return true;
     }
     card_writes(list, placed, to, None);
@@ -1073,7 +1079,9 @@ impl Staging {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            let frame = crate::frame::current();
+            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY)
+                && last.ahead.is_none_or(|at| frame > at + 1);
             if unwritten && !turn {
                 return 0;
             }
@@ -1159,6 +1167,36 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
+    }
+
+    /// Detiles the texture memory into the staging buffer ahead of the
+    /// submission, on the thread of `crate::heap_worker`: read through the
+    /// kernel, so that the runtime's remapping never waits for it, whole or
+    /// not at all (the submission then does it, as ever). False if it was
+    /// not read. What the title writes after this is found at submission.
+    pub(crate) fn refresh_ahead(&self) -> bool {
+        let size = self.layout.size as usize;
+        let start = self.memory as usize;
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let last = &mut *last;
+        if last.hash.is_some() || last.asked != 0 {
+            // Detiled before: the submission's check is cheap.
+            return true;
+        }
+        let asked = crate::watch::writes(start, start + size, false).or_else(|| crate::watch::writes(start, start + size, true));
+        let Some((now, _)) = asked else {
+            return false;
+        };
+        with_read(size, |read| {
+            if !crate::host::read_into(self.memory, read) {
+                return false;
+            }
+            last.hash = Some(blake3::hash(read));
+            self.detile(read);
+            last.asked = now;
+            last.ahead = Some(crate::frame::current());
+            true
+        })
     }
 
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):

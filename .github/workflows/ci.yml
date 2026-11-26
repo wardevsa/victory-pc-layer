@@ -30,4 +30,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --exclude victory-gpu
+      # The runner has no card, so these tests make their devices on Microsoft's software
+      # renderer, whose shader compiler has crashed the test program (access violation in
+      # d3d10warp) when several tests used it at once. One test at a time has not shown it.
+      - name: Tests, victory-gpu (one at a time)
+        run: cargo test -p victory-gpu --locked -- --test-threads=1

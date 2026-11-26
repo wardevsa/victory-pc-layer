@@ -1622,3 +1622,158 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         }
     }
 }
+
+/// `v_mad_legacy_f32` as RDNA 2 runs it: fused (`v_fma_legacy_f32`), with
+/// flushed subnormal sources and the legacy zero-factor rule.
+#[test]
+fn legacy_mad_fuses_its_product_and_flushes_its_sources() {
+    let mad = build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let cases = [
+        // (1 + 2^-23) * (1 - 2^-23) - 1 is -2^-46 exactly: kept by one
+        // rounding, lost when the product is rounded before the add.
+        [0x3f80_0001, 0x3f7f_fffe, 0xbf80_0000, 0],
+        // A subnormal source flushes to zero: subnormal * 1.0 + 0.0 == 0.0.
+        [0x0000_0001, 0x3f80_0000, 0x0000_0000, 0],
+        // A flushed subnormal factor triggers the legacy zero-factor rule with +inf.
+        [0x0000_0001, 0x7f80_0000, 0x3f80_0000, 0],
+        // A zero factor gives a +0 product even with an infinite factor.
+        [0, 0x7f80_0000, 0x3f80_0000, 0],
+    ];
+    let want = [0xa880_0000u32, 0x0000_0000, 0x3f80_0000, 0x3f80_0000];
+    if Host::new(false).is_err() && Host::new(true).is_err() {
+        eprintln!("no SM 6.6 host or WARP device; skipped");
+        return;
+    }
+    run_cases(&mad, &cases, |backend, i, _, got| {
+        if backend == "warp" && i == 0 {
+            // WARP rounds the product before the add; hardware's single
+            // rounding is the reference for the fused form.
+            eprintln!("{backend}: fused rounding differs on WARP; skipped");
+            return;
+        }
+        assert_eq!(got, want[i], "{backend}: case {i}");
+    });
+}
+
+/// A dispatch spread across z past 65,535 groups in x
+/// (`USER_DISPATCH_SPREAD`): the program sees the group id the title asked
+/// for, `(x + z * row)`, and the groups past the asked count do nothing.
+/// One thread a group stores 1 at dword `group id x` of a raw UAV. Run
+/// unspread (10 groups), spread with surplus (10 asked as 4 x 1 x 3) and
+/// spread exactly (10 asked as 5 x 1 x 2), on the hardware adapter and
+/// WARP. (After upstream VIctory pull request #2312.)
+#[test]
+fn a_spread_dispatch_runs_each_asked_group_once() {
+    use crate::native::{ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource};
+    let words: Vec<u32> = [
+        vec![s_mov_b32(5, 0x80)], // s5 = 0: the table address's high half
+        s_load_dwordx4(8, 4).to_vec(), // s[8:11] = table entry 0 (raw UAV)
+        vec![
+            vop1(0x001, 1, sgpr(6)),  // v_mov_b32 v1, s6 (group id x)
+            0x3404_0282,              // v_lshlrev_b32 v2, 2, v1
+            vop1(0x001, 3, 129),      // v_mov_b32 v3, 1
+            0xBF8C_C07F,              // s_waitcnt lgkmcnt(0)
+            0x38 << 26 | 0x1C << 18 | 1 << 12, // buffer_store_dword v3, v2, s[8:11], 0 offen
+            0x80 << 24 | (8 >> 2) << 16 | 3 << 8 | 2,
+            S_ENDPGM,
+        ],
+    ]
+    .concat();
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 4,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 0,
+        }],
+        // 6 user SGPRs (s0..s5), then the group id x in s6 (TGID_X_EN).
+        io: StageIo::Cs(ComputeIo { rsrc2: (6 << 1) | (1 << 7), threads: [1, 1, 1] }),
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let spread = RootType::Other(super::USER_DISPATCH_SPREAD);
+    let row_at = shader.user_data.iter().find(|u| u.root == spread && u.dword == 0).expect("the row word").index;
+    let asked_at = shader.user_data.iter().find(|u| u.root == spread && u.dword == 1).expect("the asked word").index;
+    assert_eq!(asked_at, row_at + 1, "the two words are adjacent (one root-constant argument sets both)");
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = Vec::new();
+    for (backend, warp) in [("hardware", false), ("warp", true)] {
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("no SM 6.6 {backend} device ({e}); skipped");
+                continue;
+            }
+        };
+        ran.push(backend);
+        let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(|e| panic!("{backend}: {e}"));
+        // (row, asked, groups): unspread, spread with surplus, spread exactly.
+        for (row, asked, groups) in [(0u32, 10u32, [10u32, 1, 1]), (4, 10, [4, 1, 3]), (5, 10, [5, 1, 2])] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            ud[row_at as usize] = row;
+            ud[asked_at as usize] = if row == 0 { 0 } else { asked };
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(16)],
+                        samplers: &[],
+                        groups,
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{backend} row {row}: {e}"));
+            let want: Vec<u32> = (0..16).map(|i| u32::from(i < asked)).collect();
+            assert_eq!(out[0], want, "{backend}: row {row}, groups {groups:?}");
+        }
+    }
+    eprintln!("ran on {ran:?}");
+    assert!(!ran.is_empty(), "no device ran the test");
+}

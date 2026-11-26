@@ -34,6 +34,20 @@ by the project owner's decision (2026-11-23), entered as an exception in
 repository's licence does not cover them. Nothing else of this kind is
 accepted.
 
+## Run logs
+
+`diagnostics/` holds the layer's own logs of test and play runs, by the
+project owner's decision (2026-11-26): every run's log is published there
+so that others can read what a run measured. A log is text the layer
+wrote; before it is committed it is scrubbed of the user's and the
+machine's names and paths, of the title's folder, file, product and
+program names, and of the title's own output lines. Nothing of the game is
+in it. Because logs are long, `xtask/src/policy.rs` gives the files
+directly under `diagnostics/` a rule of their own: a `.txt` up to 32 MiB
+that holds no binary data, or a gzipped `.txt.gz` up to 16 MiB. Pictures,
+frame shots and anything else a run produces are NOT published: they show
+the title.
+
 ## Where data lives
 
 Outside the repository, configured in `victory.toml`: `game_dir` (the

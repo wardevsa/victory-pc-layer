@@ -97,7 +97,19 @@ static SUBMITTED: AtomicU32 = AtomicU32::new(0);
 
 /// Whether the title has begun to submit the frame being recorded.
 fn closing() -> bool {
-    SUBMITTED.load(Relaxed) >= FRAME_LISTS
+    SUBMITTED.load(Relaxed) >= frame_lists()
+}
+
+/// [`FRAME_LISTS`], or `VICTORY_SHOT_LISTS` if set. The title may go on
+/// beginning lists of a frame long after its first twenty are submitted:
+/// shot-1785-012256 (run 287) had 34 lists submitted before the frame's
+/// lighting lists were begun, took those for the next frame's and holds
+/// none of their commands. A number no frame reaches keeps every list
+/// begun until the shot's last present (three presents at most): more
+/// than one frame, with nothing of it left out.
+fn frame_lists() -> u32 {
+    static LISTS: OnceLock<u32> = OnceLock::new();
+    *LISTS.get_or_init(|| number("VICTORY_SHOT_LISTS", u64::from(FRAME_LISTS)).min(u64::from(u32::MAX)) as u32)
 }
 
 /// The title submits `list`, while a shot records.
@@ -845,6 +857,40 @@ fn arm(frame: u64, carry: Carry, folder: &std::path::Path) {
     PHASE.store(RECORDING, Relaxed);
 }
 
+/// How much of a picture's texture holds anything, from its bytes as the
+/// card wrote them: the share of texels with any bit set and, for R32_UINT
+/// (the title's packed light, read back as R9G9B9E5), the highest channel
+/// value of that reading. The picture says neither: it is scaled to its
+/// largest value, so one bright texel leaves every other one black
+/// (shot-2705: the screen probes' atlas, "0.0 % not black", one white pixel).
+fn holds(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> (f64, f32) {
+    let n = match format {
+        1..=2 => 16,
+        9..=16 | 19..=22 => 8,
+        23..=47 | 87..=93 => 4,
+        48..=59 => 2,
+        60..=65 => 1,
+        _ => return (f64::NAN, 0.0),
+    };
+    let (mut set, mut high) = (0u64, 0f32);
+    for y in 0..h {
+        let Some(row) = rows.get(y * pitch..y * pitch + w * n) else {
+            break;
+        };
+        for texel in row.chunks_exact(n) {
+            set += u64::from(texel.iter().any(|&b| b != 0));
+            if format == 42 {
+                let v = u32::from_le_bytes([texel[0], texel[1], texel[2], texel[3]]);
+                let scale = 2f32.powi((v >> 27) as i32 - 24);
+                for k in 0..3 {
+                    high = high.max((v >> (9 * k) & 0x1ff) as f32 * scale);
+                }
+            }
+        }
+    }
+    (set as f64 * 100.0 / (w * h).max(1) as f64, high)
+}
+
 /// Writes one frame of a shot out and lets its buffers go. What the shot
 /// carries on, if pictures are left for a later frame.
 fn save(shot: Shot, to: &std::path::Path) -> Option<Carry> {
@@ -884,7 +930,7 @@ fn save(shot: Shot, to: &std::path::Path) -> Option<Carry> {
         let _ = std::fs::write(to.join("stamps.txt"), stamps);
         let _ = std::fs::write(
             to.join("snaps.txt"),
-            "texture\tn\tslice\tfile\tpart\tframe\twidth\theight\tformat\tbefore\tafter\tnot_black_percent\tmean_rgb\n",
+            "texture\tn\tslice\tfile\tpart\tframe\twidth\theight\tformat\tbefore\tafter\tnot_black_percent\tmean_rgb\ttexels_with_bits_percent\tpacked_high\n",
         );
         carry.lines = shot.events.len();
         carry.work = shot.work;
@@ -899,6 +945,7 @@ fn save(shot: Shot, to: &std::path::Path) -> Option<Carry> {
     for snap in shot.snaps {
         let f = snap.footprint;
         let mut data = std::ptr::null_mut();
+        let mut held = (f64::NAN, 0f32);
         // SAFETY: the copy finished long ago; the mapping spans the bytes
         // the footprint was sized for.
         let rgba = unsafe {
@@ -907,6 +954,7 @@ fn save(shot: Shot, to: &std::path::Path) -> Option<Carry> {
             } else {
                 let rows = std::slice::from_raw_parts(data.cast::<u8>(), snap.bytes as usize);
                 let rgba = crate::capture::to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, f.RowPitch as usize, rows);
+                held = holds(f.Format.0 as u32, f.Width as usize, f.Height as usize, f.RowPitch as usize, rows);
                 snap.buffer.Unmap(0, None);
                 rgba
             }
@@ -941,7 +989,7 @@ fn save(shot: Shot, to: &std::path::Path) -> Option<Carry> {
         }
         let _ = writeln!(
             list,
-            "{:#x}\t{}\t{}\t{}.png\t{part}\t{}\t{}\t{}\t{}\t{:#x}\t{:#x}\t{:.1}\t{},{},{}",
+            "{:#x}\t{}\t{}\t{}.png\t{part}\t{}\t{}\t{}\t{}\t{:#x}\t{:#x}\t{:.1}\t{},{},{}\t{:.3}\t{}",
             snap.texture,
             snap.occurrence,
             snap.slice,
@@ -955,7 +1003,9 @@ fn save(shot: Shot, to: &std::path::Path) -> Option<Carry> {
             lit as f64 * 100.0 / n as f64,
             sum[0] / n,
             sum[1] / n,
-            sum[2] / n
+            sum[2] / n,
+            held.0,
+            held.1
         );
     }
     if let Ok(mut file) = std::fs::OpenOptions::new().append(true).create(true).open(to.join("snaps.txt")) {

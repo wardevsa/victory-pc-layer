@@ -410,7 +410,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // memory (in turn they are said at each change).
     if guarded && light_mode() == 1 {
         static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if (CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1) % 65_536 == 0 {
+        if (CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1).is_multiple_of(65_536) {
             let [bits, locked, filled] = light_asks();
             tracing::info!(
                 "refreshes of host copies go the light way (VICTORY_LIGHT_REFRESH=1): of the last 65536 askings that allowed for view memory {bits} were answered by the bits of their blocks and {locked} took the guards' lock (the others were of memory the kernel watches); {filled} holes found filled with nobody telling"
@@ -511,6 +511,15 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
         add(C::Watches, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
+        // What one failed asking costs, against one the guards answer
+        // without the kernel (fps41 round 7: the cost of `VICTORY_VIEW_KNOWN`'s
+        // case was known only from runs 222/225).
+        if failed {
+            add(
+                if known_view { C::WatchKnownUs } else { C::WatchFailedUs },
+                started.elapsed().as_micros() as u64,
+            );
+        }
     }
     j.asked += 1;
     let now = j.asked;
@@ -542,7 +551,7 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
 fn failed_asking(start: usize, end: usize) {
     use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2048 != 0 {
+    if !N.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(2048) {
         return;
     }
     // SAFETY: plain data filled in by the query.
@@ -1144,6 +1153,53 @@ fn nothing_noted(start: usize, end: usize, base: usize, copied: &[u64]) -> bool 
     same
 }
 
+/// Whether a refresh of `[start, end)` by a copy whose note of taken pages
+/// is `copied` (from page `base` on, as for [`nothing_new`]) would copy
+/// nothing, known before asking and whatever the light refresh says:
+/// every page of the range was taken, the journal notes no write of a page
+/// after the copy took it, and either the range lies in a standing asking
+/// ahead (the journal is then the whole answer, as [`writes`] gives it) or
+/// every 64 KiB block of it is read-only by our hand and clean (no write
+/// opened its guard since a copy took it: the guard fault handler, our own
+/// writes through the kernel ([`writing`]), DirectStorage's writes through
+/// the runtime's views ([`title_memory_written`]) and a remapping
+/// ([`title_memory_remapped`]) all open or forget the block first).
+///
+/// What it cannot see is what the guards cannot see either: a write
+/// through another view of the same physical page where the two were not
+/// guarded together, and a write into private memory that no asking has
+/// reported yet (such a range is answered here only inside a standing
+/// asking, where [`writes`] would answer from the journal too). So where
+/// this says yes, [`writes`] would say the same (fps41 round 8).
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn unchanged_known(start: usize, end: usize, base: usize, copied: &[u64]) -> bool {
+    if start >= end {
+        return false;
+    }
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
+        return false;
+    };
+    if taken.contains(&0) {
+        return false;
+    }
+    let ahead = {
+        let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        if !j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first]) {
+            return false;
+        }
+        j.ahead.iter().any(|&(a, b)| a <= first && last <= b)
+    };
+    if ahead {
+        return true;
+    }
+    // (The journal's lock is let go first: `writes_as` takes it, then the
+    // guards'.)
+    let g = guards();
+    let blocks = last - first;
+    g.protected.range(first..last).count() == blocks && g.clean.range(first..last).count() == blocks
+}
+
 /// `VICTORY_ABSENT_ONCE`: 0 off, 1 on, 2 in turn ([`absent_once`]).
 fn absent_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -1240,7 +1296,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // at each change).
     if absent_mode() == 1 {
         static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if (CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1) % 65_536 == 0 {
+        if (CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1).is_multiple_of(65_536) {
             let [asked, kept] = absent_looks();
             tracing::info!(
                 "blocks of view memory found uncommitted are asked of Windows again only after {} ms (VICTORY_ABSENT_ONCE=1): in the last 65536 askings of the guards {asked} questions to Windows about such blocks, {kept} blocks answered from their note",
@@ -1498,7 +1554,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
                 #[cfg(feature = "diagnostics")]
                 {
                     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 1024 == 0 {
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(1024) {
                         tracing::info!("a block of title memory could not be made read-only (one in 1024): {:#x}: {error}", block * BLOCK);
                     }
                 }
@@ -1911,12 +1967,17 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
-        assert!(before.is_empty());
+        // (Not empty by rule: the journal is the process's and keeps what
+        // was written at an address for good, and a fresh allocation can
+        // land where another test's freed one stood; that failed this test
+        // now and then. Nothing written since the allocation is new.)
+        let (asked, before) = writes(start, end, false).expect("watched");
+        assert!(before.iter().all(|&(_, at)| at < asked), "a fresh allocation has no page written at this asking");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
         let (now, after) = writes(start, end, false).expect("watched");
-        assert_eq!(after, [(p / PAGE + 1, now)]);
+        let new: Vec<(usize, u64)> = after.iter().copied().filter(|entry| !before.contains(entry)).collect();
+        assert_eq!(new, [(p / PAGE + 1, now)], "the written page, and no other, is new at this asking");
         // Another asker after the kernel's bit was cleared still sees it.
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);

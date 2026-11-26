@@ -1,19 +1,36 @@
-//! The frame rate, drawn into the top left corner of every frame shown.
+//! The frame rate and the machine's load, drawn into the top left corner of
+//! every frame shown.
 //!
 //! The window's caption has the frame rate, but a capture of the window's
-//! picture (a stream) does not carry the caption. Here the number is part
+//! picture (a stream) does not carry the caption. Here the numbers are part
 //! of the picture: a small box of text copied onto the swap chain's back
 //! buffer right after the title's frame, before it is presented. The
 //! title's own frame is not touched, so saved frames and everything read
 //! back from it are as before.
 //!
+//! The box has six lines, new once a second:
+//!
+//! ```text
+//! 5.8 FPS  172 MS            the frames shown a second and a frame's time
+//! CPU 31%  GAME 5.2 CORES    all processors, all programs; this process
+//! TOP THREAD 97%             this process's busiest thread, of one processor
+//! GPU 41%  GAME 38%          the card's busiest engine: all programs; this one
+//! VRAM 9.0/10.0 GB           the card's memory this process uses / its budget
+//! RAM 15.4 GB  FREE 3.1 GB   this process's committed memory; the PC's free
+//! ```
+//!
+//! A thread near 100 % beside a card far from it is a frame held by that
+//! thread; a card near 100 % holds it itself; neither busy is waiting (for
+//! memory to cross between the two, mostly). The load comes from
+//! `crate::stats`, the card's memory from the host.
+//!
 //! The text is drawn on the CPU with a font of its own (5 by 7 dots a
-//! glyph) into a buffer the card copies from; a buffer is made once for a
-//! text and never written again, so a present still in the air reads what
-//! it was recorded with. On by default; `VICTORY_FPS_COUNTER=0` leaves the
-//! frame as the title drew it.
+//! glyph) into one of four buffers the card copies from, taken in turn: a
+//! buffer is written again only three texts (three seconds) after it was
+//! last recorded, so a present still in the air reads what it was recorded
+//! with. On by default; `VICTORY_FPS_COUNTER=fps` shows the frame rate
+//! alone, `VICTORY_FPS_COUNTER=0` leaves the frame as the title drew it.
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -24,13 +41,24 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 /// second, by the presenter's meter); `u32::MAX` before the first.
 static TENTHS: AtomicU32 = AtomicU32::new(u32::MAX);
 
-/// Whether the counter is drawn.
-fn on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Hidden while the performance overlay is on (`overlay.rs`).
-    *ON.get_or_init(|| match std::env::var_os("VICTORY_FPS_COUNTER") {
-        Some(v) => v != "0",
-        None => std::env::var_os("VICTORY_OVERLAY").is_some_and(|v| v == "0"),
+/// What is drawn: nothing, the frame rate alone, or the whole box.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Off,
+    Rate,
+    All,
+}
+
+fn mode() -> Mode {
+    static MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_FPS_COUNTER").as_deref() {
+        Ok("0") => Mode::Off,
+        Ok("fps") => Mode::Rate,
+        Ok(_) => Mode::All,
+        // Ours: unset, the box hides while the performance overlay is on
+        // (`overlay.rs`, `VICTORY_OVERLAY=0` turns that off).
+        Err(_) if std::env::var_os("VICTORY_OVERLAY").is_some_and(|v| v == "0") => Mode::All,
+        Err(_) => Mode::Off,
     })
 }
 
@@ -55,9 +83,28 @@ fn glyph(c: char) -> [u8; 7] {
         '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
         '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
         '.' => [0, 0, 0, 0, 0, 0b01100, 0b01100],
+        '%' => [0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011],
+        '/' => [0b00001, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b10000],
+        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
+        'C' => [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
+        'D' => [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
+        'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
         'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
+        'G' => [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111],
+        'H' => [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        'K' => [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],
+        'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
+        'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
+        'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
         'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
+        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
         'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
+        'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+        'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
+        'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001],
         _ => [0; 7],
     }
 }
@@ -65,6 +112,49 @@ fn glyph(c: char) -> [u8; 7] {
 /// The text for a frame rate in tenths.
 fn text(tenths: u32) -> String {
     format!("{}.{} FPS", tenths / 10, tenths % 10)
+}
+
+/// The glyphs a line of the whole box has room for.
+const COLUMNS: usize = 26;
+
+/// The glyphs of the frame rate alone ("9999.9 FPS").
+const RATE_COLUMNS: usize = 10;
+
+/// The six lines of the whole box (see the module's notes), each exactly
+/// [`COLUMNS`] glyphs: for a frame rate in tenths, the machine's load if a
+/// look was taken, and the card's memory in bytes (budget, used) if the
+/// host answered. A line whose figures are not there yet is blank.
+fn lines(tenths: u32, stats: Option<crate::stats::Stats>, card: Option<(u64, u64)>) -> Vec<String> {
+    let gb = |mb: f64| mb / 1024.0;
+    let mut out = Vec::with_capacity(6);
+    out.push(if tenths > 0 { format!("{}  {:.0} MS", text(tenths), 10_000.0 / f64::from(tenths)) } else { text(tenths) });
+    match stats {
+        Some(s) => {
+            out.push(format!("CPU {:.0}%  GAME {:.1} CORES", s.cpu_all, s.cores));
+            out.push(format!("TOP THREAD {:.0}%", s.top_thread));
+            out.push(match (s.gpu_all, s.gpu_ours) {
+                (Some(all), Some(ours)) => format!("GPU {all:.0}%  GAME {ours:.0}%"),
+                _ => "GPU NOT KNOWN".to_owned(),
+            });
+        }
+        None => out.extend([String::new(), String::new(), String::new()]),
+    }
+    out.push(match card {
+        Some((budget, used)) => format!("VRAM {:.1}/{:.1} GB", gb((used >> 20) as f64), gb((budget >> 20) as f64)),
+        None => String::new(),
+    });
+    out.push(match stats {
+        Some(s) => format!("RAM {:.1} GB  FREE {:.1} GB", gb(f64::from(s.ram_ours_mb)), gb(f64::from(s.ram_free_mb))),
+        None => String::new(),
+    });
+    out.into_iter().map(|line| fit(&line, COLUMNS)).collect()
+}
+
+/// `line` in exactly `columns` glyphs: cut, or filled with spaces.
+fn fit(line: &str, columns: usize) -> String {
+    let mut out: String = line.chars().take(columns).collect();
+    out.extend(std::iter::repeat_n(' ', columns - out.chars().count()));
+    out
 }
 
 /// Bytes a pixel of a swap chain format this layer presents in, or none.
@@ -111,25 +201,31 @@ fn half(v: f32) -> u16 {
     ((exponent as u32) << 10 | (bits >> 13) & 0x3FF) as u16
 }
 
-/// The box for `text` at `scale` dots a pixel: its width and height in
-/// pixels and, row by row from the top, whether each pixel is text.
+/// The box for `text` (lines parted by `\n`) at `scale` dots a pixel: its
+/// width and height in pixels and, row by row from the top, whether each
+/// pixel is text. A glyph takes six dots across with its gap and a line
+/// nine down with its gap; a pad of two dots lies all round.
 fn bitmap(text: &str, scale: u32) -> (u32, u32, Vec<bool>) {
-    let chars: Vec<char> = text.chars().collect();
+    let lines: Vec<Vec<char>> = text.split('\n').map(|l| l.chars().collect()).collect();
+    let longest = lines.iter().map(Vec::len).max().unwrap_or(0).max(1) as u32;
     let pad = 2 * scale;
-    let width = 2 * pad + chars.len() as u32 * 6 * scale - scale;
-    let height = 2 * pad + 7 * scale;
+    let width = 2 * pad + longest * 6 * scale - scale;
+    let height = 2 * pad + lines.len() as u32 * 9 * scale - 2 * scale;
     let mut lit = vec![false; (width * height) as usize];
-    for (i, &c) in chars.iter().enumerate() {
-        let rows = glyph(c);
-        for (row, bits) in rows.into_iter().enumerate() {
-            for column in 0..5u32 {
-                if bits >> (4 - column) & 1 == 0 {
-                    continue;
-                }
-                let (x0, y0) = (pad + (i as u32 * 6 + column) * scale, pad + row as u32 * scale);
-                for y in y0..y0 + scale {
-                    for x in x0..x0 + scale {
-                        lit[(y * width + x) as usize] = true;
+    for (line, chars) in lines.iter().enumerate() {
+        for (i, &c) in chars.iter().enumerate() {
+            let rows = glyph(c);
+            for (row, bits) in rows.into_iter().enumerate() {
+                for column in 0..5u32 {
+                    if bits >> (4 - column) & 1 == 0 {
+                        continue;
+                    }
+                    let x0 = pad + (i as u32 * 6 + column) * scale;
+                    let y0 = pad + (line as u32 * 9 + row as u32) * scale;
+                    for y in y0..y0 + scale {
+                        for x in x0..x0 + scale {
+                            lit[(y * width + x) as usize] = true;
+                        }
                     }
                 }
             }
@@ -138,26 +234,45 @@ fn bitmap(text: &str, scale: u32) -> (u32, u32, Vec<bool>) {
     (width, height, lit)
 }
 
-/// A buffer the card copies a text's box from, with its footprint.
+/// A buffer the card copies a box from, with its footprint and where its
+/// bytes are mapped.
 struct Made {
     buffer: ID3D12Resource,
+    data: *mut u8,
     width: u32,
     height: u32,
     pitch: u32,
 }
 
-// SAFETY: a free-threaded D3D12 object and plain numbers.
+// SAFETY: a free-threaded D3D12 object, its mapping (written under
+// `PANEL`'s lock only) and plain numbers.
 unsafe impl Send for Made {}
 
-/// The boxes made so far, by text, format and scale.
-static MADE: Mutex<Option<HashMap<(u32, i32, u32), Made>>> = Mutex::new(None);
+/// The buffers a text is drawn into, in turn.
+const RING: usize = 4;
 
-/// Copies the frame rate's box onto `back`, a back buffer of `width` by
-/// `height` pixels of `format` that `list` holds as a copy's destination.
-/// Nothing if the counter is off, no rate was measured yet, the format is
-/// not one of ours or the frame is too small for the box.
+/// The box as last drawn.
+#[derive(Default)]
+struct Panel {
+    /// What the buffers were made for: the format, the scale, the glyphs
+    /// across and the lines.
+    made_for: Option<(i32, u32, usize, usize)>,
+    /// The text in `ring[at]`: the frame rate and the number of the look at
+    /// the machine's load.
+    shown: Option<(u32, u64)>,
+    ring: Vec<Made>,
+    at: usize,
+}
+
+static PANEL: Mutex<Option<Panel>> = Mutex::new(None);
+
+/// Copies the box onto `back`, a back buffer of `width` by `height` pixels
+/// of `format` that `list` holds as a copy's destination. Nothing if the
+/// box is off, no rate was measured yet, the format is not one of ours or
+/// the frame is too small for the box.
 pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, back: &ID3D12Resource, (width, height, format): (u32, u32, DXGI_FORMAT)) {
-    if !on() {
+    let mode = mode();
+    if mode == Mode::Off {
         return;
     }
     let tenths = TENTHS.load(Ordering::Relaxed);
@@ -167,31 +282,60 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
     // About a fortieth of the frame's height a glyph: 6 dots a pixel at
     // 2160 lines, 3 at 1080.
     let scale = (height / 360).clamp(2, 12);
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    let made = made.get_or_insert_with(HashMap::new);
-    if made.len() > 2048 {
-        // (Every text is a buffer of a few hundred KiB; a rate that wanders
-        // over thousands of values is not expected.)
-        made.clear();
+    let stats = (mode == Mode::All).then(|| {
+        crate::stats::start();
+        crate::stats::now()
+    });
+    let look = stats.flatten();
+    let (columns, rows) = if mode == Mode::All { (COLUMNS, 6) } else { (RATE_COLUMNS, 1) };
+    let mut panel = PANEL.lock().unwrap_or_else(|e| e.into_inner());
+    let panel = panel.get_or_insert_with(Panel::default);
+    let made_for = Some((format.0, scale, columns, rows));
+    if panel.made_for != made_for {
+        // Another size of frame or another format: new buffers. A present
+        // still in the air may read the old ones, so they are never let go
+        // (a few hundred KiB each; this happens when the window changes).
+        std::mem::forget(std::mem::take(&mut panel.ring));
+        *panel = Panel { made_for, ..Default::default() };
     }
-    let key = (tenths, format.0, scale);
-    if !made.contains_key(&key) {
-        let (w, h, lit) = bitmap(&text(tenths), scale);
-        let pitch = (w as usize * bytes).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize);
-        let Some((buffer, data)) = host.shared_buffer((pitch * h as usize) as u64) else {
-            return;
+    let key = (tenths, look.map_or(0, |(number, _)| number));
+    if panel.shown != Some(key) {
+        let text = if mode == Mode::All {
+            let card = host.video_memory().map(|m| (m[0], m[1]));
+            lines(tenths, look.map(|(_, s)| s), card).join("\n")
+        } else {
+            fit(&text(tenths), RATE_COLUMNS)
         };
-        // SAFETY: the buffer's own mapped bytes, `pitch * h` of them.
-        let out = unsafe { std::slice::from_raw_parts_mut(data, pitch * h as usize) };
+        let (w, h, lit) = bitmap(&text, scale);
+        let pitch = (w as usize * bytes).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize);
+        // The next buffer in turn, made at its first use.
+        let at = if panel.ring.len() < RING {
+            let Some((buffer, data)) = host.shared_buffer((pitch * h as usize) as u64) else {
+                return;
+            };
+            panel.ring.push(Made { buffer, data, width: w, height: h, pitch: pitch as u32 });
+            panel.ring.len() - 1
+        } else {
+            (panel.at + 1) % RING
+        };
+        let m = &panel.ring[at];
+        if (m.width, m.height, m.pitch) != (w, h, pitch as u32) {
+            // (Every text of one `made_for` has one size: not reached.)
+            return;
+        }
+        // SAFETY: the buffer's own mapped bytes, `pitch * h` of them; the
+        // card last read them at least `RING - 1` texts ago.
+        let out = unsafe { std::slice::from_raw_parts_mut(m.data, pitch * h as usize) };
         for y in 0..h as usize {
             for x in 0..w as usize {
-                let at = y * pitch + x * bytes;
-                pixel(format, lit[y * w as usize + x], &mut out[at..at + bytes]);
+                let to = y * pitch + x * bytes;
+                pixel(format, lit[y * w as usize + x], &mut out[to..to + bytes]);
             }
         }
-        made.insert(key, Made { buffer, width: w, height: h, pitch: pitch as u32 });
+        panel.at = at;
+        panel.shown = Some(key);
     }
-    let Some(m) = made.get(&key) else {
+    let Some(m) = panel.ring.get(panel.at) else {
         return;
     };
     let margin = 4 * scale;
@@ -250,6 +394,48 @@ mod tests {
         for c in "0123456789.FPS".chars() {
             assert!(glyph(c).iter().any(|&r| r != 0), "{c}");
         }
+    }
+
+    #[test]
+    fn the_whole_box_has_six_lines_of_one_length_and_a_glyph_for_every_letter() {
+        let stats = crate::stats::Stats {
+            cpu_all: 100.0,
+            cores: 28.0,
+            top_thread: 100.0,
+            gpu_all: Some(100.0),
+            gpu_ours: Some(100.0),
+            ram_ours_mb: 31 * 1024 + 512,
+            ram_free_mb: 12 * 1024 + 100,
+        };
+        // The longest figures there can be, the usual ones, and none.
+        let texts = [
+            lines(99_999, Some(stats), Some((12_282 << 20, 11_900 << 20))),
+            lines(58, Some(crate::stats::Stats { gpu_all: None, gpu_ours: None, ..stats }), Some((10_048 << 20, 9_039 << 20))),
+            lines(0, None, None),
+        ];
+        assert_eq!(texts[0][0].trim_end(), "9999.9 FPS  0 MS");
+        assert_eq!(texts[0][1].trim_end(), "CPU 100%  GAME 28.0 CORES");
+        assert_eq!(texts[0][5].trim_end(), "RAM 31.5 GB  FREE 12.1 GB");
+        assert_eq!(texts[1][0].trim_end(), "5.8 FPS  172 MS");
+        assert_eq!(texts[1][2].trim_end(), "TOP THREAD 100%");
+        assert_eq!(texts[1][3].trim_end(), "GPU NOT KNOWN");
+        assert_eq!(texts[1][4].trim_end(), "VRAM 8.8/9.8 GB");
+        assert_eq!(texts[2][0].trim_end(), "0.0 FPS");
+        for lines in &texts {
+            assert_eq!(lines.len(), 6);
+            for line in lines {
+                assert_eq!(line.chars().count(), COLUMNS, "{line:?}");
+                for c in line.chars().filter(|c| *c != ' ') {
+                    assert!(glyph(c).iter().any(|&r| r != 0), "no glyph for {c:?} in {line:?}");
+                }
+            }
+        }
+        // Six lines: nine dots a line, less the last gap, and the pad.
+        let (w, h, lit) = bitmap(&texts[0].join("\n"), 3);
+        assert_eq!((w, h), ((COLUMNS as u32 * 6 - 1 + 4) * 3, (6 * 9 - 2 + 4) * 3));
+        assert_eq!(lit.len(), (w * h) as usize);
+        // The frame rate alone keeps its length whatever the rate.
+        assert_eq!(fit(&text(7), RATE_COLUMNS).len(), fit(&text(99_999), RATE_COLUMNS).len());
     }
 
     #[test]

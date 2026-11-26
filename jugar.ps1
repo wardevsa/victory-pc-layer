@@ -243,7 +243,7 @@ if ($Diag) {
     # cargo build --release -p victory --features diagnostics --target-dir target\diag
     $exe = ".\target\diag\release\victory.exe"
     $log = "diag-$Resolution.log"
-    $env:VICTORY_PIPELINE_DUMP = Join-Path $PSScriptRoot "pipeline-dumps"
+    $env:VICTORY_NATIVE_PSO_DUMP = Join-Path $PSScriptRoot "pipeline-dumps"
     # -Tiempos: the card's time of every command it runs, by program
     # (VICTORY_GPU_TIMING; the run is slower: each list is sent on its own).
     # The log's "the card's time by command (timing run)" lines.

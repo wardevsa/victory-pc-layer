@@ -358,6 +358,20 @@ struct Lanes {
     /// BCPack bytes written and time spent on them.
     bcpack: (u64, std::time::Duration),
     since: Option<std::time::Instant>,
+    /// Reads held back for the title's Submit when a half-full queue
+    /// submitted itself, since the last line: Submits that released some,
+    /// entries released, and the wait (sum, most) from the first hold to
+    /// that Submit (µs); when the last line was written. (A lead for the
+    /// stand-in models and the haze: a batch of streamed data waits here
+    /// for one call of the title's; gfx41.)
+    held_waits: (u64, u64, u64, u64),
+    held_line: Option<std::time::Instant>,
+    /// Since the last 5 s line: the slowest request run (ms, destination
+    /// bytes, options), and requests over 250 ms and over 1 s, plain and
+    /// BCPack apart (gfx41: BCPack decodes at about 12 MB/s a worker in run
+    /// 327, and a status waits for every earlier request of its queue).
+    slowest: (u64, u32, u64),
+    slow: [u64; 4],
 }
 
 /// A queue's requests in the scheduler.
@@ -371,6 +385,8 @@ struct Lane {
     /// Left out when the queue submitted itself, until the title's Submit:
     /// reads into physical pages and the status entries behind them.
     held: Vec<Command>,
+    /// When the first of `held` was left out (for the held-wait line).
+    held_since: Option<std::time::Instant>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
     reads: VecDeque<(u64, Request)>,
@@ -418,6 +434,10 @@ fn scheduler() -> Option<&'static Scheduler> {
                     refused: 0,
                     bcpack: Default::default(),
                     since: None,
+                    held_waits: Default::default(),
+                    held_line: None,
+                    slowest: (0, 0, 0),
+                    slow: [0; 4],
                 }),
                 work: Condvar::new(),
                 finished: Condvar::new(),
@@ -541,6 +561,17 @@ impl Lanes {
             self.bcpack.0 += u64::from(job.request.destination_size);
             self.bcpack.1 += started.elapsed();
         }
+        let ms = started.elapsed().as_millis() as u64;
+        let bc = job.request.options & BCPACK != 0;
+        if ms > self.slowest.0 {
+            self.slowest = (ms, job.request.destination_size, job.request.options);
+        }
+        if ms >= 250 {
+            self.slow[usize::from(bc) * 2] += 1;
+        }
+        if ms >= 1000 {
+            self.slow[usize::from(bc) * 2 + 1] += 1;
+        }
         let since = *self.since.get_or_insert(started);
         let elapsed = since.elapsed();
         if elapsed.as_secs() >= 5 {
@@ -557,6 +588,18 @@ impl Lanes {
                 waiting,
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
+            );
+            let (ms, bytes, options) = std::mem::take(&mut self.slowest);
+            let slow = std::mem::take(&mut self.slow);
+            tracing::info!(
+                "dstorage, slowest request in the last {:.1} s: {ms} ms for {:.1} MB (options {options:#x}{}); requests over                  250 ms: {} plain, {} BCPack; over 1 s: {} plain, {} BCPack (a status behind such a request on its queue                  waits that long)",
+                elapsed.as_secs_f64(),
+                f64::from(bytes) / 1e6,
+                if options & BCPACK != 0 { ", BCPack" } else { "" },
+                slow[0],
+                slow[2],
+                slow[1],
+                slow[3],
             );
             self.done = Default::default();
             self.bcpack = Default::default();
@@ -641,6 +684,15 @@ impl Lanes {
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
+        let now = std::time::Instant::now();
+        // The title's Submit releases what a self-submit held: how long it waited.
+        let released = if explicit && !lane.held.is_empty() {
+            lane.held_since
+                .take()
+                .map(|since| (lane.held.len() as u64, now.saturating_duration_since(since).as_micros() as u64))
+        } else {
+            None
+        };
         let mut commands = if explicit { std::mem::take(&mut lane.held) } else { Vec::new() };
         commands.append(&mut lane.unsubmitted);
         for command in commands {
@@ -660,7 +712,38 @@ impl Lanes {
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
+        if !lane.held.is_empty() && lane.held_since.is_none() {
+            lane.held_since = Some(now);
+        }
         lane.flush();
+        if let Some((entries, us)) = released {
+            let w = &mut self.held_waits;
+            w.0 += 1;
+            w.1 += entries;
+            w.2 += us;
+            w.3 = w.3.max(us);
+        }
+        self.held_line(now);
+    }
+
+    /// Every 5 s while it has something: [`Lanes::held_waits`] as one line.
+    fn held_line(&mut self, now: std::time::Instant) {
+        let since = *self.held_line.get_or_insert(now);
+        let secs = now.saturating_duration_since(since).as_secs_f64();
+        if secs < 5.0 {
+            return;
+        }
+        self.held_line = Some(now);
+        let (releases, entries, sum, most) = std::mem::take(&mut self.held_waits);
+        let held_now: usize = self.lanes.values().map(|l| l.held.len()).sum();
+        if releases == 0 && held_now == 0 {
+            return;
+        }
+        tracing::info!(
+            "dstorage reads held for the title's Submit after a queue submitted itself, last {secs:.1} s: {releases} Submits released {entries} entries, waited {:.1} ms on average, {:.1} ms at most; held now {held_now}",
+            sum as f64 / releases.max(1) as f64 / 1e3,
+            most as f64 / 1e3,
+        );
     }
 }
 
@@ -672,6 +755,7 @@ impl Lane {
             clock: 0,
             unsubmitted: Vec::new(),
             held: Vec::new(),
+            held_since: None,
             reads: VecDeque::new(),
             statuses: VecDeque::new(),
             running: BTreeSet::new(),
@@ -1610,6 +1694,10 @@ mod tests {
             refused: 0,
             bcpack: Default::default(),
             since: None,
+            held_waits: Default::default(),
+            held_line: None,
+            slowest: (0, 0, 0),
+            slow: [0; 4],
         }
     }
 

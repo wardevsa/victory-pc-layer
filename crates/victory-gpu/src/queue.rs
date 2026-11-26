@@ -687,7 +687,7 @@ fn send_joined(joined: &mut Joined) {
         let sent = JOINED[1].fetch_add(1, Ordering::Relaxed) + 1;
         JOINED[2].fetch_add(order.len() as u64, Ordering::Relaxed);
         JOINED[3].fetch_add(joined.signals.len() as u64, Ordering::Relaxed);
-        if sent % 2048 == 0 {
+        if sent.is_multiple_of(2048) {
             let n: Vec<u64> = JOINED.iter().map(|n| n.swap(0, Ordering::Relaxed)).collect();
             tracing::info!(
                 "parts joined (VICTORY_JOIN_PARTS=1): {} parts went to the host in {} submissions ({:.1} parts, {:.1} lists each), {} signals delivered behind them, {} waits passed for a write of a part not sent yet",
@@ -1495,6 +1495,8 @@ extern "system" fn copy_page_mappings(
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
     let mut ok = true;
+    // The remapping meter: what the title asks for, by kind of range.
+    crate::framelog::add(crate::framelog::T::PageMapCalls, 1);
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
             continue;
@@ -1506,6 +1508,19 @@ extern "system" fn copy_page_mappings(
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
+            {
+                use crate::framelog::{T, add};
+                let counted = match r.kind {
+                    0 => Some((T::PageMapRanges0, T::PageMapPages0)),
+                    1 => Some((T::PageMapRanges1, T::PageMapPages1)),
+                    2 => Some((T::PageMapRanges2, T::PageMapPages2)),
+                    _ => None,
+                };
+                if let Some((ranges, pages)) = counted {
+                    add(ranges, 1);
+                    add(pages, u64::from(r.count));
+                }
+            }
             ok &= match r.kind {
                 0 if inside(r.count) => map(at, source, len),
                 1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),

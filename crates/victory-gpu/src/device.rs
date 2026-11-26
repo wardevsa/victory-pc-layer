@@ -397,66 +397,62 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         );
     }
     #[cfg(windows)]
-    dump_unknown_pipeline(SLOT, calls, desc);
+    if let Some(dir) = std::env::var_os("VICTORY_NATIVE_PSO_DUMP") {
+        dump_native(SLOT, desc as usize, std::path::Path::new(&dir));
+    }
     E_NOTIMPL
 }
 
-/// With `VICTORY_PIPELINE_DUMP=<folder>`: the first calls of each pipeline
-/// method still being worked out (16 of 0x1c8, 400 of 0x218, whose
-/// programs vary more) write what they were given: `<slot>-<call>-desc.bin`
-/// (the description's first 512 bytes), `-obj.bin` (512 bytes at its first
-/// word, an object of ours so far) and `-w<i>.bin` for each (address, size)
-/// pair of words `i`, `i+1` that looks like a block (a size from 1 to
-/// 1 MiB after an address).
+/// `VICTORY_NATIVE_PSO_DUMP=<dir>` (diagnostics; off unless set): the blobs
+/// a 0x1c8 / 0x218 description names, once per description key (0x218: its
+/// word 11, a 64-bit hash; 0x1c8: the code pointers of words 5 and 9).
+/// Files: `<dir>/<slot>_<key>/desc.bin` (the first 0x80 bytes), `root.bin`
+/// (0x80 bytes at word 0), `w<i>_<size>.bin` for each (pointer, size) pair
+/// at words (1,2) (3,4) (5,6) (7,8) (9,10) (11,12), and `p9.bin` /
+/// `p10.bin` (0x100 bytes at 0x218's two unsized pointers). Everything is
+/// read through the kernel (`host::read_into`): an unmapped pointer is
+/// skipped, never touched.
 #[cfg(windows)]
-pub(crate) fn dump_unknown_pipeline(slot: usize, calls: u32, desc: *const u8) {
-    use std::sync::OnceLock;
-    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
-    let Some(dir) = DIR.get_or_init(|| {
-        let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_PIPELINE_DUMP")?);
-        std::fs::create_dir_all(&dir).ok()?;
-        tracing::warn!(dir = %dir.display(), "unknown pipeline methods' arguments dumped");
-        Some(dir)
-    }) else {
+pub(crate) fn dump_native(slot: usize, desc: usize, dir: &std::path::Path) {
+    use std::sync::Mutex;
+    static SEEN: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+    let read = |at: usize, n: usize| -> Option<Vec<u8>> {
+        let mut b = vec![0u8; n];
+        (at != 0 && n <= 1 << 20 && crate::host::read_into(at as *const u8, &mut b)).then_some(b)
+    };
+    let Some(d) = read(desc, 0x80) else {
         return;
     };
-    let limit = if slot == 0x218 { 400 } else { 16 };
-    if calls > limit || desc.is_null() {
-        return;
+    let w = |i: usize| u64::from_le_bytes(d[8 * i..8 * i + 8].try_into().unwrap_or([0; 8]));
+    let key = if slot == 0x218 { w(11) } else { w(5) ^ (w(9) << 1) };
+    {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.contains(&(slot, key)) || seen.len() >= 4096 {
+            return;
+        }
+        seen.push((slot, key));
     }
-    let read = |at: u64, n: usize| -> Option<Vec<u8>> {
-        let mut bytes = vec![0u8; n];
-        (at != 0 && crate::host::read_into(at as *const u8, &mut bytes)).then_some(bytes)
-    };
-    let name = |what: &str| dir.join(format!("{slot:x}-{calls:02}-{what}.bin"));
-    let Some(head) = read(desc as u64, 512) else {
-        return;
-    };
-    let _ = std::fs::write(name("desc"), &head);
-    let words: Vec<u64> = head
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .map(|c| u64::from_le_bytes(*c))
-        .collect();
-    if let Some(obj) = read(words[0], 512) {
-        let _ = std::fs::write(name("obj"), obj);
+    let sub = dir.join(format!("{slot:x}_{key:016x}"));
+    let _ = std::fs::create_dir_all(&sub);
+    let _ = std::fs::write(sub.join("desc.bin"), &d);
+    if let Some(r) = read(w(0) as usize, 0x80) {
+        let _ = std::fs::write(sub.join("root.bin"), r);
     }
-    // 0x218's words 9 and 10 are addresses without a size: 256 bytes of
-    // each, in case the wave size or more state is there.
-    if slot == 0x218 {
-        for i in [9, 10] {
-            if let Some(block) = read(words[i], 256) {
-                let _ = std::fs::write(name(&format!("p{i:02}")), block);
-            }
+    let pairs: &[usize] = if slot == 0x218 { &[1, 3, 5, 7] } else { &[1, 3, 5, 7, 9, 11] };
+    for &i in pairs {
+        let (at, size) = (w(i) as usize, w(i + 1) as usize);
+        if at == 0 || size == 0 || size > 1 << 20 {
+            continue;
+        }
+        if let Some(b) = read(at, size) {
+            let _ = std::fs::write(sub.join(format!("w{i}_{size:x}.bin")), b);
         }
     }
-    for i in 1..words.len() - 1 {
-        let (at, len) = (words[i], words[i + 1]);
-        if at > 0x10000 && (1..=1 << 20).contains(&len)
-            && let Some(block) = read(at, len as usize)
-        {
-            let _ = std::fs::write(name(&format!("w{i:02}")), block);
+    if slot == 0x218 {
+        for i in [9usize, 10] {
+            if let Some(b) = read(w(i) as usize, 0x100) {
+                let _ = std::fs::write(sub.join(format!("p{i}.bin")), b);
+            }
         }
     }
 }

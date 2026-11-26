@@ -178,14 +178,19 @@ fn parse_manifest(bytes: &[u8]) -> Option<Vec<String>> {
 }
 
 /// The container's newest committed version, if any. Removes what a crash
-/// left: unfinished versions and older ones.
+/// left: unfinished versions and older ones (what cannot be removed now
+/// is left for a later call).
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let mut committed = Vec::new();
     for entry in std::fs::read_dir(dir)?.flatten() {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            // As far as it goes, like the older versions below: an
+            // unfinished version is never read.
+            if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                tracing::debug!(dir = %entry.path().display(), %e, "an unfinished save version stays for now");
+            }
         } else if let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok()) {
             committed.push(n);
         }
@@ -194,8 +199,17 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let Some(&number) = committed.last() else {
         return Ok(None);
     };
+    // Older versions are removed as far as that goes. The highest version
+    // is the container whatever is left below it, and a file another
+    // program holds without letting it be deleted (a virus scanner, a
+    // backup in progress) fails the removal: returning that error made the
+    // container unreadable and every save of it fail for as long as the
+    // file was held.
     for old in &committed[..committed.len() - 1] {
-        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+        let path = dir.join(format!("v{old}"));
+        if let Err(e) = std::fs::remove_dir_all(&path) {
+            tracing::info!(dir = %path.display(), %e, "an older save version stays for now; it goes at a later save");
+        }
     }
     let version = dir.join(format!("v{number}"));
     let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
@@ -1000,6 +1014,37 @@ mod tests {
         let blobs = read(&c, None).unwrap();
         let text = |(n, d): (String, Vec<u8>)| (n, String::from_utf8(d).unwrap());
         Some((display, blobs.into_iter().map(text).collect()))
+    }
+
+    /// A file of an older version held by another program (a virus scanner,
+    /// a backup copy in progress) keeps that version from being removed.
+    /// The saves after it must not fail for that: the newest version is the
+    /// container whatever is left below it, and what is left goes at a
+    /// later save.
+    #[test]
+    fn an_older_version_that_cannot_be_removed_does_not_fail_the_saves_after_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = container_dir(root.path(), "Slot");
+        let versions = || {
+            let entries = std::fs::read_dir(&dir).unwrap().flatten();
+            entries.filter(|e| e.file_name().to_string_lossy().starts_with('v')).count()
+        };
+        assert_eq!(update(root.path(), "one", &[("a", Some("first a"))]), S_OK);
+        let first = current(&dir).unwrap().unwrap();
+        // Opened with no sharing: nobody else can delete it while it is held.
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(first.blob(0)).unwrap();
+        // Blob `a` is written anew each time, so no version shares the held file.
+        assert_eq!(update(root.path(), "two", &[("a", Some("second a"))]), S_OK);
+        assert_eq!(state(root.path()), Some(("two".into(), vec![("a".into(), "second a".into())])));
+        assert_eq!(update(root.path(), "three", &[("a", Some("third a"))]), S_OK);
+        assert_eq!(state(root.path()), Some(("three".into(), vec![("a".into(), "third a".into())])));
+        assert!(first.blob(0).exists(), "the held file is still there");
+        // Let go of: the next looks at the container remove what was left.
+        drop(held);
+        assert_eq!(update(root.path(), "four", &[("a", Some("fourth a"))]), S_OK);
+        assert_eq!(state(root.path()), Some(("four".into(), vec![("a".into(), "fourth a".into())])));
+        assert_eq!(versions(), 1);
     }
 
     fn old_state() -> Option<(String, Vec<(String, String)>)> {

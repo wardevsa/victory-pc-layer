@@ -203,7 +203,17 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
-        for (range_from, range_end) in written.take(start as usize, end as usize) {
+        // With `VICTORY_HEAP_SYNC_CUT`: only the pages that hold slots the
+        // host heap has title slots for are taken and read ([`sync_cut`]).
+        let looked_end = if sync_cut() {
+            (start as usize).saturating_add(mirrored_count as usize * step as usize).min(end as usize)
+        } else {
+            end as usize
+        };
+        let asking = std::time::Instant::now();
+        let ranges = written.take(start as usize, looked_end);
+        SYNC_PARTS[0].fetch_add(asking.elapsed().as_micros() as u64, Relaxed);
+        for (range_from, range_end) in ranges {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 let from = page.max(range_from);
@@ -212,7 +222,10 @@ pub(crate) fn sync_heaps() {
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
                 page_bytes.resize(to - from, 0);
-                if crate::host::read_into(from as *const u8, &mut page_bytes) {
+                let reading = std::time::Instant::now();
+                let read = crate::host::read_into(from as *const u8, &mut page_bytes);
+                SYNC_PARTS[1].fetch_add(reading.elapsed().as_micros() as u64, Relaxed);
+                if read {
                     pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                     // The page's records in one go, under one lock
@@ -254,6 +267,174 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+/// Whether a submission's pass over the title's view heaps ([`sync_heaps`])
+/// and the making of the slots that waited for a texture's host copy
+/// ([`make_waiting`]) run on a thread of their own while the submitting
+/// thread prepares the submission (`VICTORY_SYNC_BESIDE=1`; off by default:
+/// both on the submitting thread before preparing, as before). `alt`:
+/// twenty seconds with, twenty without, in turn, each change said in the
+/// log; decided once per submission.
+///
+/// Why: the pass is 9.0 to 11.1 ms a frame on the submitting thread in the
+/// boat-save runs 311-316 (its by-part line; "making the host slots of the
+/// changed records" 6.0 to 7.6 of it, 7,000 to 10,000 records a frame),
+/// and that thread is the frame's wall (at work 68 of a 79 ms usual frame,
+/// run 316). Preparing (40 to 60 ms) reads and writes title memory and host
+/// copies, not the host heap's slots; the slots are read when the lists
+/// run, after [`sync_end`].
+///
+/// What changes: the pass starts after the once-a-second sweep instead of
+/// before it (the sweep lets go only of what no slot names, so nothing the
+/// pass names is let go under it), and after the submission counts as
+/// started (what its slot writes retire waits for this submission too). It
+/// runs beside the submitting thread's steps, which may write title
+/// memory (memory-to-memory copies); records such a step writes into a
+/// view heap may be mirrored in this submission instead of the next.
+#[cfg(windows)]
+pub(crate) fn sync_beside() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_SYNC_BESIDE").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "the pass over the title's view heap runs beside the preparing from now (VICTORY_SYNC_BESIDE=alt): {}",
+                    if on { "ON" } else { "off, on the submitting thread before it as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// [`sync_beside`]'s hand-over: 0 nothing asked, 1 asked, 2 running.
+#[cfg(windows)]
+static BESIDE: (std::sync::Mutex<u8>, std::sync::Condvar) = (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+/// Since the line last took them: passes run beside, microseconds the
+/// submitting thread waited for one at [`sync_end`], passes it found done.
+#[cfg(windows)]
+static BESIDE_COUNTS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Hands the pass and [`make_waiting`] to their thread (started once); the
+/// submitting thread goes on preparing. Without the thread both run here.
+#[cfg(windows)]
+pub(crate) fn sync_begin() {
+    static THREAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let started = *THREAD.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("victory-heap-sync".into())
+            .spawn(|| {
+                crate::framelog::keep_on_fast_cores("victory-heap-sync");
+                loop {
+                    {
+                        let mut state = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
+                        while *state != 1 {
+                            state = BESIDE.1.wait(state).unwrap_or_else(|e| e.into_inner());
+                        }
+                        *state = 2;
+                    }
+                    sync_heaps();
+                    make_waiting();
+                    *BESIDE.0.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+                    BESIDE.1.notify_all();
+                }
+            })
+            .is_ok()
+    });
+    if !started {
+        sync_heaps();
+        make_waiting();
+        return;
+    }
+    let mut state = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
+    // (One submission at a time holds the submission lock, and each ends
+    // with [`sync_end`]: nothing is running here now.)
+    while *state != 0 {
+        state = BESIDE.1.wait(state).unwrap_or_else(|e| e.into_inner());
+    }
+    *state = 1;
+    BESIDE_COUNTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    BESIDE.1.notify_all();
+}
+
+/// Waits until the pass handed over by [`sync_begin`] is done (at once if
+/// none is out).
+#[cfg(windows)]
+pub(crate) fn sync_end() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let waiting = std::time::Instant::now();
+    let mut state = BESIDE.0.lock().unwrap_or_else(|e| e.into_inner());
+    if *state == 0 {
+        BESIDE_COUNTS[2].fetch_add(1, Relaxed);
+        return;
+    }
+    while *state != 0 {
+        state = BESIDE.1.wait(state).unwrap_or_else(|e| e.into_inner());
+    }
+    BESIDE_COUNTS[1].fetch_add(waiting.elapsed().as_micros() as u64, Relaxed);
+}
+
+/// Whether [`sync_heaps`] leaves alone the part of a title view heap the
+/// host heap has no title slots for (`VICTORY_HEAP_SYNC_CUT=1`; off by
+/// default; `alt`: twenty seconds with, twenty without, in turn, each
+/// change said in the log).
+///
+/// On a host that caps view heaps at 1,000,000 the host heap holds the
+/// title's slots below 737,855 and the title's heap has 1,245,184. The
+/// records past the host's title slots were never mirrored
+/// ([`changed_slots`] cuts them off), but their pages were asked about and
+/// read all the same, and they are the busiest of the heap: the title
+/// keeps its own per-draw tables there and rewrites them every frame
+/// (measured in run 285 with an instrument since removed: about 100,000
+/// records a frame that are not zeros, a third of them live view objects,
+/// a fifth constant views; about half of the changed pages a frame). The
+/// layer serves those tables from slots of its own when a draw names
+/// them. With the switch the pass asks the write watch about, and reads,
+/// the mirrored part only: the same records are mirrored.
+#[cfg(windows)]
+fn sync_cut() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_HEAP_SYNC_CUT").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "the pass over the title's view heap leaves the part the host has no title slots for alone from now                      (VICTORY_HEAP_SYNC_CUT=alt): {}",
+                    if on { "ON" } else { "off, every changed page is read as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Microseconds of [`sync_heaps`] by part, since its line last took them:
+/// asking the write tracking which pages changed, reading the pages, the
+/// walk over their records (`HostHeap::mirror_copied_page`), and making
+/// the host slots of the records that changed. An instrument: the pass is
+/// 8 to 13 ms a frame and cutting the pages read took nothing off it (run
+/// 286).
+pub(crate) static SYNC_PARTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
 /// not the one last seen (mirrored), and the microseconds it took.
@@ -277,6 +458,36 @@ pub(crate) fn sync_line(frames: f64) {
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
         micros as f64 / 1000.0 / frames
     );
+    let [beside, waited_us, found_done] = [0, 1, 2].map(|i| BESIDE_COUNTS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    if beside > 0 {
+        tracing::info!(
+            "the pass over the title's view heap beside the preparing (VICTORY_SYNC_BESIDE), per frame: {:.1} passes, the submitting thread waited {:.2} ms for them, {:.1} found done",
+            beside as f64 / frames,
+            waited_us as f64 / 1e3 / frames,
+            found_done as f64 / frames
+        );
+    }
+    let parts = [0, 1, 2, 3].map(|i| SYNC_PARTS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e3 / frames);
+    tracing::info!(
+        "the pass over the title's view heap by part, ms per frame: asking which pages changed {:.2}, reading the pages {:.2},          the walk over their records {:.2}, making the host slots of the changed records {:.2}",
+        parts[0],
+        parts[1],
+        parts[2],
+        parts[3]
+    );
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = host::MIRRORED.each_ref().map(|a| a.swap(0, Relaxed) as f64 / frames);
+        let us = host::MIRROR_US.each_ref().map(|a| a.swap(0, Relaxed) as f64 / 1e3 / frames);
+        tracing::info!(
+            "the view-heap pass's records made, per frame, by what making them did (count, ms): made already {:.0} {:.2}, \
+             not a view of ours {:.0} {:.2}, the same view as made {:.0} {:.2}, the old view kept {:.0} {:.2}, \
+             left for later (a null view made) {:.0} {:.2}, a view created {:.0} {:.2}, other {:.0} {:.2}; inside: \
+             buffer notes and stale slots {:.2} ms, creating views {:.2} ms, keeping the slots' resources {:.2} ms",
+            n[0], n[7], n[1], n[8], n[2], n[9], n[3], n[10], n[4], n[11], n[5], n[12], n[6], n[13], us[0], us[1], us[2]
+        );
+    }
 }
 
 /// Whether [`sync_heaps`] hands a changed page's records to the host heap
@@ -889,7 +1100,61 @@ pub(crate) fn forget(resource: usize) {
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+        if crate::heap_pass::marked_set() {
+            note_forgotten(i);
+        }
     }
+}
+
+/// With `VICTORY_HEAP_PASS_MARKED` (`crate::heap_pass`): table entries
+/// freed since the pass over the heap's buffer views last asked
+/// ([`take_forgotten`]): records that name them read nothing now, though no
+/// slot was written. Kept only once a pass has asked.
+static FORGOTTEN: std::sync::Mutex<(bool, bool, Vec<u32>)> = std::sync::Mutex::new((false, false, Vec::new()));
+
+/// More entries than this between two asks: the list is dropped, and the
+/// next ask is told it does not know.
+const FORGOTTEN_MOST: usize = 1 << 20;
+
+fn note_forgotten(i: u32) {
+    let mut forgotten = FORGOTTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (asked, overflowed, list) = &mut *forgotten;
+    if !*asked || *overflowed {
+        return;
+    }
+    if list.len() >= FORGOTTEN_MOST {
+        *overflowed = true;
+        *list = Vec::new();
+        return;
+    }
+    list.push(i);
+}
+
+/// The table entries freed since the last call (in any order, maybe
+/// twice); `None` on the first call and when too many were to be kept.
+pub(crate) fn take_forgotten() -> Option<Vec<u32>> {
+    let mut forgotten = FORGOTTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (asked, overflowed, list) = &mut *forgotten;
+    let known = *asked && !*overflowed;
+    *asked = true;
+    *overflowed = false;
+    let list = std::mem::take(list);
+    known.then_some(list)
+}
+
+/// The record at `handle` (a descriptor slot in title memory): its tag and
+/// two words, read as they are.
+pub(crate) fn record_at(handle: u64) -> [u32; 3] {
+    // SAFETY: the handle is a descriptor slot in title memory, at least 16
+    // bytes.
+    unsafe { (handle as *const [u32; 3]).read_unaligned() }
+}
+
+/// The view table entry a record names, if it names one (not a view named
+/// whole in its record, not a record of no view).
+pub(crate) fn record_entry(record: [u32; 3]) -> Option<u32> {
+    let [tag, i, generation] = record;
+    (tag == VIEW_TAG && generation >> KIND_SHIFT == 0).then_some(i)
 }
 
 /// The view the record words `i` and `generation` name: the one they hold
@@ -918,6 +1183,21 @@ pub(crate) fn view(handle: u64) -> Option<View> {
         return None;
     }
     view_at(i, generation)
+}
+
+/// The view recorded at `handle`, and what says which record that is
+/// (`host::HostHeap::publish`).
+#[cfg(windows)]
+pub(crate) fn view_and_key(handle: u64) -> Option<(View, u64)> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: as in `view`.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag != VIEW_TAG {
+        return None;
+    }
+    Some((view_at(i, generation)?, u64::from(generation) << 32 | u64::from(i)))
 }
 
 /// A description of `N` words, if the title passes one.
