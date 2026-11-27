@@ -4,9 +4,14 @@
 # -Machine 3060: 6/4/3 worker threads, up to 3 GB of shader-read windows in
 # the card's memory, pages mapped by several threads). There, 2026-11-27: the
 # boat at a steady 12 fps (the cool_fox base: 8-10), the card about 80% busy.
-# The picture is Vice-Tay's own defaults.
+# The picture is Vice-Tay's own defaults, drawn at half size and scaled to a
+# 1080p output by the title's own upscaler (its FidelityFX, as on the
+# console): the boat went from 12.0 to 14.5-14.9 fps steady, the cutscene
+# before it from 8-12 to 15-20 at its start. With the frame at native size
+# the card took about 69 of a 90 ms frame (the diagnostics panel's GPU EST).
 #
 # Usage:  .\jugar.ps1                   (as above)
+#         .\jugar.ps1 -Nativo           (drawn at full size, no upscaling: sharper, slower)
 #         .\jugar.ps1 -Release:$false   (target\diag, the build Vice-Tay measures with)
 #         .\jugar.ps1 -Pantalla         (full screen instead of a window)
 #         .\jugar.ps1 -Mas @{VICTORY_PANEL='0'}  (any other setting)
@@ -15,6 +20,7 @@
 # Build first: cargo build --locked --release -p victory
 param(
     [switch]$Pantalla,
+    [switch]$Nativo,
     [bool]$Release = $true,
     [hashtable]$Mas = @{},
     [string]$Game = $(
@@ -31,6 +37,11 @@ if (-not $Game -or -not (Test-Path $Game)) {
     exit 1
 }
 $build = if ($Release) { 'release' } else { 'diag' }
+# Half size through the title's upscaler unless -Nativo; -Mas wins over both.
+$scaled = @{}
+if (-not $Nativo) { $scaled = @{ VICTORY_OUTPUT = '1920x1080'; VICTORY_UPSCALER = '6'; VICTORY_RENDER_SCALE = '0.5' } }
+foreach ($k in $Mas.Keys) { $scaled[$k] = $Mas[$k] }
+$Mas = $scaled
 $log = Join-Path $PSScriptRoot "run-series-s.log"
 Write-Host "Vice-Tay base: Series S, -Machine 3060, $build build; log in $log"
 # -WarmPipelines: the host pipelines of earlier runs are made before the title
