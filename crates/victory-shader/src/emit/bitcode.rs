@@ -5,7 +5,7 @@
 //! it is written: functions, then constants (all at module level), then the
 //! instructions of `main` in block order.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 pub mod census;
 pub mod opt;
@@ -157,8 +157,6 @@ enum Op {
     /// `getelementptr` over the pointee type, from a pointer.
     Gep(Ty, V, Vec<V>),
     Load(V),
-    /// A group-shared load the wait loop must repeat. Not folded with an earlier load.
-    VolatileLoad(V),
     /// Pointer, value.
     Store(V, V),
     AtomicRmw(Rmw, V, V),
@@ -228,8 +226,6 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
-    /// A block that was closed by a meet: later instructions aimed at it belong in the continuation.
-    redirect: HashMap<usize, usize>,
 }
 
 impl Module {
@@ -412,23 +408,7 @@ impl Module {
         }
     }
 
-    fn follow(&self, mut block: usize) -> usize {
-        for _ in 0..64 {
-            match self.redirect.get(&block) {
-                Some(&next) if next != block => block = next,
-                _ => break,
-            }
-        }
-        block
-    }
-
-    /// Instructions aimed at `from` after this belong in `to` (a meet closed `from`).
-    pub fn continues(&mut self, from: usize, to: usize) {
-        self.redirect.insert(from, to);
-    }
-
     fn push(&mut self, block: usize, ty: Ty, op: Op) -> V {
-        let block = self.follow(block);
         let i = self.insts.len() as u32;
         self.insts.push(Inst { ty, op });
         // Terminators are kept apart, so a block can still grow at its end.
@@ -495,13 +475,6 @@ impl Module {
             panic!("load from a non-pointer")
         };
         self.push(block, ty, Op::Load(ptr))
-    }
-    /// A load the optimiser and the driver must not lift out of a wait loop.
-    pub fn load_volatile(&mut self, block: usize, ptr: V) -> V {
-        let TypeDef::Ptr(ty, _) = self.types[self.type_of(ptr).0 as usize] else {
-            panic!("load from a non-pointer")
-        };
-        self.push(block, ty, Op::VolatileLoad(ptr))
     }
     pub fn store(&mut self, block: usize, ptr: V, value: V) {
         let void = self.void();
@@ -575,85 +548,6 @@ impl Module {
         }
         live
     }
-
-    /// The blocks a block's terminator branches to.
-    fn successors(&self, b: usize) -> Vec<usize> {
-        match self.blocks[b].term {
-            Some(Term::Br(t)) => vec![t],
-            Some(Term::CondBr(_, t, f)) => vec![t, f],
-            _ => Vec::new(),
-        }
-    }
-
-    /// Gives every loop header one back edge, as DXC's code has:
-    /// vkd3d-proton's DXIL conversion keeps one per header, takes any other
-    /// for a forward edge and then recurses without end over the cycle that
-    /// makes (in programs with wave shuffles). The back edges of a header
-    /// with several go through a new block that joins their phi values.
-    pub fn single_latches(&mut self) {
-        let n = self.blocks.len();
-        if n == 0 {
-            return;
-        }
-        // Depth-first from the entry: an edge to a block still on the stack
-        // is a back edge (the control flow is reducible).
-        let mut state = vec![0u8; n];
-        let mut stack = vec![(0usize, 0usize)];
-        state[0] = 1;
-        let mut latches: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        while let Some(top) = stack.last_mut() {
-            let (b, k) = *top;
-            let succ = self.successors(b);
-            if k < succ.len() {
-                top.1 += 1;
-                let t = succ[k];
-                match state[t] {
-                    0 => {
-                        state[t] = 1;
-                        stack.push((t, 0));
-                    }
-                    1 => latches.entry(t).or_default().push(b),
-                    _ => {}
-                }
-            } else {
-                state[b] = 2;
-                stack.pop();
-            }
-        }
-        for (header, mut from) in latches {
-            from.sort_unstable();
-            from.dedup();
-            if from.len() < 2 {
-                continue;
-            }
-            let latch = self.new_block();
-            for &b in &from {
-                let to = |t: usize| if t == header { latch } else { t };
-                self.blocks[b].term = match self.blocks[b].term {
-                    Some(Term::Br(t)) => Some(Term::Br(to(t))),
-                    Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(c, to(t), to(f))),
-                    other => other,
-                };
-            }
-            self.blocks[latch].term = Some(Term::Br(header));
-            for id in self.blocks[header].phis.clone() {
-                let Op::Phi(incoming) = self.insts[id as usize].op.clone() else {
-                    continue;
-                };
-                let ty = self.insts[id as usize].ty;
-                let (back, mut rest): (Vec<_>, Vec<_>) =
-                    incoming.into_iter().partition(|(_, b)| from.contains(b));
-                if back.is_empty() {
-                    continue;
-                }
-                let joined = self.phi(latch, ty);
-                self.set_phi(joined, back);
-                rest.push((joined, latch));
-                self.insts[id as usize].op = Op::Phi(rest);
-            }
-        }
-    }
-
 
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
@@ -974,8 +868,6 @@ impl Module {
                     }
                     // Alignment 4 (log2 + 1), not volatile.
                     Op::Load(p) => w.record(20, &[rel(*p), u64::from(inst.ty.0), 3, 0]),
-                    // The last field is the volatile bit: the wait must read again.
-                    Op::VolatileLoad(p) => w.record(20, &[rel(*p), u64::from(inst.ty.0), 3, 1]),
                     Op::Store(p, v) => w.record(44, &[rel(*p), rel(*v), 3, 0]),
                     // Sequentially consistent, across threads.
                     Op::AtomicRmw(op, p, v) => {
@@ -1021,7 +913,7 @@ fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
             f(*a);
             f(*b);
         }
-        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) | Op::VolatileLoad(v) => f(*v),
+        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => f(*v),
         Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
             f(*a);
             f(*b);
@@ -1383,46 +1275,5 @@ mod tests {
                 fnv(&bytes)
             );
         }
-    }
-
-    /// A loop header with two back edges gets one, through a new block that
-    /// joins what each brings (vkd3d-proton keeps one per header).
-    #[test]
-    fn a_header_with_two_back_edges_gets_one() {
-        let mut m = Module::default();
-        let i32t = m.int(32);
-        let void = m.void();
-        let main_ty = m.func_ty(void, vec![]);
-        m.function("main", main_ty, None, true);
-        let [entry, head, body, mid, exit] = [(); 5].map(|()| m.new_block());
-        let (zero, one, two) = (m.i32(0), m.i32(1), m.i32(2));
-        m.terminate(entry, Term::Br(head));
-        let p = m.phi(head, i32t);
-        m.terminate(head, Term::Br(body));
-        let x = m.bin(body, Bin::Add, p, one);
-        let c = m.cmp(body, pred::IULT, x, two);
-        m.terminate(body, Term::CondBr(c, head, mid));
-        let y = m.bin(mid, Bin::Add, x, one);
-        let d = m.cmp(mid, pred::IULT, y, two);
-        m.terminate(mid, Term::CondBr(d, head, exit));
-        m.terminate(exit, Term::Ret);
-        m.set_phi(p, vec![(zero, entry), (x, body), (y, mid)]);
-        m.single_latches();
-        let latch = m.blocks.len() - 1;
-        assert_eq!(m.successors(body), [latch, mid]);
-        assert_eq!(m.successors(mid), [latch, exit]);
-        assert_eq!(m.successors(latch), [head]);
-        let phi = |m: &Module, v: V| match v {
-            V::Inst(id) => match &m.insts[id as usize].op {
-                Op::Phi(incoming) => incoming.clone(),
-                op => panic!("{op:?}"),
-            },
-            v => panic!("{v:?}"),
-        };
-        let incoming = phi(&m, p);
-        assert_eq!(incoming[0], (zero, entry));
-        assert_eq!(incoming[1].1, latch);
-        assert_eq!(phi(&m, incoming[1].0), [(x, body), (y, mid)]);
-        assert!(!m.write().is_empty());
     }
 }

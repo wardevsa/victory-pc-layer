@@ -892,36 +892,6 @@ impl<'a> Lanes<'a> {
         }
     }
 
-    /// The source pair of two adjacent dword moves in one block.
-    fn moved_pair(&self, k: Key) -> Option<Key> {
-        let moved = |v| {
-            let &(b, i) = self.defs.get(&v)?;
-            let inst = &self.p.blocks[b].insts[i];
-            if inst.name() != "s_mov_b32" {
-                return None;
-            }
-            let Fields::Sop {
-                dst: Some(Operand::Scalar { code: dst, .. }),
-                src,
-                ..
-            } = &inst.fields
-            else {
-                return None;
-            };
-            let [Operand::Scalar { code: src, .. }] = src.as_slice() else {
-                return None;
-            };
-            if inst.write(Reg::S(*dst)) != Some(v) {
-                return None;
-            }
-            Some((b, *dst, *src, inst.read(Reg::S(*src))?))
-        };
-        let (lb, ld, ls, lv) = moved(k.0)?;
-        let (hb, hd, hs, hv) = moved(k.1)?;
-        (lb == hb && ld.checked_add(1) == Some(hd) && ls.checked_add(1) == Some(hs))
-            .then_some((lv, hv))
-    }
-
     fn exec(&mut self, inst: &Inst) -> Bool {
         match self.key(|r| inst.read(r), EXEC) {
             Some(k) => self.mask(k).0,
@@ -938,54 +908,32 @@ impl<'a> Lanes<'a> {
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
         }
-        // A scalar pair can be parked in two VGPR lanes and restored one
-        // dword at a time. The spill pass turns these into scalar moves.
-        // Recover the original lane predicate only when the two words
-        // still come from the same known mask, in their original order.
-        if self.p.wave64 {
-            let source = (self.move_source(k.0), self.move_source(k.1));
-            if source != k && let Some(&m) = self.masks.get(&source) {
-                self.masks.insert(k, m);
-                return (m, true);
-            }
-        }
         let p = self.p;
         let (m, derived) = match self.join(k) {
             Some(join) => join,
             None => {
                 let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
                 let def = |d: Option<(usize, usize)>| d.map(|(b, i)| &p.blocks[b].insts[i]);
+                let m = match (lo, hi) {
+                    (Some(at), Some(hi)) if at == hi => def(lo)
+                        .and_then(|i| self.sop(i))
+                        .and_then(|r| r.dst)
+                        .map(|d| d.1),
+                    _ => None,
+                };
                 // What an EXEC write the pass does not follow leaves there.
                 let exec_write = |d: Option<(usize, usize)>, v: Value| {
                     def(d).is_some_and(|i| {
                         i.write(Reg::S(EXEC)) == Some(v) || i.write(Reg::S(EXEC + 1)) == Some(v)
                     })
                 };
-                let (m, derived) = match (lo, hi) {
-                    (Some(at), Some(hi)) if at == hi => {
-                        let m = def(lo)
-                            .and_then(|i| self.sop(i))
-                            .and_then(|r| r.dst)
-                            .map(|d| d.1);
-                        (m, exec_write(lo, k.0) || exec_write(Some(hi), k.1))
-                    }
-                    _ => {
-                        let copied = self.moved_pair(k).and_then(|source| {
-                            let (m, derived) = self.mask(source);
-                            self.b
-                                .support(m)
-                                .iter()
-                                .all(|a| !matches!(a, Atom::Opaque(_)))
-                                .then_some((m, derived))
-                        });
-                        copied.map_or_else(
-                            || (None, exec_write(lo, k.0) || exec_write(hi, k.1)),
-                            |(m, derived)| (Some(m), derived),
-                        )
-                    }
-                };
+                let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
                 // shortcut: the atom names the pair by its low dword, and
-                // lowering takes the high dword written beside it.
+                // lowering takes the high dword written beside it. For halves
+                // written apart (two `s_mov_b32`) lanes 32-63 are wrong unless
+                // lowering has no value for the low dword (EXEC, compares)
+                // and refuses. Give the atom both dwords when such code
+                // turns up.
                 let m = m.unwrap_or_else(|| {
                     let born = self.born(k.0);
                     self.b.atom(Atom::Opaque(k.0), born)
@@ -1000,20 +948,6 @@ impl<'a> Lanes<'a> {
         };
         cache.insert(k, m);
         (m, derived)
-    }
-
-    fn move_source(&self, mut value: Value) -> Value {
-        while let Some(&(b, i)) = self.defs.get(&value) {
-            let inst = &self.p.blocks[b].insts[i];
-            let [(Reg::S(_), source)] = inst.reads.as_slice() else {
-                break;
-            };
-            if inst.name() != "s_mov_b32" {
-                break;
-            }
-            value = *source;
-        }
-        value
     }
 
     /// A mask joined by phis at a block entry, and whether a mask coming in
@@ -1510,6 +1444,43 @@ mod tests {
         s.guards.iter().flatten().filter(|g| g.is_some()).count()
     }
 
+    /// A pixel program that writes only through atomics ends with `exp null
+    /// done vm`, after a loop that leaves through `s_andn2 X, X, exec` and its
+    /// SCC on its own exit mask. Taken for a discard's "no live lane is left"
+    /// test, the back edge would be taken by every lane, which then runs the
+    /// loop to its limit (upstream #2306 measured 203 ms a draw on an RTX
+    /// 5090). The back edge is taken by the lanes not done.
+    #[test]
+    fn a_loop_exit_to_a_null_export_keeps_its_exit_test() {
+        let words = [
+            0xBE89_037E, // s_mov_b32 s9, exec_lo
+            0xBE88_037E, // s_mov_b32 s8, exec_lo
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBF82_0001, // s_branch -> body
+            0xBEFE_0308, // header: s_mov_b32 exec_lo, s8
+            0x4A02_0281, // body: v_add_nc_u32 v1, 1, v1
+            0x7DA2_0283, // v_cmpx_lt_u32 exec, 3, v1 (the lanes done)
+            0x8A08_7E08, // s_andn2_b32 s8, s8, exec_lo
+            0xBF85_FFFB, // s_cbranch_scc1 -> header
+            0xBEFE_0309, // s_mov_b32 exec_lo, s9
+            0xF800_1890, // exp null done vm
+            0x0000_0000,
+            S_ENDPGM,
+        ];
+        let p = build(&words, false);
+        let s = structure(&p).unwrap();
+        let back = p
+            .blocks
+            .iter()
+            .position(|b| b.insts.last().is_some_and(|i| i.name() == "s_cbranch_scc1"))
+            .unwrap();
+        let LaneExit::Branch { when, .. } = s.exits[back] else {
+            panic!("{:?}", s.exits)
+        };
+        assert_ne!(when, Bool::TRUE);
+        assert_ne!(when, Bool::FALSE);
+    }
+
     /// The search of [`Bools::meet`] with every case split made anew, as it
     /// was before [`Meets`].
     fn meet_anew(b: &Bools, mut all: Vec<(Bool, bool)>, budget: &mut usize) -> bool {
@@ -1771,32 +1742,6 @@ mod tests {
     }
 
     #[test]
-    fn split_scalar_copies_across_a_branch_preserve_both_words_of_a_wave64_mask() {
-        for (high, intact) in [(0xBE83_036B, true), (0xBE83_036A, false)] {
-            let p = build(
-                &[
-                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
-                    0xBE84_046A, // s_mov_b64 s[4:5], vcc
-                    0xBF06_0100, // s_cmp_eq_u32 s0, s1
-                    0xBF85_0004, // s_cbranch_scc1 -> join at 32
-                    0xBE82_036A, // s_mov_b32 s2, vcc_lo
-                    high,        // s_mov_b32 s3, vcc_hi (or vcc_lo)
-                    0xBE84_0302, // s_mov_b32 s4, s2
-                    0xBE85_0303, // s_mov_b32 s5, s3
-                    0xBEFE_0404, // s_mov_b64 exec, s[4:5]
-                    0x7E02_0280, // v_mov_b32 v1, 0
-                    S_ENDPGM,
-                ],
-                true,
-            );
-            let s = structure(&p).unwrap();
-            let compare = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
-            let restored = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
-            assert_eq!(s.masks[&restored] == s.masks[&compare], intact);
-        }
-    }
-
-    #[test]
     fn a_mask_whose_high_dword_is_rewritten_is_not_the_compare() {
         for reader in [
             0x0202_0480, // v_cndmask_b32 v1, 0, v2, vcc
@@ -1822,47 +1767,6 @@ mod tests {
                 "{reader:#x}: vcc_hi was zeroed after the compare"
             );
         }
-    }
-
-    #[test]
-    fn paired_dword_moves_keep_exec_mask_provenance() {
-        let p = build(
-            &[
-                0xBE82_047E, // s_mov_b64 s[2:3], exec
-                0xBE84_0302, // s_mov_b32 s4, s2
-                0xBE85_0303, // s_mov_b32 s5, s3
-                0xBE86_0304, // s_mov_b32 s6, s4
-                0xBE87_0305, // s_mov_b32 s7, s5
-                0xBEFE_0406, // s_mov_b64 exec, s[6:7]
-                0x7E02_0280, // v_mov_b32 v1, 0
-                S_ENDPGM,
-            ],
-            true,
-        );
-        let s = structure(&p).unwrap();
-        assert_eq!(guarded(&s), 0, "{:?}", s.guards);
-    }
-
-    #[test]
-    fn paired_dword_moves_do_not_make_unknown_values_into_masks() {
-        let p = build(
-            &[
-                0xBE84_0300, // s_mov_b32 s4, s0
-                0xBE85_0301, // s_mov_b32 s5, s1
-                0xBEFE_0404, // s_mov_b64 exec, s[4:5]
-                0x7E02_0280, // v_mov_b32 v1, 0
-                S_ENDPGM,
-            ],
-            true,
-        );
-        let s = structure(&p).unwrap();
-        let guard = s.guards[0][3].expect("unknown mask still guards the vector op");
-        assert!(
-            s.bools
-                .support(guard)
-                .iter()
-                .any(|a| matches!(a, Atom::Opaque(_)))
-        );
     }
 
     #[test]

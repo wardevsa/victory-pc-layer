@@ -182,7 +182,8 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
                 && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
         });
         let Some(end) = end else {
-            break;
+            i += 1;
+            continue;
         };
         let (vec, uni) = simulate(&insts[i + 1..end], wave, saved);
         let mut reads = HashMap::new();
@@ -375,7 +376,6 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
             }
             continue;
         };
-        let f16_inline = name == "v_add_f16";
         let lanes = |op: &Operand,
                      vec: &HashMap<Value, Vec<Sym>>,
                      uni: &HashMap<Value, Sym>|
@@ -393,12 +393,6 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
                     Some(x) => one(uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
                     None => one(Sym::Unknown),
                 },
-                Operand::Const(c @ 240..=248) if f16_inline => {
-                    let h = [
-                        0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
-                    ][usize::from(c - 240)];
-                    one(Sym::K(h))
-                }
                 Operand::Const(c) => one(crate::resource::inline(c).map_or(Sym::Unknown, Sym::K)),
                 Operand::Literal(x) => one(Sym::K(x)),
                 _ => one(Sym::Unknown),
@@ -1297,43 +1291,29 @@ mod tests {
         }
     }
 
+    /// A saveexec of every lane whose restore is not in the block (it lies in a later one) is
+    /// no section, and the sections after it in the block are still found (upstream #3187):
+    /// the scan used to stop at the first unmatched one.
     #[test]
-    fn v_add_f16_inline_float_constants_are_not_zero_identity() {
-        // Wave32 f16 sum reduction with an extra `v_add_f16 v1, <const>, v1`
-        // step: 0 (code 128) is a true additive identity, whereas inline float
-        // constants (240..=248: 0.5, -0.5, 1.0, ..., 1/(2*pi)) are non-zero
-        // f16 values on GFX10 and must not be decoded as f32 bits whose low 15
-        // bits happen to be zero.
-        let run = |src_const: u16| -> (Option<Shape>, Value, Value) {
-            let mut w = vec![sop1(0, 0x3D, 193)]; // s_or_saveexec_b32 s0, -1
-            w.extend(vop3(1, 0x101, 128, 256, 0)); // v_cndmask_b32 v1, 0, v0, s0
-            w.push(vop2(1, 0x32, src_const, 1)); // v_add_f16 v1, <const>, v1
-            for ctrl in [0x00B1u16, 0x004E, 0x0164, 0x0168] {
-                w.push(vop2(1, 0x32, 0xFA, 1));
-                w.push(dpp16(1, ctrl, 0xF, 0xF, false));
-            }
-            w.extend(vop3(2, 0x378, 257, 128, 128)); // v_permlanex16_b32 v2, v1, 0, 0
-            w.push(vop2(1, 0x32, 258, 1)); // v_add_f16 v1, v2, v1
-            w.extend(vop3(1, 0x360, 257, 128 + 31, 0)); // v_readlane_b32 s1, v1, 31
-            w.push(sop1(EXEC, 0x03, 0)); // s_mov_b32 exec_lo, s0
-
-            let p = build(&w, false);
+    fn an_unmatched_saveexec_leaves_the_later_sections_of_its_block() {
+        let total = |w: &[u32], start: usize| {
+            let p = build(w, true);
             let insts = &p.blocks[0].insts;
-            let saved = insts[0].write(Reg::S(0)).unwrap();
-            let v0_in = insts[1].read(Reg::V(0)).unwrap();
-            let s1 = insts[insts.len() - 3].write(Reg::S(1)).unwrap();
-            let sec = &sections(&p, 0)[&0];
-            (sec.shapes.get(&s1).copied(), v0_in, saved)
+            let saved = insts[start].write(Reg::S(4)).unwrap();
+            let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
+            // ..., v_readlane_b32 s7, v1, 0; s_mov_b64 exec, s[4:5]; s_endpgm
+            let s7 = insts[insts.len() - 3].write(Reg::S(7)).unwrap();
+            let secs = sections(&p, 0);
+            assert!(start == 0 || !secs.contains_key(&0), "the unmatched saveexec is no section");
+            let shape = secs.get(&start).and_then(|sec| sec.shapes.get(&s7).copied());
+            (shape, Shape::Active(Op::Or, v7, saved, 0))
         };
-
-        let (zero_shape, v0_in, saved) = run(128);
-        assert_eq!(
-            zero_shape,
-            Some(Shape::Active(Op::AddH, v0_in, saved, 0))
-        );
-        for c in 240..=248u16 {
-            let (shape, _, _) = run(c);
-            assert_eq!(shape, None, "inline float const {c} was treated as identity");
-        }
+        let (alone, want) = total(&WAVE_OR_V7_TO_S7, 0);
+        assert_eq!(alone, Some(want));
+        // s_or_saveexec_b64 s[2:3], -1, restored nowhere in the block
+        let mut w = vec![sop1(2, 0x25, 193)];
+        w.extend(WAVE_OR_V7_TO_S7);
+        let (after, want) = total(&w, 1);
+        assert_eq!(after, Some(want), "the section after an unmatched saveexec");
     }
 }

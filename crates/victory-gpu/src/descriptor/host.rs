@@ -1589,7 +1589,9 @@ impl HostHeap {
         ));
         let strides = (!sampler)
             .then(|| {
-                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
+                // The strides, then the views' title addresses as the
+                // translator reads them (ictory_shader::emit::VIEW_ADDRESSES).
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_BYTES);
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
@@ -2830,6 +2832,19 @@ impl HostHeap {
     /// Writes a title view address as two dwords at view heap slot `index`.
     #[inline]
     fn write_address(&self, index: u32, addr: u64) {
+        // Also after the strides, where the translator reads them
+        // (ictory_shader::emit::VIEW_ADDRESSES).
+        if let Some((_, _, data)) = &self.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            let words = (*data + victory_shader::emit::VIEW_ADDRESSES as usize) as *mut u32;
+            // SAFETY: inside the mapping (SLOT_STRIDES_BYTES); both aligned
+            // dwords are within the slot's eight bytes.
+            unsafe {
+                words.add(index as usize * 2).write_volatile(addr as u32);
+                words.add(index as usize * 2 + 1).write_volatile((addr >> 32) as u32);
+            }
+        }
         if let Some((_, _, data)) = &self.addresses
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {

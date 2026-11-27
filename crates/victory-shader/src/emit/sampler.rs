@@ -46,6 +46,15 @@ impl StaticSampler {
         }
     }
 
+    /// Makes this a comparison sampler. D3D12 keeps the reduction in filter
+    /// bits 7-8 (0 standard, 1 comparison, 2 minimum, 3 maximum), so the
+    /// comparison replaces whatever reduction the words carried: OR-ing
+    /// 0x80 in would turn a minimum sampler (0x100) into a maximum one
+    /// (0x180).
+    pub fn make_comparison(&mut self) {
+        self.filter = self.filter & !0x180 | 0x80;
+    }
+
     /// Decodes the four sampler words.
     pub fn from_words(w: [u32; 4]) -> Self {
         let bits = |word: u32, at: u32, n: u32| word >> at & ((1 << n) - 1);
@@ -172,6 +181,24 @@ mod tests {
     }
 
     #[test]
+    fn comparison_replaces_the_reduction() {
+        // (decoded filter, after make_comparison): standard, minimum and
+        // maximum reductions, with point, linear and anisotropic filters.
+        for (filter, want) in [
+            (0x00, 0x80),
+            (0x14, 0x94),
+            (0x115, 0x95),
+            (0x1D5, 0xD5),
+            (0x95, 0x95),
+        ] {
+            let mut s = StaticSampler::from_words([0, 0, 0, 0]);
+            s.filter = filter;
+            s.make_comparison();
+            assert_eq!(s.filter, want, "filter {filter:#x}");
+        }
+    }
+
+    #[test]
     fn host_filter_keeps_other_filters_unchanged() {
         for reduction in [0, 0x80, 0x100, 0x180] {
             for base in [0, 1, 4, 5, 0x10, 0x11, 0x14, 0x15, 0x55] {
@@ -183,5 +210,37 @@ mod tests {
                 assert_eq!(s.filter_for_host(true), s.filter);
             }
         }
+    }
+
+    #[test]
+    fn mip_lod_bias_decodes_signed_14bit_fixed_point_extremes() {
+        let cases = [
+            (0x0000, 0.0_f32),
+            (0x0001, 1.0 / 256.0),
+            (0x1FFF, 8191.0 / 256.0),
+            (0x2000, -32.0),
+            (0x3FFF, -1.0 / 256.0),
+        ];
+        for (raw, expected) in cases {
+            let s = StaticSampler::from_words([0, 0, raw, 0]);
+            assert_eq!(s.mip_lod_bias, expected, "raw bias {raw:#x}");
+        }
+    }
+
+    #[test]
+    fn no_mip_filter_forces_zero_lod_range_and_non_zero_preserves_it() {
+        let w1 = (0xABC << 12) | 0x123;
+        let no_mip = StaticSampler::from_words([0, w1, 0, 0]);
+        assert_eq!((no_mip.min_lod, no_mip.max_lod), (0.0, 0.0));
+
+        let point_mip = StaticSampler::from_words([0, w1, 1 << 26, 0]);
+        assert_eq!(
+            (point_mip.min_lod, point_mip.max_lod),
+            (0x123 as f32 / 256.0, 0xABC as f32 / 256.0)
+        );
+        assert_eq!(point_mip.filter, 0);
+
+        let linear_mip = StaticSampler::from_words([0, w1, 2 << 26, 0]);
+        assert_eq!(linear_mip.filter, 1);
     }
 }

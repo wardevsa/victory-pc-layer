@@ -369,3 +369,32 @@ fn a_tables_raw_buffer_is_read_at_its_raw_twin() {
         assert_eq!(got[..2], [0, 6], "{label}");
     }
 }
+
+/// A texel a program stores to a texture it picks from the view heap and then loads back is
+/// the one it stored: the load reads through the texture's UAV, as the store writes it. (A
+/// read through another view of it need not see the dispatch's own writes: an RTX 3070 read
+/// the old value, xcl-dev/xcl ec356bc5c8.)
+#[test]
+fn a_heap_texture_loaded_after_a_store_reads_the_store() {
+    let words = [
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7E04_02FF, // v_mov_b32 v2, 7.0
+        0x40E0_0000,
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x7E08_0302, // v_mov_b32 v4, v2
+        0x7E0A_0302, // v_mov_b32 v5, v2
+        0xF020_1F08, // image_store v[2:5], v[0:1], s[8:15] dmask:0xf 2D unorm
+        0x0002_0200,
+        0xF000_1F08, // image_load v[6:9], v[0:1], s[8:15] dmask:0xf 2D unorm
+        0x0002_0600,
+        0x7E08_0506, // v_readfirstlane_b32 s4, v6
+        0x7E0A_0509, // v_readfirstlane_b32 s5, v9
+    ];
+    let shader = build(&[TABLE, FROM_HEAP, &words, STORE].concat(), (8, 0)).expect("translates");
+    let texel = [[0.0; 4]; 1];
+    let views = [View::Texture(1, 1, &texel), View::TextureUav(1, 1), View::RawUav(2)];
+    for (label, got) in run(&shader, &views) {
+        assert_eq!(got[..2], [7.0f32.to_bits(); 2], "{label}");
+    }
+}

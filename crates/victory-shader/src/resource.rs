@@ -2424,11 +2424,18 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
-    // A mask of S0 bits from bit S1, as the upscaler's compiler makes an
-    // immediate sampler's word.
-    if let ("s_bfm_b32", 0, [Operand::Const(w), Operand::Const(at)]) = (inst.name(), k, &src[..]) {
-        let (w, at) = (inline(*w)? & 31, inline(*at)? & 31);
-        return Some(Moved::Const(((1u32 << w) - 1) << at));
+    // s_bfm_b32 d, width, offset: `width` ones from bit `offset` (the
+    // console compiler builds sampler words this way, the upscaler's too),
+    // from inline constants or literals.
+    if inst.name() == "s_bfm_b32" && k == 0 {
+        let constant = |o: &Operand| match *o {
+            Operand::Const(c) => inline(c),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        };
+        let width = constant(src.first()?)? & 31;
+        let offset = constant(src.get(1)?)? & 31;
+        return Some(Moved::Const(((1u32 << width) - 1) << offset));
     }
     let src = src.first()?;
     match (inst.name(), *src) {

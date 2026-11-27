@@ -64,6 +64,31 @@ impl SigElement {
     }
 }
 
+/// Gives the elements of a row whose interpolation mode nothing decided
+/// (float elements, unless `read` and read) the mode the row's other
+/// elements agree on: DXIL wants one mode per row, and the console's
+/// signature, packed by the source's modes, had one (an int or a system
+/// value beside a float means the float was `nointerpolation`).
+/// (After VIctory 13091f6e.)
+pub(crate) fn same_mode_per_row(elements: &mut [SigElement], read: bool) {
+    let free = |e: &SigElement| e.kind == 0 && e.comp == 9 && !(read && e.usage != 0);
+    let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    for row in rows {
+        let decided = |e: &&SigElement| e.row == Some(row) && !free(e) && e.interp != 0;
+        let mut modes = elements.iter().filter(decided).map(|e| e.interp);
+        let Some(mode) = modes.next() else { continue };
+        if modes.any(|m| m != mode) {
+            continue;
+        }
+        let undecided = |e: &&mut SigElement| e.row == Some(row) && free(e);
+        for e in elements.iter_mut().filter(undecided) {
+            e.interp = mode;
+        }
+    }
+}
+
 /// `ISG1`/`OSG1`: 32-byte rows, then the names.
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
@@ -230,16 +255,20 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             );
         }
     }
-    // Arbitrary names occur once per element (repeats included); system values use "". Indices follow.
+    // Names of arbitrary semantics (system values use ""), then indices.
     let mut strings = vec![0u8];
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
         let name = if e.kind == 0 {
             let needle: Vec<u8> = e.name.bytes().chain([0]).collect();
-            let at = strings.len();
-            strings.extend(needle);
-            at
+            match find(&strings, &needle) {
+                Some(at) => at,
+                None => {
+                    strings.extend(&needle);
+                    strings.len() - needle.len()
+                }
+            }
         } else {
             0
         };
@@ -296,6 +325,10 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         }
     }
     out
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// The container: parts in order, hashed.
@@ -466,36 +499,6 @@ mod tests {
     }
 
     #[test]
-    fn psv_keeps_repeated_arbitrary_semantic_names() {
-        let element = SigElement {
-            name: "TEXCOORD".into(),
-            index: 0,
-            kind: 0,
-            comp: 9,
-            interp: 2,
-            row: Some(0),
-            col: 0,
-            cols: 4,
-            usage: 15,
-            half: false,
-        };
-        let psv = psv(&Psv {
-            stage: 1,
-            flag: false,
-            inputs: &[element.clone()],
-            outputs: &[element],
-            prims: &[],
-            mesh: None,
-            geometry: None,
-            bindings: &[],
-            threads: [0; 3],
-            wave_size: None,
-        });
-        let strings = u32::from_le_bytes(psv[56..60].try_into().unwrap()) as usize;
-        assert_eq!(&psv[60..60 + strings], b"\0TEXCOORD\0TEXCOORD\0\0");
-    }
-
-    #[test]
     fn md5_core_matches_the_standard() {
         // Standard MD5 of "abc" with standard padding, through md5_block.
         let mut block = b"abc".to_vec();
@@ -510,5 +513,44 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    fn el(name: &str, kind: u8, comp: u8, interp: u8, row: u32, col: u8, usage: u8) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp,
+            interp,
+            row: Some(row),
+            col,
+            cols: 1,
+            usage,
+            half: false,
+        }
+    }
+
+    /// An unread float beside the front face (constant) takes the row's
+    /// mode; a read float keeps its own in an input signature; a row whose
+    /// decided elements disagree, and other rows, are left alone.
+    #[test]
+    fn a_row_keeps_one_interpolation_mode() {
+        let mut inputs = vec![
+            el("TEXCOORD", 0, 9, 2, 0, 0, 0),
+            el("SV_IsFrontFace", 13, 5, 1, 0, 1, 1),
+            el("TEXCOORD", 0, 9, 2, 1, 0, 1),
+            el("SV_IsFrontFace", 13, 5, 1, 1, 1, 1),
+            el("COLOR", 0, 9, 2, 2, 0, 0),
+            el("COLOR", 0, 4, 1, 2, 1, 1),
+            el("COLOR", 0, 5, 4, 2, 2, 1),
+            el("NORMAL", 0, 9, 2, 3, 0, 1),
+        ];
+        same_mode_per_row(&mut inputs, true);
+        let modes: Vec<u8> = inputs.iter().map(|e| e.interp).collect();
+        assert_eq!(modes, [1, 1, 2, 1, 2, 1, 4, 2]);
+        // Outputs: what is written does not decide.
+        let mut outputs = vec![el("TEXCOORD", 0, 9, 2, 0, 0, 1), el("TEXCOORD", 0, 5, 1, 0, 1, 1)];
+        same_mode_per_row(&mut outputs, false);
+        assert_eq!(outputs.iter().map(|e| e.interp).collect::<Vec<_>>(), [1, 1]);
     }
 }
