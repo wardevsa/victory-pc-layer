@@ -1935,7 +1935,7 @@ pub(crate) fn put_beside(block: usize, weight: u32, put: impl FnOnce(usize)) -> 
     }
     // No mapping changes until all is told: a view of the page that came
     // after the look at them would not be.
-    let Some(_reading) = title_memory_reading_now() else {
+    let Some(_reading) = title_memory_reading_now_in(block * BLOCK, BLOCK) else {
         return Beside::Cannot;
     };
     let Some((page, shown)) = crate::inplace::beside_page(block * BLOCK) else {
@@ -3488,11 +3488,54 @@ pub fn title_memory_splitting(at: usize, len: usize) {
 /// had asked whether the texture was all mapped and been told yes. Asking
 /// cannot help; not changing the mapping while such a read is under way
 /// does.
-static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+///
+/// By the region of title memory ([`MAPPING_REGION`] bytes each, taken
+/// modulo [`MAPPING_SHARDS`]): a change holds alone the regions of the views
+/// it takes away and maps again, a read shares those it reads. It was one
+/// lock for all of title memory: while the world streamed in (run of
+/// 2026-11-27, RTX 2060 SUPER) the runtime held it for its mapping calls
+/// (0.2-4 ms a page, groups of 64 pages) and the texture refreshes of every
+/// thread waited 6.4-11.3 s a frame between them for it, 99% of their
+/// time, the card 2-3% busy, 0.5-1 fps; the textures read are almost never
+/// those whose pages change.
+static MAPPING: [std::sync::RwLock<()>; MAPPING_SHARDS] = [const { std::sync::RwLock::new(()) }; MAPPING_SHARDS];
+
+/// Locks of [`MAPPING`].
+const MAPPING_SHARDS: usize = 512;
+/// Bytes of title memory per lock of [`MAPPING`] (16 MiB).
+const MAPPING_REGION: u32 = 24;
+
+/// One change of mapping at a time, as with the single lock: [`CHANGES`] is
+/// odd while one is under way, and [`Guards::changing`] is the one's blocks.
+static REMAPPERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The locks of [`MAPPING`] for `ranges` (`[at, at + len)`), in rising order
+/// (every thread takes them so: no two wait for each other); all of them for
+/// none.
+fn mapping_shards(ranges: &[(usize, usize)]) -> impl Iterator<Item = usize> {
+    let mut set = [0u64; MAPPING_SHARDS / 64];
+    let mut put = |shard: usize| set[shard / 64] |= 1 << (shard % 64);
+    if ranges.is_empty() {
+        (0..MAPPING_SHARDS).for_each(&mut put);
+    }
+    for &(at, len) in ranges {
+        let first = at >> MAPPING_REGION;
+        let last = at.saturating_add(len.max(1) - 1) >> MAPPING_REGION;
+        if last - first >= MAPPING_SHARDS {
+            (0..MAPPING_SHARDS).for_each(&mut put);
+            break;
+        }
+        (first..=last).for_each(|region| put(region % MAPPING_SHARDS));
+    }
+    (0..MAPPING_SHARDS).filter(move |&shard| set[shard / 64] & (1 << (shard % 64)) != 0)
+}
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(
+    #[allow(dead_code)] Vec<std::sync::RwLockWriteGuard<'static, ()>>,
+    #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+);
 
 impl Drop for Remapping {
     fn drop(&mut self) {
@@ -3639,6 +3682,13 @@ pub(crate) fn lost(what: &'static str, at: usize, len: usize) {
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
+    title_memory_remapping_in(&[])
+}
+
+/// [`title_memory_remapping`] for a change that maps, unmaps or moves pages
+/// only in `ranges` (`[at, at + len)`: every view it takes away whole, and
+/// what it maps); none: all of title memory. Reads elsewhere go on.
+pub fn title_memory_remapping_in(ranges: &[(usize, usize)]) -> Remapping {
     // For the title's own threads ([`came_back`]).
     install();
     let met = MET.load(std::sync::atomic::Ordering::Relaxed);
@@ -3649,32 +3699,54 @@ pub fn title_memory_remapping() -> Remapping {
             tracing::info!(met, "accesses of title threads that waited for a change of mapping");
         }
     }
-    let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    let alone = REMAPPERS.lock().unwrap_or_else(|e| e.into_inner());
+    let changing =
+        mapping_shards(ranges).map(|shard| MAPPING[shard].write().unwrap_or_else(|e| e.into_inner())).collect();
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
-    Remapping(changing)
+    Remapping(changing, alone)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading(#[allow(dead_code)] Vec<std::sync::RwLockReadGuard<'static, ()>>);
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    title_memory_reading_in(0, 0)
+}
+
+/// [`title_memory_reading`] for a read of `[at, at + len)` only (`len` 0:
+/// all of title memory): changes of mapping elsewhere go on meanwhile.
+pub fn title_memory_reading_in(at: usize, len: usize) -> Reading {
+    let ranges = [(at, len)];
+    let ranges: &[(usize, usize)] = if len == 0 { &[] } else { &ranges };
+    Reading(mapping_shards(ranges).map(|shard| MAPPING[shard].read().unwrap_or_else(|e| e.into_inner())).collect())
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
 /// runtime changes a mapping (or waits to), for a caller that has another
 /// way to read and would rather not wait.
 pub fn title_memory_reading_now() -> Option<Reading> {
-    match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+    title_memory_reading_now_in(0, 0)
+}
+
+/// [`title_memory_reading_now`] for `[at, at + len)` only, as
+/// [`title_memory_reading_in`].
+pub fn title_memory_reading_now_in(at: usize, len: usize) -> Option<Reading> {
+    let ranges = [(at, len)];
+    let ranges: &[(usize, usize)] = if len == 0 { &[] } else { &ranges };
+    let mut held = Vec::new();
+    for shard in mapping_shards(ranges) {
+        match MAPPING[shard].try_read() {
+            Ok(guard) => held.push(guard),
+            Err(std::sync::TryLockError::Poisoned(e)) => held.push(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
     }
+    Some(Reading(held))
 }
 
 /// The runtime mapped title memory `[at, at + len)`: what it shows is new,
@@ -6026,5 +6098,44 @@ mod rearm_tests {
         assert_eq!(NOT_REARMED.load(Relaxed), before + 2);
         // SAFETY: our allocation.
         unsafe { VirtualFree(page as *mut _, 0, MEM_RELEASE) };
+    }
+}
+
+#[cfg(test)]
+mod mapping_shard_tests {
+    use super::*;
+
+    #[test]
+    fn shards_rise_and_cover_their_ranges() {
+        let r = 1usize << MAPPING_REGION;
+        let s: Vec<usize> = mapping_shards(&[(5 * r + 10, 2 * r)]).collect();
+        assert_eq!(s, vec![5, 6, 7]);
+        let s: Vec<usize> = mapping_shards(&[(9 * r, r), (2 * r, 1)]).collect();
+        assert_eq!(s, vec![2, 9]);
+        // Wrapped regions land on the same lock.
+        let s: Vec<usize> = mapping_shards(&[((MAPPING_SHARDS + 3) * r, 1)]).collect();
+        assert_eq!(s, vec![3]);
+        assert_eq!(mapping_shards(&[]).count(), MAPPING_SHARDS);
+        assert_eq!(mapping_shards(&[(0, MAPPING_SHARDS * r + 1)]).count(), MAPPING_SHARDS);
+    }
+
+    /// A read elsewhere is not held up by a change of mapping; one of the
+    /// same region is, and a read of all of title memory too.
+    #[test]
+    fn a_change_holds_up_only_reads_of_its_regions() {
+        let r = 1usize << MAPPING_REGION;
+        // Far from what other tests map (no title memory up there).
+        let base = 0x7000_0000_0000usize;
+        let changing = title_memory_remapping_in(&[(base, 4096)]);
+        // (Other tests' changes of all of title memory may come between.)
+        let started = std::time::Instant::now();
+        while title_memory_reading_now_in(base + 64 * r, 4096).is_none() {
+            assert!(started.elapsed().as_secs() < 5, "a read elsewhere waited for the change");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(title_memory_reading_now_in(base + 100, 8).is_none());
+        assert!(title_memory_reading_now().is_none());
+        drop(changing);
+        assert!(title_memory_reading_now_in(base + 100, 8).is_some());
     }
 }
