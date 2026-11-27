@@ -1848,7 +1848,7 @@ impl Drop for Scratch {
     }
 }
 
-const SCRATCH_CHUNK: u64 = 4 << 20;
+pub(crate) const SCRATCH_CHUNK: u64 = 4 << 20;
 /// A list's first chunk when the chunks are shared ([`scratch_pool`]): most
 /// lists put a few constants or a rectangle's corners there, and every
 /// list that did took 4 MiB of the PC's memory for it.
@@ -2999,6 +2999,10 @@ const WHY_FENCE: usize = 10;
 /// copy, a fill of upload memory, a texture).
 static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
 
+/// Since the last frame-rate line: fills of scratch memory the card copied
+/// out of a copy at its place in the same list ([`HostList::fill_scratch`]).
+static PLACED_FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Since the last frame-rate line: the microseconds settles waited for the
 /// card, by why they settled (the `WHY_` places).
 static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
@@ -3869,6 +3873,10 @@ fn late_line(frames: f64) {
         s[WHY_FENCE],
         s[13],
         s[14],
+    );
+    tracing::info!(
+        "fills of scratch memory the card copied out of a copy at its place in the same list, per frame: {:.1}",
+        PLACED_FILLS.swap(0, Ordering::Relaxed) as f64 / frames
     );
     {
         let w: Vec<f64> = LATE_WAITED.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames).collect();
@@ -7173,6 +7181,10 @@ impl HostList {
         let (buffer, at, to) = self.scratch_at(len)?;
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
+        if len.max(1).next_multiple_of(256) <= SCRATCH_CHUNK && self.fill_from_placed(&buffer, at, src as usize, len) {
+            self.deferred().filled.insert(key, gpu);
+            return Some(gpu);
+        }
         // With the card steps the card may bring the bytes: scratch chunks
         // are then memory it can write (`take_chunk`). Not a scratch buffer
         // of its own (over a chunk), which is upload memory.
@@ -7185,6 +7197,54 @@ impl HostList {
         ));
         self.deferred().filled.insert(key, gpu);
         Some(gpu)
+    }
+
+    /// A fill of `len` bytes of title memory at `src` into scratch memory
+    /// (`buffer` at `offset`, out of a chunk) that a copy at its place earlier
+    /// in this list wrote: the card copies them there now, in the list's
+    /// order, out of the destination's host copy, and no fill is left for the
+    /// submission. On the CPU at submission such a fill read the copy's
+    /// destination, which made the whole submission wait for every flight to
+    /// land (`place::read_by`): one settle a frame, about 70 ms on the RTX
+    /// 2060 SUPER, for the title's ring of constants. `false`: not such a
+    /// fill (or no card steps: scratch is then memory the card cannot write).
+    pub(crate) fn fill_from_placed(&self, buffer: &ID3D12Resource, offset: u64, src: usize, len: u64) -> bool {
+        if card_steps::stage() == 0 {
+            return false;
+        }
+        let Some(shadow) = self.placed_over(src, len as usize) else {
+            return false;
+        };
+        let Some(host) = host() else {
+            return false;
+        };
+        // SAFETY: an open list; live buffers (the list holds its scratch
+        // memory, the placed step the host copy), ranges inside them;
+        // scratch memory the card can write (`take_chunk`).
+        unsafe {
+            place::wait_for_all(host, &self.list);
+            self.list.CopyBufferRegion(buffer, offset, &shadow.buffer, shadow.offset(src as u64), len);
+            place::wait_for_all(host, &self.list);
+        }
+        PLACED_FILLS.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// The destination's host copy of the last copy at its place in this
+    /// list that wrote all of `[src, src + len)`, if nothing written to
+    /// those bytes on the CPU stands behind it.
+    fn placed_over(&self, src: usize, len: usize) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+        let deferred = self.deferred();
+        for step in deferred.copies.iter().rev() {
+            match step {
+                Step::Placed(p) if p.dst <= src && src + len <= p.dst + p.len => return Some(p.shadow.clone()),
+                Step::Placed(p) if p.dst < src + len && src < p.dst + p.len => return None,
+                &Step::Copy(dst, _, n) if dst < src + len && src < dst + n => return None,
+                Step::Run(_) => return None,
+                _ => {}
+            }
+        }
+        None
     }
 
     /// As [`HostList::defer_fill`], for upload memory that only `slot` (a

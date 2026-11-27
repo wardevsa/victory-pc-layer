@@ -4007,8 +4007,15 @@ impl State {
                             host.make_null(index);
                             continue;
                         };
-                        let slot = (std::ptr::from_ref(heap) as usize, index);
-                        list.defer_constants(to, address as *const u8, size as usize, slot);
+                        // Bytes a copy at its place earlier in the list wrote:
+                        // the card copies them here at once (`fill_from_placed`).
+                        // SAFETY: a live buffer.
+                        let offset = gpu - unsafe { buffer.GetGPUVirtualAddress() };
+                        let small = u64::from(size).max(1).next_multiple_of(256) <= crate::host::SCRATCH_CHUNK;
+                        if !(small && list.fill_from_placed(&buffer, offset, address as usize, u64::from(size))) {
+                            let slot = (std::ptr::from_ref(heap) as usize, index);
+                            list.defer_constants(to, address as *const u8, size as usize, slot);
+                        }
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
