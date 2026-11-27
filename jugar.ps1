@@ -33,7 +33,12 @@ if (-not $Game -or -not (Test-Path $Game)) {
 $build = if ($Release) { 'release' } else { 'diag' }
 $log = Join-Path $PSScriptRoot "run-series-s.log"
 Write-Host "Vice-Tay base: Series S, -Machine 3060, $build build; log in $log"
-$play = @{ Exe = $Game; Console = 'series-s'; Build = $build; Machine = '3060'; More = $Mas }
+# -WarmPipelines: the host pipelines of earlier runs are made before the title
+# starts. Without it the first start of this tree on the test PC drew black
+# for minutes: about 1,000 pipelines were waiting to be made in the world and
+# their draws were left out (the driver took up to 72 s for one; 4,123 took
+# 600 s on 8 processes). Pipelines made before are not made again.
+$play = @{ Exe = $Game; Console = 'series-s'; Build = $build; Machine = '3060'; More = $Mas; WarmPipelines = $true }
 if (-not $Pantalla) { $play.Windowed = $true }
 # A writer of our own, not Tee-Object: Windows PowerShell 5.1's wraps long
 # lines at the window's width and writes UTF-16.
