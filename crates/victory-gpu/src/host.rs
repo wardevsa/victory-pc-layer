@@ -3065,6 +3065,12 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
 /// the wait, for constants at the end of a 64 KiB page that the title wrote
 /// before the page was taken.
 ///
+/// Or no shader's write ever changed one of its bytes
+/// ([`crate::watch::shader_changed_ever`], by 32-byte block): the skinning
+/// passes write the heap in the same pages as the ring, and with the two
+/// above alone a fill of 16-48 bytes still waited once a frame, 13-81 ms
+/// (RTX 2060 SUPER, cool_fox 72944b1).
+///
 /// What can go wrong: a constant a flight's shader really writes, in a
 /// block that the title (or an earlier flight's copy-back) also wrote, or
 /// for the first time, is read as it was before that flight.
@@ -3072,7 +3078,10 @@ fn fill_is_titles(src: usize, len: usize) -> bool {
     const SMALL: usize = 64 << 10;
     static ON: OnceLock<bool> = OnceLock::new();
     let on = *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_TITLE").is_some_and(|v| v == "1"));
-    on && len <= SMALL && (crate::watch::written_since_taken(src, len) || !crate::watch::landed_lately(src, len, 600))
+    on && len <= SMALL
+        && (crate::watch::written_since_taken(src, len)
+            || !crate::watch::landed_lately(src, len, 600)
+            || !crate::watch::shader_changed_ever(src, len))
 }
 
 /// Diagnostics: the waits for flights, by what waited, why it was not done
