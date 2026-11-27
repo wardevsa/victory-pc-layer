@@ -40,6 +40,13 @@ $build = if ($Release) { 'release' } else { 'diag' }
 # Half size through the title's upscaler unless -Nativo; -Mas wins over both.
 $scaled = @{}
 if (-not $Nativo) { $scaled = @{ VICTORY_OUTPUT = '1920x1080'; VICTORY_UPSCALER = '6'; VICTORY_RENDER_SCALE = '0.5' } }
+# The fill of 240 bytes of the title's constants a shader of a flight still
+# in the air writes (once a frame, at 0x...38280 in the boat) waited 24-28 ms
+# a frame for the card: card steps refused it ("a copy at its place in a list
+# writes what it reads"). With the read-through it reads the placed copy's
+# result on the card: that wait went to 1.2 ms a frame (diagnostics run and
+# release run of 2026-11-27).
+$scaled.VICTORY_PLACED_FILL_REDIRECT = '1'
 foreach ($k in $Mas.Keys) { $scaled[$k] = $Mas[$k] }
 $Mas = $scaled
 $log = Join-Path $PSScriptRoot "run-series-s.log"
