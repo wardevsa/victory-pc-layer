@@ -1,5 +1,5 @@
 //! The title's frame rate (`VICTORY_FRAME_INTERVAL_MS`, off without it): the
-//! rate Grand Theft Auto VI asks for is a setting of its own, and two
+//! rate the title asks for is a setting of its own, and two
 //! places in its code are changed at load to read another.
 //!
 //! What the title does (game_scarlett_master.exe 1.0.2.1, image offsets):
