@@ -134,15 +134,15 @@ if (-not $Fabrica -and -not $Rapido) {
     # Not VICTORY_RELAY_COPY (tried in d516213): copying back fell from 81 to
     # 28 ms a frame, but preparing rose from 66 to 95 and the frame rate
     # stayed, and textures showed torn for a moment as they appeared.
-    # Not the card steps (VICTORY_RELAY=2, VICTORY_CARD_STEPS=1, tried as
+    # The card steps, stage 1 (the relay's stage 2 is the default; tried as
     # -Prueba in 1425c90): 0 fills a frame were done on the card, the card
-    # took 104 ms a frame and the frame rate stayed (5.4 median). The
-    # diagnostics build runs with them, so that its log names why each fill
-    # was not done on the card ("not done on the card: ...").
-    if ($Diag) {
-        $env:VICTORY_RELAY = "2"
-        $env:VICTORY_CARD_STEPS = "1"
-    }
+    # took 104 ms a frame and the frame rate stayed (5.4 median): stage 1 did
+    # only fills of descriptor-table slots, and the fill that waited (16-48
+    # bytes, once a frame, 65-83 ms) is one of a list's scratch memory. Since
+    # then stage 1 does those too, into scratch the card can write
+    # (host.rs fill_scratch, take_chunk). Stage 2 (copies too) stays off:
+    # with it victory-rtx3060 saw stretched bodies.
+    $env:VICTORY_CARD_STEPS = "1"
     if ([Environment]::ProcessorCount -le 12) {
         # Helper pools sized for a 24-thread CPU share 6 cores with the title
         # here: fewer of each (Maykzera's victory-rtx3060, measured on a

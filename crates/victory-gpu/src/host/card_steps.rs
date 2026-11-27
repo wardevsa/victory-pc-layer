@@ -120,8 +120,8 @@ pub(super) enum FillTo {
     /// A descriptor slot that shows the fill's memory, and nothing else does
     /// (title heap, slot): it is made to show our buffer instead.
     Slot(usize, u32),
-    /// A buffer the card can write, filled from its beginning.
-    Buffer(ID3D12Resource),
+    /// A buffer the card can write, and where in it the bytes go.
+    Buffer(ID3D12Resource, u64),
 }
 
 /// Title memory something in the air writes: the host copy it goes through
@@ -533,8 +533,8 @@ enum To {
     Copy(Arc<Shadow>, usize),
     /// A descriptor slot (title heap, slot).
     Slot(usize, u32),
-    /// A buffer's beginning.
-    Buffer(ID3D12Resource),
+    /// A buffer, and the offset in it.
+    Buffer(ID3D12Resource, u64),
 }
 
 /// Records a level of what [`stage`] describes into `list` (open): `reads`
@@ -768,7 +768,7 @@ impl Host {
                 }
                 _ => match fill_to(runs, steps[i]) {
                     Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
-                    Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
+                    Some(FillTo::Buffer(buffer, offset)) => To::Buffer(buffer, offset),
                     None => continue,
                 },
             };
@@ -824,7 +824,7 @@ impl Host {
                 }
                 match &op.to {
                     To::Copy(to, dst) => writes.push((&to.buffer, to.offset(*dst as u64), op.at, len)),
-                    To::Buffer(buffer) => writes.push((buffer, 0, op.at, len)),
+                    To::Buffer(buffer, offset) => writes.push((buffer, *offset, op.at, len)),
                     To::Slot(..) => {}
                 }
             }
@@ -891,7 +891,7 @@ fn noted(ops: &[Op]) {
     for op in ops {
         let (to, dst) = match &op.to {
             To::Copy(to, dst) => (to.span(), *dst),
-            To::Slot(..) | To::Buffer(_) => ((0, 0), 0),
+            To::Slot(..) | To::Buffer(..) => ((0, 0), 0),
         };
         let e = noted.entry((op.len, op.from.0.span(), to)).or_default();
         *e = (e.0 + 1, op.from.1, dst);

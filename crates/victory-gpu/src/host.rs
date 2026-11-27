@@ -1940,7 +1940,10 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let (buffer, data) = host.upload_buffer(size)?;
+    // With the card steps a fill of scratch memory may be done by the card
+    // ([`HostList::fill_scratch`]): memory it can write, as `shared_buffer`
+    // is; upload memory it can only read.
+    let (buffer, data) = if card_steps::stage() > 0 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
     name(&buffer, || "list scratch".into());
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
@@ -7167,8 +7170,19 @@ impl HostList {
         if known.is_some() {
             return known;
         }
-        let (gpu, to) = self.scratch(len)?;
-        self.defer_fill(to, src, len as usize);
+        let (buffer, at, to) = self.scratch_at(len)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
+        // With the card steps the card may bring the bytes: scratch chunks
+        // are then memory it can write (`take_chunk`). Not a scratch buffer
+        // of its own (over a chunk), which is upload memory.
+        let card = card_steps::stage() > 0 && len.max(1).next_multiple_of(256) <= SCRATCH_CHUNK;
+        self.deferred().copies.push(Step::Fill(
+            to as usize,
+            src as usize,
+            len as usize,
+            card.then(|| card_steps::FillTo::Buffer(buffer, at)),
+        ));
         self.deferred().filled.insert(key, gpu);
         Some(gpu)
     }
@@ -7184,7 +7198,7 @@ impl HostList {
     /// As [`HostList::defer_fill`], for the beginning of a buffer
     /// [`HostList::upload`] made.
     pub(crate) fn defer_fill_buffer(&self, buffer: &ID3D12Resource, dst: *mut u8, src: *const u8, len: usize) {
-        let to = (card_steps::stage() > 1).then(|| card_steps::FillTo::Buffer(buffer.clone()));
+        let to = (card_steps::stage() > 1).then(|| card_steps::FillTo::Buffer(buffer.clone(), 0));
         self.deferred().copies.push(Step::Fill(dst as usize, src as usize, len, to));
     }
 
