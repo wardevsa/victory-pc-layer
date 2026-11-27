@@ -186,6 +186,9 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && kind & MEM_RESERVE_PLACEHOLDER != 0 && constrained && flags & ADDRESS_32BIT != 0 {
         LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
     }
+    if !at.is_null() && placeholder {
+        victory_gpu::title_placeholder_reserved(at as usize, size);
+    }
     note_protection(asked, kind, flags, at as usize, size);
     at
 }
@@ -390,6 +393,68 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
+/// Pages of physical-page sections committed so far (all of them under
+/// Wine, where sections are committed whole). Windows charges them to the
+/// system commit limit but not to the process's private bytes
+/// (`PagefileUsage`), so the title's own figure misses them.
+// shortcut: never lowered; sections are not decommitted, and a freed
+// section's pages stay committed while views of it remain. Pages committed
+// only by `View::map` (`VICTORY_SECTION_WINDOW=0`, or no kept view) set no
+// bit and are missed; set the bit there if that path matters.
+static POOL_COMMITTED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether `fetch_or(bit)` returning `prev` set the bit (racing workers
+/// count each page once).
+fn newly_set(prev: u64, bit: u64) -> bool {
+    prev & bit == 0
+}
+
+/// Sets a page's committed bit, counting it in [`POOL_COMMITTED`] if new.
+fn mark_committed(word: &AtomicU64, bit: u64) {
+    if newly_set(word.fetch_or(bit, Ordering::AcqRel), bit) && !on_wine() {
+        POOL_COMMITTED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether `size` bytes still fit in the system's commit headroom.
+fn pool_fits(headroom: u64, size: u64) -> bool {
+    size <= headroom
+}
+
+/// Logs the commit a new section may need against the system commit limit:
+/// its pages are committed as touched, never decommitted, and do not show
+/// in private bytes, so a small pagefile can run out midway. Under Wine the
+/// section is committed whole and counted at once.
+fn note_pool_commit(size: usize) {
+    if on_wine() {
+        POOL_COMMITTED.fetch_add((size / PAGE) as u64, Ordering::Relaxed);
+        return;
+    }
+    let mut info = PERFORMANCE_INFORMATION {
+        cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
+    if unsafe { K32GetPerformanceInfo(&mut info, info.cb) } == 0 {
+        return;
+    }
+    let limit = (info.CommitLimit * info.PageSize) as u64;
+    let headroom = limit.saturating_sub((info.CommitTotal * info.PageSize) as u64);
+    let (pool_mb, limit_mb, headroom_mb) = (size as u64 >> 20, limit >> 20, headroom >> 20);
+    if pool_fits(headroom, size as u64) {
+        tracing::info!(pool_mb, limit_mb, headroom_mb, "physical page pool against the commit limit");
+    } else {
+        tracing::warn!(
+            pool_mb,
+            limit_mb,
+            headroom_mb,
+            "physical page pool larger than the commit headroom: it is committed as the title \
+             touches it and is not counted in private bytes, so the Windows paging file may \
+             need enlarging"
+        );
+    }
+}
+
 struct Section {
     handle: HANDLE,
     pages: usize,
@@ -441,7 +506,7 @@ impl Section {
                 return None;
             }
             for p in page..page + run {
-                self.committed[p / 64].fetch_or(1 << (p % 64), Ordering::AcqRel);
+                mark_committed(&self.committed[p / 64], 1 << (p % 64));
             }
             page += run;
         }
@@ -470,7 +535,7 @@ impl Section {
         }
         for p in pages {
             let (word, bit) = bit(p);
-            word.fetch_or(bit, Ordering::AcqRel);
+            mark_committed(word, bit);
         }
         true
     }
@@ -684,6 +749,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    note_pool_commit(size);
     let section = Arc::new(Section {
         handle,
         pages: n,
@@ -1942,6 +2008,7 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
             which = _which,
             limit_mb = stats.title_limit >> 20,
             used_mb = stats.title_used >> 20,
+            pool_committed_mb = (POOL_COMMITTED.load(Ordering::Relaxed) * PAGE as u64) >> 20,
             "the title asks how much memory it uses"
         );
     }
@@ -2692,5 +2759,21 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn pool_fits_within_headroom() {
+        assert!(pool_fits(8 << 30, 6 << 30));
+        assert!(pool_fits(6 << 30, 6 << 30));
+        assert!(!pool_fits(5 << 30, 6 << 30));
+        assert!(!pool_fits(0, PAGE as u64));
+    }
+
+    #[test]
+    fn newly_set_counts_a_bit_once() {
+        let word = AtomicU64::new(0);
+        assert!(newly_set(word.fetch_or(1 << 5, Ordering::AcqRel), 1 << 5));
+        assert!(!newly_set(word.fetch_or(1 << 5, Ordering::AcqRel), 1 << 5));
+        assert!(newly_set(word.fetch_or(1 << 6, Ordering::AcqRel), 1 << 6));
     }
 }

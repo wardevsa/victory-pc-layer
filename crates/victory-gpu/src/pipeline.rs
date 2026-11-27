@@ -116,8 +116,18 @@ fn idle_without_rays(container: &[u8]) -> bool {
     !victory_shader::emit::rays() && container.windows(NAME.len()).any(|w| w == NAME)
 }
 
+/// Whether `VICTORY_HAIR`'s value asks for the hair strands' programs to run:
+/// any value but an empty one, `0`, `off`, `false` or `no` (issue #59: only
+/// whether the variable was set was asked, so `VICTORY_HAIR=0` ran them).
+fn hair_asked(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| {
+        let v = v.to_string_lossy();
+        !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "off" | "false" | "no")
+    })
+}
+
 /// Whether a container's program is one of those that animate and draw hair
-/// strands, by its name. `VICTORY_HAIR` has them run.
+/// strands, by its name. `VICTORY_HAIR=1` has them run ([`hair_asked`]).
 /// shortcut: left out, as some of them do not translate (an address from a
 /// phi) and the others draw lines all over the screen without them.
 #[cfg(windows)]
@@ -143,7 +153,7 @@ fn hair_strands(container: &[u8]) -> bool {
         b"CS_CullMaskPass",
         b"CS_LodBlend",
     ];
-    if *RUN.get_or_init(|| std::env::var_os("VICTORY_HAIR").is_some()) {
+    if *RUN.get_or_init(|| hair_asked(std::env::var_os("VICTORY_HAIR").as_deref())) {
         return false;
     }
     const END: &[u8] = b"_Wrapped";
@@ -231,6 +241,7 @@ impl Shader {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
                         hash = %self.hash,
+                        names = ?container_names(&self.container),
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
                         "shader translated"
@@ -852,8 +863,39 @@ pub fn save_pipeline_cache() {
     library::save(true);
 }
 
+/// The names a title's shader container carries (`CS_..._1234abcd`), for the
+/// log: printable runs of a stage prefix, an underscore and more.
+pub(crate) fn container_names(container: &[u8]) -> Vec<String> {
+    let mut found = Vec::new();
+    for run in container.split(|b| !(b.is_ascii_alphanumeric() || *b == b'_')) {
+        if run.len() >= 6
+            && run.len() <= 96
+            && run[2] == b'_'
+            && matches!(&run[..2], b"CS" | b"PS" | b"VS" | b"MS" | b"AS" | b"GS" | b"HS" | b"DS")
+        {
+            let name = String::from_utf8_lossy(run).into_owned();
+            if !found.contains(&name) {
+                found.push(name);
+            }
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hair_runs_only_when_asked_for_with_a_value_that_says_so() {
+        use std::ffi::OsStr;
+        assert!(!super::hair_asked(None));
+        for off in ["", "0", " 0 ", "off", "OFF", "false", "no"] {
+            assert!(!super::hair_asked(Some(OsStr::new(off))), "{off:?}");
+        }
+        for on in ["1", "yes", "on", "true", "2"] {
+            assert!(super::hair_asked(Some(OsStr::new(on))), "{on:?}");
+        }
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {

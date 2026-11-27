@@ -42,9 +42,6 @@ pub(crate) fn counts() -> (u64, u64) {
 /// what it was told of the host. Not our executable: a rebuild of anything
 /// else used to translate every shader again.
 fn build() -> [u8; 32] {
-    // The view heap's null slot differs by host GPU: a translation cached
-    // without the clamp must not be served (`host_settings` below).
-    crate::descriptor::host::probe_view_limit();
     static FIXED: OnceLock<Vec<u8>> = OnceLock::new();
     let fixed = FIXED.get_or_init(|| {
         let limit = victory_shader::emit::loop_limit();
@@ -68,6 +65,7 @@ fn build() -> [u8; 32] {
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
+            "VICTORY_LANE_SPLIT",
             "VICTORY_F16_NEAREST",
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",
@@ -76,8 +74,6 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
-            "VICTORY_SCENE_KERNELS",
-            "VICTORY_DEFRAG",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -85,6 +81,11 @@ fn build() -> [u8; 32] {
                 bytes.extend_from_slice(value.as_encoded_bytes());
             }
             bytes.push(0);
+        }
+        // The defrag translation and LDS flag-region lowering are both
+        // enabled unless their switch is exactly "0".
+        for name in ["VICTORY_DEFRAG", "VICTORY_LDS_FLAGS"] {
+            bytes.push(u8::from(std::env::var_os(name).is_none_or(|v| v != "0")));
         }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
@@ -104,8 +105,11 @@ fn build() -> [u8; 32] {
     *hash.finalize().as_bytes()
 }
 
-/// What tells one set of translations from another ([`build`]).
+/// The fingerprint for this host and the current translator.
 pub(crate) fn translation() -> [u8; 32] {
+    // The view heap's null slot differs by host GPU. Probe it before
+    // reading the host settings, so a cached shader has the right clamp.
+    crate::descriptor::host::probe_view_limit();
     build()
 }
 
@@ -138,7 +142,7 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
         .map_err(|e| e.to_string())
     };
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate),
+        Some(cache) => cached(cache, &translation(), container, translate),
         None => translate(container),
     }
 }
@@ -401,6 +405,46 @@ mod tests {
                 shift: 5,
             }],
         }
+    }
+
+    #[test]
+    fn defrag_and_lds_modes_have_distinct_keys() {
+        const RESULT: &str = "VICTORY_TEST_SHADER_FINGERPRINT_FILE";
+        if let Some(path) = std::env::var_os(RESULT) {
+            // Every child starts with the same unprobed host settings.
+            std::fs::write(path, build()).unwrap();
+            return;
+        }
+
+        // Settings are cached for the lifetime of the process.
+        let key = |defrag: Option<&str>, lds: Option<&str>| -> [u8; 32] {
+            let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args([
+                "--exact",
+                "shader_cache::tests::defrag_and_lds_modes_have_distinct_keys",
+            ]);
+            child.env(RESULT, path.as_os_str());
+            for (name, value) in [("VICTORY_DEFRAG", defrag), ("VICTORY_LDS_FLAGS", lds)] {
+                match value {
+                    Some(v) => child.env(name, v),
+                    None => child.env_remove(name),
+                };
+            }
+            assert!(child.status().unwrap().success());
+            std::fs::read(path).unwrap().try_into().unwrap()
+        };
+
+        let on = key(None, None);
+        let modes = [
+            on,
+            key(Some("0"), None),
+            key(None, Some("0")),
+            key(Some("0"), Some("0")),
+        ];
+        assert_eq!(std::collections::HashSet::from(modes).len(), 4);
+        assert_eq!(key(Some("1"), Some("1")), on);
+        assert_eq!(key(Some(""), Some("00")), on);
     }
 
     #[test]

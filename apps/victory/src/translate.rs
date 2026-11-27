@@ -432,16 +432,22 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
                             if !lock(&seen).insert(hash) {
                                 continue;
                             }
-                            match victory_hle::modules::d3d12x::precompile(&bytes) {
-                                Ok(_) => {
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                victory_hle::modules::d3d12x::precompile(&bytes)
+                            })) {
+                                Ok(Ok(_)) => {
                                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                                     if n.is_multiple_of(1000) {
                                         println!("{n} shaders in the cache, {:.0} s", started.elapsed().as_secs_f64());
                                     }
                                 }
-                                Err(why) => {
+                                Ok(Err(why)) => {
                                     let mut failed = lock(&failed);
                                     failed.entry(why).or_insert_with(|| (0, hash.to_hex()[..16].to_owned())).0 += 1;
+                                }
+                                Err(_) => {
+                                    let mut failed = lock(&failed);
+                                    failed.entry("translation panicked".into()).or_insert_with(|| (0, hash.to_hex()[..16].to_owned())).0 += 1;
                                 }
                             }
                         }
@@ -538,7 +544,7 @@ fn translate(
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
     // `VICTORY_WAVE_WIDE_ONLY`: the wave-wide form for the containers it names.
-    emit::with_wave_wide(emit::wave_wide_only(&hash), || translate_programs(&container, programs, &example, t, checks));
+    emit::with_shader(&hash, || translate_programs(&container, programs, &example, t, checks));
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);

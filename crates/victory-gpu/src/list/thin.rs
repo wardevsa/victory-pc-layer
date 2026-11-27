@@ -325,8 +325,21 @@ fn back_list(kind: u32) -> This {
     list
 }
 
+/// How many threads translate the written-down calls
+/// (`VICTORY_THIN_THREADS`, 1-32): by default a third of the logical
+/// processors, 2 to 8. Eight was measured on 24 (an i9-12900K) and is kept
+/// there; on 16 (eight cores) eight of them took processors the title's
+/// own threads, which the console gives about seven cores, were waiting for.
+fn thread_count(asked: Option<usize>, logical: usize) -> usize {
+    asked.unwrap_or((logical / 3).clamp(2, 8)).clamp(1, 32)
+}
+
 fn start() {
-    let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, 32);
+    let threads = thread_count(
+        std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()),
+        std::thread::available_parallelism().map_or(8, |n| n.get()),
+    );
+    tracing::info!(threads, "threads that translate written-down list calls (VICTORY_THIN_THREADS)");
     for i in 0..threads {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");
@@ -893,6 +906,19 @@ const MINE: [(usize, *const ()); 50] = [
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn list_threads_follow_the_processors_unless_asked() {
+        use super::thread_count;
+        assert_eq!(thread_count(None, 24), 8);
+        assert_eq!(thread_count(None, 32), 8);
+        assert_eq!(thread_count(None, 16), 5);
+        assert_eq!(thread_count(None, 12), 4);
+        assert_eq!(thread_count(None, 4), 2);
+        assert_eq!(thread_count(Some(12), 16), 12);
+        assert_eq!(thread_count(Some(0), 16), 1);
+        assert_eq!(thread_count(Some(99), 16), 32);
+    }
+
     use super::*;
 
     /// Every method of the tables that records is written down too: what is
@@ -938,6 +964,7 @@ mod tests {
     /// A view's record is the one at the call, also if its slot is written
     /// again right after.
     #[test]
+    #[allow(unused_assignments)] // the write after the call is the point
     fn a_target_is_the_one_at_the_call() {
         let mut slot = [0x5256_5476u64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let kept = record(slot.as_ptr() as u64);

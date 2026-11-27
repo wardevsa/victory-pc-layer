@@ -73,6 +73,10 @@ pub(crate) struct Staging {
     /// of 1,120 textures in one frame of run 18.)
     dirty: std::sync::atomic::AtomicBool,
     uploaded: std::sync::atomic::AtomicBool,
+    /// Diagnostics: the submission ([`crate::host::submissions`]) whose
+    /// lists last recorded an upload from the staging buffer; 0: none.
+    #[cfg(feature = "diagnostics")]
+    sent: std::sync::atomic::AtomicU64,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
     /// How many bytes of the texture's memory were mapped when a list last
@@ -893,6 +897,10 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         list.defer_host(move || {
             staging.uploaded.store(true, Relaxed);
             staging.dirty.store(false, Relaxed);
+            // Run inside `Host::submit`, under its lock, after this
+            // submission took its number: `STARTED` is this submission.
+            #[cfg(feature = "diagnostics")]
+            staging.sent.store(crate::host::submissions().0, Relaxed);
         });
     }
     // A host copy that took the place of one with fewer levels: the slots
@@ -926,6 +934,14 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
             crate::descriptor::host::levels_waiting(staging.memory as u64);
         }
     });
+}
+
+/// Diagnostics: whether the upload recorded by submission `sent` may not
+/// have run yet when submission `landed` is the newest finished one (both
+/// numbered as [`crate::host::submissions`]); `sent` 0: none recorded.
+#[cfg(any(test, feature = "diagnostics"))]
+fn in_air(sent: u64, landed: u64) -> bool {
+    sent != 0 && sent > landed
 }
 
 fn record_upload(
@@ -1540,6 +1556,22 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Diagnostics: the staging buffer is written while an earlier
+        // submission that copies from it may not have run yet (nothing waits
+        // for it): that copy can upload these bytes, or a mix. Counted only.
+        // `FINISHED` is the landed number (no store of our own): the relay
+        // lander and the waited-for path set it once the card is done, so it
+        // is never ahead of the card; it lags by the landing's own work,
+        // which can only over-count. A detile of the submission that set
+        // `sent` is left out: its own lists' copy is meant to take it.
+        #[cfg(feature = "diagnostics")]
+        {
+            let sent = self.sent.load(std::sync::atomic::Ordering::Relaxed);
+            let (started, finished) = crate::host::submissions();
+            if sent < started && in_air(sent, finished) {
+                crate::copystat::add(crate::copystat::C::TexInAir, 1);
+            }
+        }
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -1982,6 +2014,8 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "diagnostics")]
+        sent: std::sync::atomic::AtomicU64::new(0),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         expected: std::sync::atomic::AtomicU64::new(0),
         on_demand,
@@ -1992,6 +2026,22 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod in_air_tests {
+    use super::in_air;
+
+    #[test]
+    fn in_air_until_its_submission_lands() {
+        // Never uploaded by a list.
+        assert!(!in_air(0, 0));
+        assert!(!in_air(0, 5));
+        // Sent by submission 7: in the air until 7 has finished.
+        assert!(in_air(7, 6));
+        assert!(!in_air(7, 7));
+        assert!(!in_air(7, 8));
+    }
 }
 
 #[cfg(test)]

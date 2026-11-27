@@ -30,6 +30,7 @@
 //! Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
 //! EXPRESS OR IMPLIED.
 
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 /// A swizzle mode, by its hardware number (addrlib's `ADDR_SW_*` order).
@@ -221,8 +222,22 @@ impl RenderPipeConfig {
     }
 }
 
-type SwizzlePattern = [Vec<u32>; 3];
-static EMPTY_PATTERN: SwizzlePattern = [const { Vec::new() }; 3];
+#[derive(Debug, PartialEq, Eq)]
+struct SwizzlePattern {
+    axes: [Vec<u32>; 3],
+    element_bytes: u32,
+    /// Elements that can be copied together at each aligned column.
+    row_run: u32,
+    /// Byte offsets of those runs in one tile, shared by all mips and layouts.
+    run_offsets: Vec<usize>,
+}
+
+static EMPTY_PATTERN: SwizzlePattern = SwizzlePattern {
+    axes: [const { Vec::new() }; 3],
+    element_bytes: 0,
+    row_run: 1,
+    run_offsets: Vec::new(),
+};
 
 /// Micro tile (256 bytes) patterns by log2 of the element size: for each
 /// address bit, the element coordinate bit it takes (`x0`, `y1`, `z0`...),
@@ -301,7 +316,25 @@ fn shared_pattern(kind: usize, element_log2: u32, block_log2: u32) -> &'static S
         [const { [const { [const { OnceLock::new() }; 5] }; 3] }; 3];
     let block_index = ((block_log2 - 8) / 4) as usize;
     PATTERNS[kind][block_index][element_log2 as usize]
-        .get_or_init(|| pattern(kind, element_log2, block_log2).map(|bits| spread(&bits)))
+        .get_or_init(|| {
+            let axes = pattern(kind, element_log2, block_log2).map(|bits| spread(&bits));
+            let element_bytes = 1u32 << element_log2;
+            // Consecutive low X bits in the address allow one contiguous copy.
+            // Check each bit separately; spread() places distinct X bits into
+            // distinct address bits, so the same run repeats throughout a tile.
+            let columns = &axes[0];
+            let mut row_run = 1;
+            while row_run < columns.len() && columns[row_run] == row_run as u32 * element_bytes {
+                row_run *= 2;
+            }
+            let run_offsets = columns.iter().step_by(row_run).map(|&off| off as usize).collect();
+            SwizzlePattern {
+                axes,
+                element_bytes,
+                row_run: row_run as u32,
+                run_offsets,
+            }
+        })
 }
 
 const MAX_MIPS: u32 = 16;
@@ -585,7 +618,7 @@ impl Layout {
     ///
     /// XOR modes require a known pipe configuration and a supported equation.
     pub fn addressable(&self) -> bool {
-        self.desc.swizzle == Swizzle::LINEAR || !self.pattern[0].is_empty() || self.render_xor.is_some()
+        self.desc.swizzle == Swizzle::LINEAR || !self.pattern.axes[0].is_empty() || self.render_xor.is_some()
     }
 
     /// The slice and the depth inside it for `z` (an array slice or a 3D
@@ -635,8 +668,9 @@ impl Layout {
         // In the tail the pattern of the shifted position gives the mip's
         // offset inside the tail block.
         let y = y + m.tail.map_or(0, |t| t.y);
-        let blocks = u64::from(y / bh) * u64::from(m.pitch / bw);
-        (blocks << log2) + u64::from(self.pattern[1][(y % bh) as usize] | self.pattern[2][z as usize])
+        let blocks = u64::from(y >> bh.trailing_zeros()) * u64::from(m.pitch >> bw.trailing_zeros());
+        (blocks << log2)
+            + u64::from(self.pattern.axes[1][(y & (bh - 1)) as usize] | self.pattern.axes[2][z as usize])
     }
 
     /// The part of an address that depends on the column.
@@ -644,7 +678,7 @@ impl Layout {
         let bw = self.block[0];
         let x = x + m.tail.map_or(0, |t| t.x);
         (u64::from(x / bw) << self.alignment.trailing_zeros())
-            + u64::from(self.pattern[0][(x % bw) as usize])
+            + u64::from(self.pattern.axes[0][(x % bw) as usize])
     }
 
     /// Depth slices a subresource of mip `mip` covers: the mip's depth for
@@ -771,10 +805,10 @@ impl Layout {
             return Ok(());
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
-        // The row and depth contribute one common base to every column, so
-        // the same contiguous runs repeat on every row, including mip tails.
+        let regular = (!linear).then(|| self.row_runs(m)).flatten();
+        // Irregular or unaligned views use their individual column addresses.
         let mut runs = Vec::new();
-        if !linear {
+        if !linear && regular.is_none() {
             let mut first_linear = 0;
             let mut first_tiled = self.column(m, 0) as usize;
             for x in 1..m.width {
@@ -805,6 +839,15 @@ impl Layout {
                     copy_run::<DETILE>(src, dst, tiled_row as usize, linear_row, bytes);
                 } else {
                     let tiled_row = (base + self.row(m, y, inner)) as usize;
+                    if let Some((run_bytes, offsets)) = &regular {
+                        match *run_bytes {
+                            8 => regular_row::<8, DETILE>(src, dst, tiled_row, linear_row, bytes, offsets),
+                            16 => regular_row::<16, DETILE>(src, dst, tiled_row, linear_row, bytes, offsets),
+                            32 => regular_row::<32, DETILE>(src, dst, tiled_row, linear_row, bytes, offsets),
+                            _ => unreachable!(),
+                        }
+                        continue;
+                    }
                     match chunk_size {
                         Some(8) if tiled_row.is_multiple_of(8) => {
                             copy_runs::<8, DETILE>(src, dst, body, tiled_row, linear_row)
@@ -822,6 +865,65 @@ impl Layout {
             }
         }
         Ok(())
+    }
+
+    /// Borrow the run offsets for a row inside one tile (including shifted
+    /// mip tails). Wider rows need just one address per run, once per mip.
+    fn row_runs(&self, mip: &Mip) -> Option<(usize, Cow<'static, [usize]>)> {
+        let p = self.pattern;
+        let start_x = mip.tail.map_or(0, |t| t.x);
+        let run = p.row_run;
+        let bytes = (run * p.element_bytes) as usize;
+        let [bw, bh, _] = self.block;
+        if !matches!(bytes, 8 | 16 | 32)
+            || !start_x.is_multiple_of(run)
+            || self.desc.element_bytes != p.element_bytes
+            || bw as usize != p.axes[0].len()
+            || bh as usize != p.axes[1].len()
+            || !self.alignment.is_power_of_two()
+            || self.alignment < bytes as u64
+        {
+            return None;
+        }
+        let first = (start_x / run) as usize;
+        let count = mip.width.div_ceil(run) as usize;
+        if let Some(slice) = p.run_offsets.get(first..first + count) {
+            return Some((bytes, Cow::Borrowed(slice)));
+        }
+        let per_tile = p.run_offsets.len();
+        let shift = per_tile.trailing_zeros();
+        let offsets = (first..first + count)
+            .map(|i| (i >> shift) * self.alignment as usize + p.run_offsets[i & (per_tile - 1)])
+            .collect();
+        Some((bytes, Cow::Owned(offsets)))
+    }
+}
+
+/// The last run of a mip may be short. Pitched rows can start at any byte.
+fn regular_row<const N: usize, const DETILE: bool>(
+    src: &[u8],
+    dst: &mut [u8],
+    tiled: usize,
+    linear: usize,
+    bytes: usize,
+    offsets: &[usize],
+) {
+    let (count, tail) = (bytes / N, bytes % N);
+    if DETILE {
+        let chunks = src[tiled..].as_chunks::<N>().0;
+        let rows = dst[linear..][..bytes].as_chunks_mut::<N>().0;
+        for (out, &offset) in rows.iter_mut().zip(&offsets[..count]) {
+            *out = chunks[offset / N];
+        }
+    } else {
+        let chunks = dst[tiled..].as_chunks_mut::<N>().0;
+        let rows = src[linear..][..bytes].as_chunks::<N>().0;
+        for (input, &offset) in rows.iter().zip(&offsets[..count]) {
+            chunks[offset / N] = *input;
+        }
+    }
+    if tail != 0 {
+        copy_run::<DETILE>(src, dst, tiled + offsets[count], linear + count * N, tail);
     }
 }
 
@@ -1103,8 +1205,8 @@ mod tests {
                 let [w, h, d] = l.block;
                 assert_eq!(u64::from(w * h * d) << e, 1 << log2, "{log2} {e}");
                 // The pattern covers exactly the block's coordinates.
-                assert_eq!(l.pattern[0].len() as u32, w);
-                assert_eq!(l.pattern[1].len() as u32, h);
+                assert_eq!(l.pattern.axes[0].len() as u32, w);
+                assert_eq!(l.pattern.axes[1].len() as u32, h);
             }
         }
         // 64 KiB, 16-byte elements: 64x64 (a 256x256 BC7 texture).
@@ -1178,6 +1280,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn shared_run_offsets_cover_shifted_mips_and_rows_spanning_tiles() {
+        let layout = Layout::new(&Desc {
+            block: 4,
+            ..desc(1031, 777, 10, 16, Swizzle::SW_64KB_D)
+        }).unwrap();
+        let mut borrowed_shifted = false;
+        let mut multiple_tiles = false;
+        let mut partial_run = false;
+        for mip in &layout.mips {
+            let (bytes, offsets) = layout.row_runs(mip).unwrap();
+            borrowed_shifted |= matches!(offsets, Cow::Borrowed(_)) && mip.tail.is_some_and(|t| t.x != 0);
+            multiple_tiles |= matches!(offsets, Cow::Owned(_));
+            let elements = bytes as u32 / layout.desc.element_bytes;
+            partial_run |= !mip.width.is_multiple_of(elements);
+            for x in 0..mip.width {
+                let within = (x % elements) * layout.desc.element_bytes;
+                assert_eq!(offsets[(x / elements) as usize] as u64 + u64::from(within), layout.column(mip, x));
+            }
+        }
+        assert!(borrowed_shifted && multiple_tiles && partial_run);
     }
 
     #[test]
@@ -1280,7 +1405,7 @@ mod tests {
                 })
                 .unwrap();
                 let expected = pattern(kind, element_log2, block_log2).map(|bits| spread(&bits));
-                assert_eq!(first.pattern, &expected);
+                assert_eq!(first.pattern.axes, expected);
                 assert!(std::ptr::eq(first.pattern, second.pattern));
                 assert!(std::ptr::eq(first.pattern, first.clone().pattern));
             }

@@ -52,6 +52,11 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
         let print = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             print(info);
+            tracing::error!(
+                target: "victory_loader::crash",
+                "panic on thread {:?}: {info}",
+                std::thread::current().name().unwrap_or("?")
+            );
             append_to_log(&format!(
                 "VIctory: panic on thread {:?}: {info}\n{}",
                 std::thread::current().name().unwrap_or("?"),
@@ -586,6 +591,8 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     let mut text = String::new();
     let mut line = |l: String| {
         eprintln!("{l}");
+        // Also in the log: under Proton stderr reaches no terminal.
+        tracing::warn!(target: "victory_loader::crash", "{l}");
         text.push_str(&l);
         text.push('\n');
     };

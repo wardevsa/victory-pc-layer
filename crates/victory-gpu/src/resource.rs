@@ -101,6 +101,7 @@ pub(crate) struct ResourceDesc {
 #[cfg(windows)]
 impl ResourceDesc {
     /// The texture of this one's levels from `base` on.
+    #[allow(clippy::wrong_self_convention)]
     fn from_level(&self, base: u32) -> ResourceDesc {
         let mut d = *self;
         if base > 0 {
@@ -117,6 +118,17 @@ impl ResourceDesc {
 pub(crate) struct AllocationInfo {
     size: u64,
     alignment: u64,
+}
+
+#[cfg(test)]
+pub(crate) fn readback_test_descriptions() -> (HeapProperties, ResourceDesc) {
+    (
+        HeapProperties { kind: 1, cpu_pages: 0, pool: 0, creation_nodes: 0, visible_nodes: 0 },
+        ResourceDesc {
+            dimension: 3, alignment: 0, width: 256, height: 256, depth_or_array_size: 1,
+            mip_levels: 1, format: 41, sample_count: 1, sample_quality: 0, layout: 0, flags: 4,
+        },
+    )
 }
 
 const _: () = assert!(size_of::<HeapProperties>() == 20);
@@ -1178,6 +1190,8 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    /// Immutable mip-zero UAV used by the ambient march pass, made only when bound.
+    march_uav: std::sync::OnceLock<windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap>,
     /// The bytes the host gives it.
     bytes: u64,
     /// Whether its contents come from title memory ([`fills`]): counted in
@@ -1316,21 +1330,31 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     base
 }
 
+#[cfg(windows)]
+thread_local! {
+    /// [`placed_bytes_from`]'s answers, by description without its filler
+    /// and first level. Never trimmed: bounded by the distinct descriptions
+    /// without filler a thread asks about (a title has a few thousand), times
+    /// the first levels its callers pass (`first_mip`: at most 16).
+    static PLACED_SIZES: std::cell::RefCell<std::collections::HashMap<([u32; 14], u32), Option<u64>>> =
+        std::cell::RefCell::default();
+}
+
 /// The bytes of title memory a placed texture with the resource description
 /// `desc` is read from for a view that starts at level `first`; `None` as
 /// [`placed_bytes`]. Remembered: asked for every slot that is looked at.
 #[cfg(windows)]
 pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
-    if first == 0 || !held_only() {
-        return placed_bytes(desc);
-    }
-    type Known = std::collections::HashMap<([u32; 14], u32), Option<u64>>;
-    thread_local! {
-        static KNOWN: std::cell::RefCell<Known> = std::cell::RefCell::default();
-    }
-    KNOWN.with(|known| {
+    // The size is a function of the description's fields alone, never of
+    // its filler words, so they are left out of the key.
+    let desc = &without_filler(desc);
+    let first = if held_only() { first } else { 0 };
+    PLACED_SIZES.with(|known| {
         *known.borrow_mut().entry((*desc, first)).or_insert_with(|| {
             let whole = placed_bytes(desc)?;
+            if first == 0 {
+                return Some(whole);
+            }
             // SAFETY: 56 bytes in the description's layout.
             let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
             let Some(t) = texture_layout(&d).filter(|t| t.planes.len() == 1) else {
@@ -2354,6 +2378,39 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 
 #[cfg(windows)]
 impl HostTexture {
+    /// The march clamp has a fixed format and subresource. A recorded list can
+    /// be submitted repeatedly, so its slot is never rewritten for another copy.
+    pub(crate) fn march_uav(
+        &self,
+        device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    ) -> windows::core::Result<&windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap> {
+        use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT};
+        if let Some(view) = self.march_uav.get() {
+            return Ok(view);
+        }
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_UAV { MipSlice: 0, PlaneSlice: 0 },
+            },
+        };
+        // SAFETY: the live texture has the clamp's RGBA16F format and allows UAVs.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            let heap: ID3D12DescriptorHeap = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })?;
+            device.CreateUnorderedAccessView(&self.texture, None::<&ID3D12Resource>, Some(&desc),
+                heap.GetCPUDescriptorHandleForHeapStart());
+            heap
+        };
+        // Concurrent first recordings may each create a heap. Only the published one is bound.
+        Ok(self.march_uav.get_or_init(|| heap))
+    }
+
     pub(crate) fn flags(&self) -> u32 {
         self.flags
     }
@@ -2368,6 +2425,7 @@ impl HostTexture {
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
+            march_uav: Default::default(),
             bytes,
             filled: false,
             tiled: None,
@@ -2393,6 +2451,7 @@ impl HostTexture {
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
+            march_uav: Default::default(),
             bytes: 0,
             filled: false,
             tiled: Some(tiled),
@@ -2615,7 +2674,7 @@ fn host_texture_as(
         }
     };
     if let Err(e) = &made {
-        crate::residency::allocation_error(&e);
+        crate::residency::allocation_error(e);
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
     }
     if !reserved
@@ -3023,21 +3082,63 @@ static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The placed textures asked for with filler words set, as asked
-/// (address and description): for [`PLACED_TWINS`].
-#[cfg(windows)]
+/// (address and description): for [`PLACED_TWINS`]. At most
+/// [`twin_room`] entries: past that, new twins go uncounted.
+#[cfg(all(windows, feature = "diagnostics"))]
 static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// Placed textures asked for a second time with other filler words in
 /// their description: each was a second resource and host copy before the
 /// filler was left out of the key ([`texture_at`]).
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// See [`PLACED_TWINS`].
+/// Counted only in the diagnostics build; 0 otherwise.
 #[cfg(windows)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))] // read by `copystat`
 pub(crate) fn placed_filler_twins() -> u64 {
-    PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
+    #[cfg(feature = "diagnostics")]
+    return PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "diagnostics"))]
+    0
+}
+
+/// Whether [`PLACED_RAW`] holding `len` entries takes one more.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn twin_room(len: usize) -> bool {
+    len < 65_536
+}
+
+/// Counts in [`PLACED_TWINS`] a placed texture at `address` asked for with
+/// the filler words `raw` when another set of them was seen for `key`.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn count_twin(address: u64, raw: &[u32; 14], key: &[u32; 14]) {
+    if raw == key {
+        return;
+    }
+    let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
+    if !twin_room(seen.len()) || !seen.insert((address, *raw)) {
+        return;
+    }
+    let others = seen
+        .range((address, [0; 14])..=(address, [u32::MAX; 14]))
+        .filter(|(_, r)| without_filler(r) == *key);
+    if others.count() > 1 {
+        PLACED_TWINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `desc` with words 1 and 13, the filler of its layout, zeroed: what the
+/// title leaves there is not part of what a texture is ([`texture_at`]).
+/// The padding of [`ResourceDesc`] after `dimension` and after `flags`.
+#[cfg(windows)]
+pub(crate) fn without_filler(desc: &[u32; 14]) -> [u32; 14] {
+    let mut d = *desc;
+    d[1] = 0;
+    d[13] = 0;
+    d
 }
 
 /// Width, height and format of texture `this` (`None` for a buffer), for
@@ -3133,30 +3234,17 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // that fills at world entry. They are not part of what a texture is.
     // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let raw = *desc;
     let mut key = *desc;
     if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
         key[1] = 0;
         key[13] = 0;
     }
-    let desc = &key;
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
     // the log: `placed_filler_twins`).
-    if raw != key {
-        let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.insert((address, raw)) {
-            let others = seen.range((address, [0; 14])..=(address, [u32::MAX; 14])).filter(|(_, r)| {
-                let mut blank = *r;
-                blank[1] = 0;
-                blank[13] = 0;
-                blank == key
-            });
-            if others.count() > 1 {
-                PLACED_TWINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-    }
+    #[cfg(feature = "diagnostics")]
+    count_twin(address, desc, &key);
+    let desc = &key;
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&r) = map.get(&(address, *desc)) {
         return Some(r as This);
     }
@@ -3180,6 +3268,106 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     }
     map.insert((address, *desc), out as usize);
     crate::texture::placed_in_host_written(address, desc);
+    resource(out)
+        .host
+        .placed
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    Some(out)
+}
+
+/// The resource for an unordered access view of a texture placed at
+/// `address` with resource description `desc` and view format `view_format`
+/// (0: the resource's own): an existing unordered-access texture at that
+/// address when its format allows the view, else a placed unordered-access
+/// resource made on first use (starting in `UNORDERED_ACCESS` and recorded
+/// in [`TARGETS_AT`] so shader views placed at `address` find its texels
+/// through [`alias_of`]).
+#[cfg(windows)]
+pub(crate) fn uav_texture_at(address: u64, desc: &[u32; 14], view_format: u32) -> Option<This> {
+    const DEPTH: u32 = 0x2;
+    const UNORDERED: u32 = 0x4;
+    const UNORDERED_ACCESS: u32 = 0x8;
+    const DEFAULT: HeapProperties = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 1,
+        visible_nodes: 1,
+    };
+    if address == 0 {
+        return None;
+    }
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if d.dimension == BUFFER {
+        return None;
+    }
+    let own = pc_format(d.format);
+    let wanted = if view_format == 0 {
+        own
+    } else {
+        pc_format(view_format)
+    };
+    {
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&other) = targets.get(&address) {
+            let o = resource(other as This);
+            let o_fmt = target_format(pc_format(o.desc.format));
+            let w_fmt = target_format(wanted);
+            let typeless = family(o_fmt) == o_fmt && family(o_fmt + 1) == o_fmt;
+            let srgb = SRGB.iter().any(|&(s, _)| s == o_fmt);
+            let compatible = o_fmt == w_fmt || ((typeless || srgb) && family(w_fmt) == family(o_fmt));
+            if o.desc.dimension == d.dimension
+                && o.desc.width == d.width
+                && o.desc.height == d.height
+                && o.desc.mip_levels == d.mip_levels
+                && o.desc.depth_or_array_size == d.depth_or_array_size
+                && o.desc.sample_count <= 1
+                && d.sample_count <= 1
+                && o.desc.flags & (DEPTH | UNORDERED) == UNORDERED
+                && compatible
+            {
+                return Some(other as This);
+            }
+        }
+    }
+    let mut r = *desc;
+    r[12] = (r[12] & !DEPTH) | UNORDERED;
+    if view_format != 0 && target_format(own) != target_format(wanted) {
+        if family(own) == family(wanted) {
+            r[8] = family(wanted);
+        } else if element(own) == element(wanted) {
+            r[8] = wanted;
+        }
+    }
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&existing) = map.get(&(address, r)) {
+        // A temporary target at this address may have replaced this texture
+        // and since been released. Restore the alias only if the slot is vacant.
+        TARGETS_AT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(address)
+            .or_insert(existing);
+        return Some(existing as This);
+    }
+    // SAFETY: 56 bytes in the description's layout.
+    let uav_desc = unsafe { r.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    let mut out = std::ptr::null();
+    let made = hand_out_resource(
+        uav_desc,
+        DEFAULT,
+        0,
+        Backing::Address(address as *mut u8),
+        UNORDERED_ACCESS,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    if made != S_OK {
+        return None;
+    }
+    map.insert((address, r), out as usize);
     resource(out)
         .host
         .placed
@@ -3428,6 +3616,48 @@ mod tests {
         creation_nodes: 0,
         visible_nodes: 0,
     };
+
+    #[cfg(windows)]
+    #[test]
+    fn cached_placed_uav_is_visible_after_releasing_a_temporary_target() {
+        static TITLE_BYTES: [u8; 4096] = [0; 4096];
+        let address = TITLE_BYTES.as_ptr() as u64;
+        let srv = [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 67, 1, 0, 0, 0, 0];
+        let uav = uav_texture_at(address, &srv, 42).unwrap();
+        let view = texture_at(address, &srv).unwrap();
+        assert_eq!(alias_of(view).map(|h| h.get()), Some(uav));
+
+        // The title uses the storage temporarily for a different shape.
+        let mut other = texture(8, 4, 42, 1);
+        other.flags = 4;
+        let mut target = std::ptr::null();
+        assert_eq!(
+            create_at_address(
+                std::ptr::null(),
+                address,
+                &other,
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut target,
+            ),
+            S_OK
+        );
+        let mut temporary_srv = srv;
+        temporary_srv[4] = 8;
+        let temporary_view = texture_at(address, &temporary_srv).unwrap();
+        assert_eq!(uav_texture_at(address, &srv, 42), Some(uav));
+        assert_eq!(
+            alias_of(temporary_view).map(|h| h.get()),
+            Some(target),
+            "keep the active target"
+        );
+        assert_eq!(resource_release(target), 0);
+
+        // Mirror the original placed UAV again, then resolve its paired SRV.
+        assert_eq!(uav_texture_at(address, &srv, 42), Some(uav));
+        assert_eq!(alias_of(view).map(|h| h.get()), Some(uav), "restore the cached target");
+    }
 
     fn buffer(width: u64) -> ResourceDesc {
         ResourceDesc {
@@ -4808,4 +5038,36 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
     }
+
+    /// The filler words of a placed texture's description change neither
+    /// its size nor what is remembered of it.
+    #[cfg(windows)]
+    #[test]
+    fn placed_sizes_leave_out_the_filler() {
+        let desc = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        let mut junk = desc;
+        junk[1] = 0xdead_beef;
+        junk[13] = 0x1234_5678;
+        assert_eq!(without_filler(&junk), desc);
+        assert_eq!(placed_bytes_from(&desc, 0), placed_bytes(&desc));
+        for first in [0, 2] {
+            assert_eq!(placed_bytes_from(&junk, first), placed_bytes_from(&desc, first));
+        }
+        let known = PLACED_SIZES.with(|k| k.borrow().len());
+        for first in [0, 2] {
+            assert!(placed_bytes_from(&junk, first).is_some());
+        }
+        assert_eq!(PLACED_SIZES.with(|k| k.borrow().len()), known);
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn placed_twins_stop_at_the_cap() {
+        assert!(twin_room(0));
+        assert!(twin_room(65_535));
+        assert!(!twin_room(65_536));
+    }
 }
+
+#[cfg(all(test, windows))]
+mod march_view_tests;

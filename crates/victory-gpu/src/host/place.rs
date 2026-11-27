@@ -62,6 +62,13 @@ pub(super) struct Placed {
 }
 
 impl Placed {
+    /// Whether the card copies the bytes the CPU takes out of the source at
+    /// submission (out of the list's upload memory), not a host copy that
+    /// shaders write.
+    pub(super) fn from_upload(&self) -> bool {
+        self.from.is_some()
+    }
+
     /// Whether flights that write `written` are waited for.
     pub(super) fn waits(&self, written: &[(usize, usize)]) -> Waits {
         let source = touches(written, self.src, self.src + self.len);

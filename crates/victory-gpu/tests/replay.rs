@@ -1857,3 +1857,8 @@ fn a_frame_is_recorded_and_replayed() {
         }
     }
 }
+
+// The D3D12 Agility SDK exports (`--features agility-sdk`), as in the unit tests.
+#[cfg(feature = "agility-sdk")]
+#[path = "../src/agility_tests.rs"]
+mod agility;

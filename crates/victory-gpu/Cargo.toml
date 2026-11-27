@@ -23,6 +23,8 @@ blake3.workspace = true
 tempfile.workspace = true
 
 [features]
+# Exports D3D12SDKVersion/D3D12SDKPath in test binaries for Windows 10 Agility SDK.
+agility-sdk = []
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
 

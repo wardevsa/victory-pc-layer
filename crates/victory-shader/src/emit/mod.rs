@@ -150,6 +150,13 @@ pub fn with_wave_wide<T>(_on: bool, translate: impl FnOnce() -> T) -> T {
     translate()
 }
 
+/// cool_fox's per-shader policy wrapper (by the shader's hash): this
+/// translator takes its per-hash lists from the environment itself, so it
+/// only runs the translation.
+pub fn with_shader<T>(_hash: &str, translate: impl FnOnce() -> T) -> T {
+    translate()
+}
+
 /// cool_fox's face-relocation compute's meet sites: that compute is not
 /// translated by this translator.
 pub fn defrag_meet_sites() -> u32 {

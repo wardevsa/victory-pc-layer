@@ -2769,7 +2769,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             }
             sig.unwrap()
         };
-        // Three records of 65,535 x 16 groups: about half the budget each.
+        // Three records that fill the budget between them (below).
         let Some((big, big_ptr)) = host.shared_buffer(3 * u64::from(STRIDE)) else {
             return;
         };
@@ -2781,8 +2781,12 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         };
         // SAFETY: mapped buffers of these sizes; nothing runs yet.
         unsafe {
+            // Two of 65,535 x 16 groups (2^26 - 1,024 each), and one of 32
+            // that spends the last 2,048 exactly, so the budget is full
+            // whether a record that does not fit takes the rest or not
+            // (`VICTORY_INDIRECT_REST`).
             for i in 0..3 {
-                let words = [32768u32, 32, 1];
+                let words = if i < 2 { [65535u32, 16, 1] } else { [32, 1, 1] };
                 std::ptr::copy_nonoverlapping(
                     words.as_ptr().cast::<u8>(),
                     big_ptr.add(i * STRIDE as usize),
@@ -3265,9 +3269,19 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             };
             assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
             assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
-            if spent > 0 {
-                assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
+            // What the records charged, each 2^26 for every execution that
+            // reads it: one that does not fit takes the rest only with
+            // `VICTORY_INDIRECT_REST=1` (`rest`), else nothing.
+            let mut charged = 0u32;
+            for _ in 0..records {
+                let cost = (1u32 << 26) * times;
+                if BUDGET - charged >= cost {
+                    charged += cost;
+                } else if rest() == 1 {
+                    charged = BUDGET;
+                }
             }
+            assert_eq!(spent, charged, "{times} times {records}");
         }
     }
 
@@ -3503,7 +3517,7 @@ void work() {
         heap_pairs: [[Option<ID3D12DescriptorHeap>; 2]; 2],
         tables: [D3D12_GPU_DESCRIPTOR_HANDLE; 2],
         targets: [D3D12_CPU_DESCRIPTOR_HANDLE; 2],
-        depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
+        _depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
         depth_tested: D3D12_CPU_DESCRIPTOR_HANDLE,
         stamps: ID3D12QueryHeap,
         back: ID3D12Resource,
@@ -3811,7 +3825,7 @@ void work() {
                     heap_pairs,
                     tables,
                     targets,
-                    depth_written,
+                    _depth_written: depth_written,
                     depth_tested,
                     stamps,
                     back,

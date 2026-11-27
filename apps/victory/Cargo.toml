@@ -21,6 +21,10 @@ clap.workspace = true
 walkdir.workspace = true
 
 [features]
+# Exports D3D12SDKVersion/D3D12SDKPath for the D3D12 Agility SDK (Windows 10;
+# src/agility.rs). Needs D3D12\D3D12Core.dll beside victory.exe
+# (scripts/get-agility-sdk.ps1), or D3D12 does not start at all.
+agility-sdk = []
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.
 diagnostics = [

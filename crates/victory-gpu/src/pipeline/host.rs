@@ -1022,6 +1022,45 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
+/// Whether the D3D12 runtime accepts the directly-indexed heap flags
+/// (CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED).
+/// Probed once with an empty root signature; false on runtimes that
+/// predate shader model 6.6 bindless.
+fn bindless_heaps_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+            Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,
+            Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                    NumParameters: 0,
+                    pParameters: std::ptr::null(),
+                    NumStaticSamplers: 0,
+                    pStaticSamplers: std::ptr::null(),
+                    Flags: D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+                        | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                },
+            },
+        };
+        // SAFETY: an empty description; the blob is dropped at once.
+        let ok = unsafe {
+            let mut blob: Option<ID3DBlob> = None;
+            D3D12SerializeVersionedRootSignature(&desc, &mut blob, None).is_ok()
+        };
+        tracing::info!(ok, "bindless heap root signature flags probe");
+        if !ok {
+            // Windows 10's own D3D12 (issues #68, #69): the translated programs index the heaps
+            // directly, so their pipelines are refused (0x80070057) and the title stalls.
+            tracing::warn!(
+                "this D3D12 runtime has no shader model 6.6 bindless heaps (Windows 10?): pipelines \
+                 that index the heaps are refused. Build with `--features agility-sdk` and run \
+                 scripts\\get-agility-sdk.ps1 (see the README's build steps)"
+            );
+        }
+        ok
+    })
+}
+
 fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
@@ -1033,6 +1072,12 @@ fn root_signature(
     } else {
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
     };
+    let bindless = if bindless_heaps_supported() {
+        D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+            | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED
+    } else {
+        D3D12_ROOT_SIGNATURE_FLAGS(0)
+    };
     let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
         Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,
         Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
@@ -1041,9 +1086,7 @@ fn root_signature(
                 pParameters: params.as_ptr(),
                 NumStaticSamplers: samplers.len() as u32,
                 pStaticSamplers: samplers.as_ptr(),
-                Flags: input
-                    | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                Flags: input | bindless,
             },
         },
     };
@@ -1118,6 +1161,42 @@ mod tests {
         D3D12_SHADER_BYTECODE {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
+        }
+    }
+
+    /// A name the library does not have is `E_INVALIDARG`, the code the trail now calls
+    /// "not in it yet" (issue #70 read it as the library refusing the pipeline).
+    #[test]
+    fn a_name_the_library_lacks_is_invalid_arg() {
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let Ok(device) = host.device.cast::<ID3D12Device1>() else {
+            return;
+        };
+        let (root, _) = root_signature(&host.device, &[], &[], true).unwrap();
+        // SAFETY: an empty library (no blob at all, which every runtime takes), then a
+        // lookup of a name never stored with a description that names a live root signature.
+        unsafe {
+            let mut raw: *mut core::ffi::c_void = std::ptr::null_mut();
+            (Interface::vtable(&device).CreatePipelineLibrary)(
+                device.as_raw(),
+                std::ptr::null(),
+                0,
+                &ID3D12PipelineLibrary::IID,
+                &mut raw,
+            )
+            .ok()
+            .expect("an empty pipeline library");
+            let library = ID3D12PipelineLibrary::from_raw(raw);
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(root.clone())),
+                ..Default::default()
+            };
+            let got = library.LoadComputePipeline::<_, ID3D12PipelineState>(windows::core::w!("never stored"), &desc);
+            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+            assert_eq!(got.err().map(|e| e.code()), Some(windows::Win32::Foundation::E_INVALIDARG));
         }
     }
 
@@ -1238,14 +1317,17 @@ mod tests {
         let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
 
         let mut g = GraphicsState::default();
-        // Subobject 21 (`DEPTH_STENCIL1`) with `DepthBoundsTestEnable = true`,
-        // depth test itself off so only depth bounds gates the draw.
+        // Subobject 21 (`DEPTH_STENCIL1`) with `DepthBoundsTestEnable = true`
+        // and a depth test that always passes and writes nothing, so only
+        // depth bounds gates the draw. (With the depth test off, the draw
+        // outside the bounds passed on the CI runners' adapter, WARP,
+        // which seems to leave the whole depth stage out then.)
         #[repr(C, align(8))]
         struct Sub21(u32, D3D12_DEPTH_STENCIL_DESC1);
         let sub = Sub21(
             21,
             D3D12_DEPTH_STENCIL_DESC1 {
-                DepthEnable: false.into(),
+                DepthEnable: true.into(),
                 DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
                 DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
                 DepthBoundsTestEnable: true.into(),

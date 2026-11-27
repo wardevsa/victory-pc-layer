@@ -16,6 +16,9 @@ const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    // Source patches for host tools (patches/), held to the same size and
+    // encoded-run checks as the rest.
+    "patch", "diff",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
