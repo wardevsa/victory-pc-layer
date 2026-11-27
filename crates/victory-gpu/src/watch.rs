@@ -2536,104 +2536,6 @@ impl Landed {
 
 static LANDED: Landed = Landed([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Landed::PIECES]);
 
-/// The 32-byte blocks of title memory whose bytes what shaders wrote ever
-/// changed: one bit each, in pieces of 256 MiB (a megabyte of bits) made when
-/// first needed and never let go. [`LANDED`] is by 4 KiB page: the skinning
-/// passes write the title's 174 MB heap in the same pages as its ring of
-/// constants, so every small fill of those waited for every flight's
-/// copy-back (one wait a frame, about 80 ms, on the RTX 2060 SUPER). Bytes no
-/// shader ever changed are the title's own.
-struct ShaderBlocks([std::sync::atomic::AtomicPtr<ShaderBlocksPiece>; ShaderBlocks::PIECES]);
-
-/// Of 256 MiB: a bit per 32-byte block.
-type ShaderBlocksPiece = [std::sync::atomic::AtomicU64; ShaderBlocks::WORDS];
-
-impl ShaderBlocks {
-    const PIECE: usize = 1 << 28;
-    const BLOCK: usize = 32;
-    const WORDS: usize = ShaderBlocks::PIECE / ShaderBlocks::BLOCK / 64;
-    /// 128 TiB, what a process has.
-    const PIECES: usize = 1 << 19;
-
-    fn piece(&self, at: usize, make: bool) -> Option<&ShaderBlocksPiece> {
-        use std::sync::atomic::Ordering::{AcqRel, Acquire};
-        let place = self.0.get(at / ShaderBlocks::PIECE)?;
-        let mut piece = place.load(Acquire);
-        if piece.is_null() {
-            if !make {
-                return None;
-            }
-            let made: Box<ShaderBlocksPiece> =
-                Box::new([const { std::sync::atomic::AtomicU64::new(0) }; ShaderBlocks::WORDS]);
-            let made = Box::into_raw(made);
-            piece = match place.compare_exchange(std::ptr::null_mut(), made, AcqRel, Acquire) {
-                Ok(_) => made,
-                Err(there) => {
-                    // SAFETY: made just now, and another thread's is there.
-                    drop(unsafe { Box::from_raw(made) });
-                    there
-                }
-            };
-        }
-        // SAFETY: a piece, which is never freed.
-        Some(unsafe { &*piece })
-    }
-
-    fn mark(&self, at: usize, len: usize) {
-        use std::sync::atomic::Ordering::Relaxed;
-        if len == 0 {
-            return;
-        }
-        for block in at / ShaderBlocks::BLOCK..=(at + len - 1) / ShaderBlocks::BLOCK {
-            let byte = block * ShaderBlocks::BLOCK;
-            let Some(piece) = self.piece(byte, true) else { continue };
-            let bit = (byte % ShaderBlocks::PIECE) / ShaderBlocks::BLOCK;
-            let word = &piece[bit / 64];
-            let mask = 1u64 << (bit % 64);
-            // (Most are marked already: no write then.)
-            if word.load(Relaxed) & mask == 0 {
-                word.fetch_or(mask, Relaxed);
-            }
-        }
-    }
-
-    fn any(&self, at: usize, len: usize) -> bool {
-        use std::sync::atomic::Ordering::Relaxed;
-        if len == 0 {
-            return false;
-        }
-        (at / ShaderBlocks::BLOCK..=(at + len - 1) / ShaderBlocks::BLOCK).any(|block| {
-            let byte = block * ShaderBlocks::BLOCK;
-            self.piece(byte, false).is_some_and(|piece| {
-                let bit = (byte % ShaderBlocks::PIECE) / ShaderBlocks::BLOCK;
-                piece[bit / 64].load(Relaxed) & (1u64 << (bit % 64)) != 0
-            })
-        })
-    }
-}
-
-static SHADER_BLOCKS: ShaderBlocks =
-    ShaderBlocks([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; ShaderBlocks::PIECES]);
-
-/// What shaders wrote changed the bytes `[at, at + len)` of title memory, and
-/// the same bytes at the other addresses their pages are mapped at.
-pub(crate) fn shader_changed(at: usize, len: usize) {
-    SHADER_BLOCKS.mark(at, len);
-    for (block, others) in elsewhere(at, len) {
-        let from = at.max(block);
-        let to = (at + len).min(block + BLOCK);
-        for other in others {
-            SHADER_BLOCKS.mark(other + (from - block), to - from);
-        }
-    }
-}
-
-/// Whether what shaders wrote ever changed a byte of `[at, at + len)`
-/// ([`shader_changed`]).
-pub(crate) fn shader_changed_ever(at: usize, len: usize) -> bool {
-    SHADER_BLOCKS.any(at, len)
-}
-
 /// A page's number, spread.
 #[derive(Default)]
 struct PageHash(u64);
@@ -2655,16 +2557,8 @@ impl std::hash::Hasher for PageHash {
     }
 }
 
-/// What shaders wrote is about to go into title memory at `[at, at + len)`:
-/// every byte of it counts as changed by them ([`shader_changed`]).
+/// What shaders wrote is about to go into title memory at `[at, at + len)`.
 pub(crate) fn landing(at: usize, len: usize) {
-    shader_changed(at, len);
-    landing_pages(at, len);
-}
-
-/// [`landing`], for a caller that tells [`shader_changed`] itself which
-/// bytes changed.
-pub(crate) fn landing_pages(at: usize, len: usize) {
     {
         let frame = crate::frame::current();
         let (first, last) = (at / KERNEL_PAGE, (at + len.max(1) - 1) / KERNEL_PAGE);

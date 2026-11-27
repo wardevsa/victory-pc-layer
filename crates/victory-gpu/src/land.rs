@@ -610,8 +610,7 @@ unsafe fn piece_at(
         let last = differing.iter().rposition(|&d| d).unwrap_or(first);
         let (from, to) = (((base + first) * PAGE).max(title), ((base + last + 1) * PAGE).min(title + end));
         let opening = std::time::Instant::now();
-        // (Which of their bytes changed is told below, page by page.)
-        crate::watch::landing_pages(from, to - from);
+        crate::watch::landing(from, to - from);
         spent(stat::NOTES, opening);
     }
     let into = beside.unwrap_or(title);
@@ -622,14 +621,6 @@ unsafe fn piece_at(
         pages += 1;
         if !differing[(title + from) / PAGE - base] {
             return;
-        }
-        // The 32-byte blocks what shaders wrote changes, before the merge
-        // may take the new bytes into `held` (`crate::watch::shader_changed`).
-        // SAFETY: the caller's: `n` bytes of both at `from`.
-        unsafe {
-            crate::safecopy::differing_blocks(now.add(from), held.add(from), n, |at| {
-                crate::watch::shader_changed(title + from + at, 32.min(n - at));
-            });
         }
         // SAFETY: the caller's; title memory, by an address that shows it
         // (`beside`) or the title's own.

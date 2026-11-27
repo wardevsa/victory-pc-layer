@@ -279,35 +279,6 @@ pub(crate) unsafe fn differ(a: *const u8, b: *const u8, len: usize) -> bool {
     (len / 32 * 32..len).any(|i| unsafe { a.add(i).read_volatile() != b.add(i).read_volatile() })
 }
 
-/// Calls `changed` with the offset of every 32-byte block (from `a` and `b`,
-/// the last one shorter) in which the `len` bytes at `a` and `b` differ.
-///
-/// # Safety
-/// As [`differ`]'s.
-pub(crate) unsafe fn differing_blocks(a: *const u8, b: *const u8, len: usize, mut changed: impl FnMut(usize)) {
-    use std::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_testz_si256, _mm256_xor_si256};
-    /// # Safety
-    /// [`differing_blocks`]'s; the processor has AVX2.
-    #[target_feature(enable = "avx2")]
-    unsafe fn block(a: *const u8, b: *const u8) -> bool {
-        // SAFETY: 32 bytes inside both.
-        let (x, y) = unsafe { (_mm256_loadu_si256(a.cast::<__m256i>()), _mm256_loadu_si256(b.cast::<__m256i>())) };
-        let d = _mm256_xor_si256(x, y);
-        _mm256_testz_si256(d, d) == 0
-    }
-    for k in 0..len / 32 {
-        // SAFETY: block `k`, inside both.
-        if unsafe { block(a.add(k * 32), b.add(k * 32)) } {
-            changed(k * 32);
-        }
-    }
-    let tail = len / 32 * 32;
-    // SAFETY: the bytes behind the blocks.
-    if (tail..len).any(|i| unsafe { a.add(i).read_volatile() != b.add(i).read_volatile() }) {
-        changed(tail);
-    }
-}
-
 /// Puts `now` at `dst` where it differs from `was`, whole dwords (as `dst`
 /// is aligned) and not a byte beside them: other threads may be writing
 /// those. At the ends, single bytes of a dword only partly in the stretch.
