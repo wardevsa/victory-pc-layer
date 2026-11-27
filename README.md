@@ -48,6 +48,7 @@ drew it):
   without waiting for the card (the title's heap counts as written by
   shaders as a whole): 5 waits a frame (93-104 ms) down to 1. 7-10 fps,
   11 in cutscenes.
+- `VICTORY_CARD_STEPS=1` and `VICTORY_PLACED_ORDER=1`: the one fill a frame that still waited for every flight (65-83 ms) is done on the card in order: stage 1 also does fills of a list's scratch memory (our change, scratch the card can write), and a submission is cut behind a copy at its place in a list that writes what its fills read. The boat mission now plays through.
 - Every run writes down the pipelines the title makes
   (`VICTORY_PIPELINE_BOOK`), for `-Preparar`.
 

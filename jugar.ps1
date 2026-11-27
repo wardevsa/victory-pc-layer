@@ -143,6 +143,14 @@ if (-not $Fabrica -and -not $Rapido) {
     # (host.rs fill_scratch, take_chunk). Stage 2 (copies too) stays off:
     # with it victory-rtx3060 saw stretched bodies.
     $env:VICTORY_CARD_STEPS = "1"
+    # With that (a6bd57d) the fills waited no more, but the card still did 0
+    # steps and one settle a frame stayed (68 ms): a copy of a few hundred
+    # bytes at its place in a list writes into the title's ring of constants
+    # that the submission's fills read, and the whole submission was refused
+    # for it (card_steps.rs BEHIND_PLACED). With the placed order the
+    # submission is cut behind that copy's list, and the fills behind it are
+    # done on the card in order (card_steps.rs cut_for).
+    $env:VICTORY_PLACED_ORDER = "1"
     if ([Environment]::ProcessorCount -le 12) {
         # Helper pools sized for a 24-thread CPU share 6 cores with the title
         # here: fewer of each (Maykzera's victory-rtx3060, measured on a
