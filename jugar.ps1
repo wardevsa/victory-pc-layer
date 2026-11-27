@@ -151,6 +151,16 @@ if (-not $Fabrica -and -not $Rapido) {
     # submission is cut behind that copy's list, and the fills behind it are
     # done on the card in order (card_steps.rs cut_for).
     $env:VICTORY_PLACED_ORDER = "1"
+    # With that (76d5c4c) the settle went from 68-80 ms to 0-35 a frame and a
+    # quiet stretch ran at 9.7-9.8 fps, but entering a new place fell to 1-2:
+    # texture refreshes waited 1.3-3.2 s a frame (all threads) for title
+    # memory to hold still while the runtime remapped it. Remapping waits for
+    # a lock every protection change takes, and the texture guards make some
+    # 100,000 of those a second (xmem.rs side_by_side). Without them each
+    # texture is hashed at its check instead: more CPU, the lock free; and
+    # the guard missed some of the title's writes (colour noise on clothes
+    # and arms, cool_fox's Play-VIctory.cmd).
+    $env:VICTORY_TEXTURE_GUARD = "0"
     if ([Environment]::ProcessorCount -le 12) {
         # Helper pools sized for a 24-thread CPU share 6 cores with the title
         # here: fewer of each (Maykzera's victory-rtx3060, measured on a
