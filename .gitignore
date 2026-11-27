@@ -74,3 +74,6 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# Logs of jugar.ps1
+run-*.log
