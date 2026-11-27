@@ -2539,9 +2539,15 @@ const CARD_RESULTS: u64 = 1 << 20;
 /// title's next submissions ahead of each. The compare has the bytes at hand
 /// when it hashes them; written to PC memory there, they are as the flight
 /// left them, with every send up to the flight's own ahead of them.
+///
+/// Off unless VICTORY_CARD_GATHER=1: in the run of 2026-11-27 (RTX 2060
+/// SUPER, gameplay) each of ~39 flights a frame gathered the pieces it
+/// flagged, the same render targets again and again: ~165 MB a frame put
+/// in PC memory, while 119 ms a frame still went to fetches of what was not
+/// gathered. 4 fps against 7-10 without it.
 fn card_gather() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_GATHER").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_GATHER").is_some_and(|v| v == "1"))
 }
 
 /// The slots of the gathered pieces, given to plans in the order they are
