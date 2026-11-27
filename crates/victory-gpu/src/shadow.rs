@@ -1002,6 +1002,12 @@ pub(crate) fn relay_fetched(number: u64) {
     RELAY_FETCHED.fetch_max(number, Ordering::AcqRel);
 }
 
+/// [`RELAY_FETCHED`]: a merge of bytes the card held right behind send
+/// `number` keeps the notes it needs only if `number` is not below it.
+pub(crate) fn relay_fetched_now() -> u64 {
+    RELAY_FETCHED.load(Ordering::Acquire)
+}
+
 /// With [`relay`]: how many submissions that are not copied back yet
 /// declared each range shaders may be writing (range, count, the last
 /// submission that declared it).

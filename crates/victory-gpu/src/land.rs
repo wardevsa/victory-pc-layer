@@ -446,6 +446,12 @@ impl Had {
         self.0.push((fence, all));
     }
 
+    /// Whether a fetch behind the flight of `fence` brought any of the
+    /// piece's block: what it brought is newer than the flight left it.
+    pub(crate) fn touches(&self, fence: u64, (copy, at, _): Piece) -> bool {
+        self.0.iter().any(|(behind, all)| *behind >= fence && all.contains_key(&(copy, at / BLOCK)))
+    }
+
     /// Whether a fetch behind the flight of `fence` brought all of the
     /// piece.
     pub(crate) fn holds(&self, fence: u64, (copy, at, len): Piece) -> bool {

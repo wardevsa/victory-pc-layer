@@ -971,6 +971,7 @@ void main() {
         let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
         let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
         let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let (_counters, _, counters_gpu) = warp.shared_buffer(64);
         let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
         // SAFETY: the mapping holds `size` bytes.
         unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
@@ -985,11 +986,13 @@ void main() {
                 }
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
-                let constants = [0u32, 0, size as u32, PIECES, 0, mode];
-                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                let constants = [0u32, 0, size as u32, PIECES, 0, mode, 0, 0, 0];
+                warp.list.SetComputeRoot32BitConstants(0, 9, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, differs_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(5, counters_gpu);
                 warp.list.Dispatch(PIECES, 1, 1);
             }
             warp.submit_and_wait();
@@ -1030,6 +1033,99 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
+    /// The compare puts the pieces it flags into PC memory itself
+    /// (`host::card_gather`): each in a slot of its plan, the slot noted
+    /// beside its result; no more than the plan's slots, the others left to
+    /// the fetch; the counter zeroed by the pass told 3.
+    #[test]
+    fn warp_card_compare_gathers_the_pieces_it_flags() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 4;
+        const SLOT: usize = 65536 + 256;
+        // A copy that starts 48 bytes into its first piece: the pieces are
+        // cut where the title's 64 KiB blocks are.
+        const SKEW: usize = 48;
+        let size = PIECE * PIECES as usize - SKEW;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES) + 16);
+        let (_differs, _, differs_gpu) = warp.shared_buffer(64);
+        let (_counters, _, counters_gpu) = warp.shared_buffer(64);
+        // The table, then the slots from byte 256.
+        let (_gathered, gathered_ptr, gathered_gpu) = warp.shared_buffer(256 + 3 * SLOT as u64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 7 + i / 509) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        let run = |warp: &mut WarpHarness, mode: u32, slots: u32| {
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, gathered_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(5, counters_gpu);
+                let zero = [0u32, 0, 0, 0, 0, 3, 0, 0, 8];
+                warp.list.SetComputeRoot32BitConstants(0, 9, zero.as_ptr().cast(), 0);
+                warp.list.Dispatch(1, 1, 1);
+                warp.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+                    },
+                    ..Default::default()
+                }]);
+                let constants = [0u32, SKEW as u32, size as u32, PIECES, 0, mode, 256, slots, 8];
+                warp.list.SetComputeRoot32BitConstants(0, 9, constants.as_ptr().cast(), 0);
+                warp.list.Dispatch(PIECES, 1, 1);
+            }
+            warp.submit_and_wait();
+        };
+        // SAFETY (each): inside the mappings.
+        let set = |at: usize, value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
+        let table = || [0, 1, 2, 3].map(|p| unsafe { gathered_ptr.cast::<u32>().add(p).read_volatile() });
+        run(&mut warp, 0, 0);
+        run(&mut warp, 2, 3);
+        assert_eq!(table(), [0, 0, 0, 0], "nothing changed, nothing gathered");
+        // Pieces 1 and 3 (the last, cut short by the copy's end) change.
+        let (one, three) = (PIECE + 999 - SKEW, 3 * PIECE + 77 - SKEW);
+        set(one, content[one] ^ 0x21);
+        set(three, content[three] ^ 0x12);
+        run(&mut warp, 2, 3);
+        let slots = table();
+        assert_eq!((slots[0], slots[2]), (0, 0));
+        let mut taken = vec![slots[1], slots[3]];
+        taken.sort_unstable();
+        assert_eq!(taken, [1, 2], "a slot each, from the plan's first");
+        for piece in [1usize, 3] {
+            // As `Shadow::card_hashed` cuts it.
+            let lo = (piece * PIECE - SKEW) & !15;
+            let hi = ((piece + 1) * PIECE - SKEW).min(size).next_multiple_of(16).min(size);
+            let slot = slots[piece] as usize - 1;
+            // SAFETY: inside the mappings, which the card has written.
+            let (got, want) = unsafe {
+                (
+                    std::slice::from_raw_parts(gathered_ptr.add(256 + slot * SLOT), hi - lo),
+                    std::slice::from_raw_parts(now_ptr.add(lo).cast_const(), hi - lo),
+                )
+            };
+            assert!(got == want, "piece {piece} gathered as it is now");
+        }
+        // One slot: one of two changed pieces is gathered, the other is left
+        // to the fetch.
+        set(one, content[one]);
+        set(three, content[three]);
+        run(&mut warp, 2, 1);
+        let mut slots = table().to_vec();
+        slots.sort_unstable();
+        assert_eq!(slots, [0, 0, 0, 1]);
+    }
+
     /// What the passes over copies in the card's memory cost on the card
     /// (ignored: a measurement): rounds of a few passes of some pieces and a
     /// wait, as a frame has them. `VICTORY_BENCH_CS=<file>` times another
@@ -1058,11 +1154,13 @@ void main() {
                     gpu.list.SetComputeRootShaderResourceView(1, now.GetGPUVirtualAddress());
                     gpu.list.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
                     gpu.list.SetComputeRootUnorderedAccessView(3, differs.GetGPUVirtualAddress());
+                    gpu.list.SetComputeRootUnorderedAccessView(4, differs.GetGPUVirtualAddress());
+                    gpu.list.SetComputeRootUnorderedAccessView(5, differs.GetGPUVirtualAddress());
                     for _ in 0..rounds {
                         for pass in 0..passes {
                             let first = if pieces * passes < 4096 { pass * pieces } else { 0 };
-                            let constants = [first, 0u32, 256 << 20, pieces, 0, 1];
-                            gpu.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                            let constants = [first, 0u32, 256 << 20, pieces, 0, 1, 0, 0, 0];
+                            gpu.list.SetComputeRoot32BitConstants(0, 9, constants.as_ptr().cast(), 0);
                             gpu.list.Dispatch(if walked_alone { pieces.div_ceil(64) } else { pieces }, 1, 1);
                         }
                         gpu.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
