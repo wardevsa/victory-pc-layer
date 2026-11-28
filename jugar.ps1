@@ -12,6 +12,8 @@
 #
 # Usage:  .\jugar.ps1                   (as above)
 #         .\jugar.ps1 -Nativo           (drawn at full size, no upscaling: sharper, slower)
+#         .\jugar.ps1 -Guardia          (the texture write guard: about 2 fps more,
+#                                        some textures in coloured noise)
 #         .\jugar.ps1 -Release:$false   (target\diag, the build Vice-Tay measures with)
 #         .\jugar.ps1 -Pantalla         (full screen instead of a window)
 #         .\jugar.ps1 -Mas @{VICTORY_PANEL='0'}  (any other setting)
@@ -21,6 +23,7 @@
 param(
     [switch]$Pantalla,
     [switch]$Nativo,
+    [switch]$Guardia,
     [bool]$Release = $true,
     [hashtable]$Mas = @{},
     [string]$Game = $(
@@ -47,6 +50,13 @@ if (-not $Nativo) { $scaled = @{ VICTORY_OUTPUT = '1920x1080'; VICTORY_UPSCALER 
 # result on the card: that wait went to 1.2 ms a frame (diagnostics run and
 # release run of 2026-11-27).
 $scaled.VICTORY_PLACED_FILL_REDIRECT = '1'
+# Textures hashed at every check, not left to the write guard (-Guardia: the
+# guard). With the guard, textures the title writes some way it does not see
+# stayed wrong: a shirt's print, forearms, legs and beards in squares of
+# coloured noise in the boat cutscene. Without it they drew right in the same
+# shots, at more CPU: the cutscene's first 45 frame lines at a median of 12.4
+# fps against 14.2 with the guard (11.0 before the read-through above).
+if (-not $Guardia) { $scaled.VICTORY_TEXTURE_GUARD = '0' }
 foreach ($k in $Mas.Keys) { $scaled[$k] = $Mas[$k] }
 $Mas = $scaled
 $log = Join-Path $PSScriptRoot "run-series-s.log"
