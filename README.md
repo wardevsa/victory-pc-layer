@@ -1,5 +1,14 @@
 # Vice-Tay
 
+> [!IMPORTANT]
+> **Development Paused Until Monday, November 30 (AI Usage Limit Reached)**
+>
+> Active development on Vice-Tay is taking a brief pit stop until **Monday, November 30**: the AI copilot behind our workflow has reached its usage limit for the current cycle, and we are waiting for the quota to recharge before jumping back into the codebase.
+>
+> **Nothing is expected or required.** Development will resume as soon as the limit is available again. If you would like to **optionally** help accelerate development and get us back to work earlier, voluntary donations go directly toward extra AI credits so we can return ahead of schedule; otherwise, the project will stay paused until Monday.
+>
+> **Ethereum (USDC):** `0x813E922837A7508d9A6838F171C63463f31A4717`
+
 **Xbox Series compatibility on Windows, tuned on a GeForce RTX 4090.**
 
 Vice-Tay builds on [VIctory](https://github.com/Marvisak/VIctory) to run an Xbox Series title from your own files. The title's x86-64 code runs on the host CPU. The compatibility layer provides the console APIs it calls and translates its graphics work to Direct3D 12.
@@ -8,16 +17,30 @@ Vice-Tay builds on [VIctory](https://github.com/Marvisak/VIctory) to run an Xbox
 
 ## Measurements
 
-The goal is **30 rendered FPS in the open world with correct visuals**. The recorded sessions below used the Series S profile on the indicated revisions.
+The goal is **30 rendered FPS in the open world with correct visuals**.
+
+### Series S boat test at 4K
+
+On November 27, 2026, I repeated the same boat route with two local builds. Both used DLSS Quality (2560 × 1440 → 3840 × 2160) and AMD 2× frame generation. Each result averages about 39 seconds of telemetry.
+
+| Build | Rendered FPS | Generated FPS | Presented FPS |
+| --- | ---: | ---: | ---: |
+| 4K reference · `e9a30f4f` | 16.12 | 16.12 | 32.25 |
+| 4K experimental · `424fb3f6` | **26.72** | 26.72 | **53.44** |
+
+The experimental build reached a median of 27.80 rendered FPS across the sampled intervals. The Series S 4K option is under review in [PR #329](https://github.com/TaynanGT/Vice-Tay/pull/329).
+
+[4K settings, frame counts and percentiles](docs/measurements.md#series-s-4k-boat-test)
+
+### Earlier Series S measurements
 
 | Session | Result |
 | --- | --- |
-| **30-minute playtest** · `bc090416` | Median of **21.1 rendered FPS**. The run covered the prologue and boat section, then continued on foot on the island. |
-| **6-minute frame generation test** · `88e80129` | Medians of **22.4 rendered FPS** and **44.9 presented FPS** with 2× frame generation on an experimental build. |
+| **1080p GPU read-through test** | An on/off test with the boat stationary went from **22.60 to 26.38 rendered FPS** and **45.13 to 52.78 presented FPS**. |
+| **6-minute frame generation test** · `88e80129` | Medians of **22.4 rendered FPS** and **44.9 presented FPS** in a separate 1080p test with 2× frame generation. |
+| **30-minute playtest** · `bc090416` | Median of **21.1 rendered FPS** and a 17.0 FPS 1% low across the prologue, the boat section and traversal on foot. |
 
-The playtest logged a 17.0 FPS 1% low, a measure of its slowest frames, and peaked at 24.1 GB of private game memory. The frame generation sample used DLSS Quality to scale 720p to 1080p and AMD FSR 3.1.6 to generate frames between rendered frames.
-
-[Playtest measurements](docs/measurements.md#series-s-baseline) · [Frame generation settings and sample](docs/measurements.md#series-s-frame-generation)
+[1080p comparison](docs/measurements.md#series-s-1080p-gpu-read-through) · [Frame generation test](docs/measurements.md#series-s-frame-generation) · [30-minute playtest](docs/measurements.md#series-s-baseline)
 
 **Test PC** · RTX 4090 (24 GB), Ryzen 9 9950X3D, 48 GiB DDR5, Windows 11 Pro x64
 
@@ -35,7 +58,7 @@ The playtest logged a 17.0 FPS 1% low, a measure of its slowest frames, and peak
 
 </details>
 
-Checkpoint retries worked after the boat ran aground. The HUD, minimap, mission prompts and pause menu were usable along the route.
+In the 30-minute playtest, checkpoint retries worked after the boat ran aground. The HUD, minimap, mission prompts and pause menu were usable along the route.
 
 ## Getting started
 
@@ -143,6 +166,8 @@ Pass an archive path to `shaders` to scan just that archive. At launch, `--if-ne
 When comparing warm-up times, `warm --used --batch-size 80` tests longer batches and
 `warm --used --normal-priority` tests normal worker priority. Change one option
 at a time. The defaults are 40 pipelines per worker process and idle priority.
+
+The opening's head blend-shape map starts compiling when its pipeline is created. Its dispatch can wait up to two seconds for the result. After a timeout, later dispatches use the pipeline as soon as it is ready. Set `VICTORY_HEAD_MAP_WAIT=0` for the ordinary pipeline schedule and wait budget.
 
 </details>
 

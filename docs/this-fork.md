@@ -67,7 +67,9 @@ How each of these was found, with the numbers:
   with `VICTORY_PLACED_ORDER=1` to let compatible fills read the recorded
   source of an earlier placed copy. The copy must cover the entire fill.
   If a CPU reader still depends on a pending copy, submission waits for the
-  bytes to become available. This path is off by default.
+  bytes to become available. This path is off by default; `scripts\play.ps1`
+  sets it for NVIDIA cards outside `-Safe`, next to `VICTORY_PLACED_ORDER`
+  ([measured in play on an RTX 5080](rtx5080-16gb.md#in-play-fills-behind-placed-copies)).
 - **Reuse lazy state preludes** with `VICTORY_PRELUDE_POOL=1`. The pool
   takes the allocator and command list back after the owning list resets,
   once its prior submission has finished. It holds up to 128 idle pairs.

@@ -146,6 +146,11 @@ if ($Machine -eq '7900xtx') {
         # into refused the whole submission to the card steps; in list order it is
         # taken (submit thread 104.7 -> 50.9 ms a frame, 12.1 -> 14.3 fps here).
         $settings.VICTORY_PLACED_ORDER = '1'
+        # A fill behind a copy at its place reads the copy's source on the card. Without
+        # it, a submission whose CPU-side fill depends on such a copy waits for the
+        # flights: in play on an RTX 5080, 0.7 submissions a frame refused and waited
+        # against 0.13, and frames 1.7 ms shorter (docs/rtx5080-16gb.md).
+        $settings.VICTORY_PLACED_FILL_REDIRECT = '1'
     }
     if ($autoNvidia -or $Machine -eq 'laptop') {
         $autoAdds = Get-AutoNvidiaSettings $cardGb $coreCount ([bool]$Safe)
