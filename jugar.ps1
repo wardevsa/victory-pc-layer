@@ -11,6 +11,8 @@
 # the card took about 69 of a 90 ms frame (the diagnostics panel's GPU EST).
 #
 # Usage:  .\jugar.ps1                   (as above)
+#         .\jugar.ps1 -SinGenerar       (DLSS without frame generation)
+#         .\jugar.ps1 -SinDlss          (the title's own upscaler at half size, no frame generation)
 #         .\jugar.ps1 -Nativo           (drawn at full size, no upscaling: sharper, slower)
 #         .\jugar.ps1 -Guardia          (the texture write guard: about 2 fps more,
 #                                        some textures in coloured noise)
@@ -24,6 +26,10 @@ param(
     [switch]$Pantalla,
     [switch]$Nativo,
     [switch]$Guardia,
+    [switch]$SinDlss,
+    [switch]$SinGenerar,
+    [string]$DlssDir = "$env:USERPROFILE\dlss",
+    [string]$FidelityFx = "$env:USERPROFILE\fidelityfx-2.4.0",
     [bool]$Release = $true,
     [hashtable]$Mas = @{},
     [string]$Game = $(
@@ -40,9 +46,19 @@ if (-not $Game -or -not (Test-Path $Game)) {
     exit 1
 }
 $build = if ($Release) { 'release' } else { 'diag' }
-# Half size through the title's upscaler unless -Nativo; -Mas wins over both.
+# NVIDIA DLSS (performance) and AMD frame generation (2x) when their signed
+# DLLs are there (nvngx_dlss.dll from github.com/NVIDIA/DLSS, in -DlssDir;
+# the FidelityFX SDK 2.4.0's DX12 loader and frame generation, in
+# -FidelityFx), unless -SinDlss or -Nativo. On the test PC, 2026-11-27, the
+# boat: 15.3-16.6 fps rendered, 29.7-33.6 presented (the title's own
+# upscaler at half size: 15.8 rendered; with it frame generation made none).
+# -SinGenerar: DLSS alone.
+$dlssOn = -not $SinDlss -and -not $Nativo -and (Test-Path (Join-Path $DlssDir 'nvngx_dlss.dll'))
+$generate = $dlssOn -and -not $SinGenerar -and (Test-Path (Join-Path $FidelityFx 'amd_fidelityfx_framegeneration_dx12.dll'))
+# Otherwise half size through the title's upscaler unless -Nativo; -Mas wins
+# over both.
 $scaled = @{}
-if (-not $Nativo) { $scaled = @{ VICTORY_OUTPUT = '1920x1080'; VICTORY_UPSCALER = '6'; VICTORY_RENDER_SCALE = '0.5' } }
+if (-not $Nativo -and -not $dlssOn) { $scaled = @{ VICTORY_OUTPUT = '1920x1080'; VICTORY_UPSCALER = '6'; VICTORY_RENDER_SCALE = '0.5' } }
 # The fill of 240 bytes of the title's constants a shader of a flight still
 # in the air writes (once a frame, at 0x...38280 in the boat) waited 24-28 ms
 # a frame for the card: card steps refused it ("a copy at its place in a list
@@ -68,6 +84,15 @@ Write-Host "Vice-Tay base: Series S, -Machine 3060, $build build; log in $log"
 # 600 s on 8 processes). Pipelines made before are not made again.
 $play = @{ Exe = $Game; Console = 'series-s'; Build = $build; Machine = '3060'; More = $Mas; WarmPipelines = $true }
 if (-not $Pantalla) { $play.Windowed = $true }
+if ($dlssOn) {
+    $env:VICTORY_DLSS_DIR = $DlssDir
+    $play.Dlss = 'performance'
+}
+if ($generate) {
+    $env:VICTORY_FFX_FG_DIR = $FidelityFx
+    $play.FrameGen = $true
+}
+Write-Host ("Upscaling: {0}; frame generation: {1}" -f $(if ($dlssOn) { 'DLSS performance' } elseif ($Nativo) { 'none' } else { "the title's, half size" }), $(if ($generate) { 'on' } else { 'off' }))
 # A writer of our own, not Tee-Object: Windows PowerShell 5.1's wraps long
 # lines at the window's width and writes UTF-16.
 $writer = [IO.StreamWriter]::new($log, $false, [Text.UTF8Encoding]::new($false))
